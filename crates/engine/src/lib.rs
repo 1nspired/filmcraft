@@ -34,6 +34,7 @@ pub mod media_watch;
 pub mod mixer;
 pub mod multicam;
 pub mod narration;
+mod native_document;
 pub mod panels;
 pub mod paste_media;
 pub mod perf;
