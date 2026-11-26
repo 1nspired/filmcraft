@@ -10,7 +10,7 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     let port = match args.as_slice() {
         [_, flag, port] if flag == "--port" => port.parse::<u16>().map_err(|e| e.to_string())?,
-        _ => return Err("usage: filmcraft-control --port <port or0>".into()),
+        _ => return Err("usage: filmcraft-control --port <port or 0>".into()),
     };
     let mut session = Session::default();
     let ctx = egui::Context::default();
