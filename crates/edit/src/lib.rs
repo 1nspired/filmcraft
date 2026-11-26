@@ -100,6 +100,10 @@ pub fn split_track_at(track: &mut Track, t: Tick, ctx: &mut EditCtx, links: &mut
     left.duration = cut;
     let new_id = ClipId(ctx.alloc());
     right.id = new_id;
+    if let Some(identity) = right.identity.as_mut() {
+        identity.parent = Some(identity.id.clone());
+        identity.id = format!("clip-{}", new_id.0);
+    }
     right.start = t;
     right.duration -= cut;
     if !right.reverse && right.frame_hold.is_none() {
