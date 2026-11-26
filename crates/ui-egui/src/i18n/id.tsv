@@ -1,4 +1,5 @@
 # Indonesian (id) catalog. Same format as `es.tsv`: context <TAB> source <TAB> translation.
+	Poema notes & protection…	Catatan dan perlindungan Poema…
 #
 # Clean-room: every entry was written from the plain meaning of the English text using ordinary
 # Indonesian (Bahasa Indonesia) video-editing vocabulary. No proprietary localisation resource,
@@ -21,7 +22,7 @@
 # thumbnail = gambar mini, voice-over = sulih suara, default = bawaan, preferences (also the native
 # macOS Settings menu) = Preferensi, settings = pengaturan.
 
-	About FilmCraft	Tentang FilmCraft
+	About Poema NLE	Tentang Poema NLE
 	Add Audio Submix Track	Tambah Trek Submix Audio
 	Add Caption at Playhead	Tambah Takarir di Kepala Putar
 	Add Chapter Marker…	Tambah Penanda Bab…
@@ -47,7 +48,7 @@
 	Apply Default Transitions to Selection	Terapkan Transisi Bawaan ke Pilihan
 	Apply Video Transition	Terapkan Transisi Video
 	Arrange	Susun
-	ArtCraft Website	Situs Web ArtCraft
+	FilmCraft engine website	Situs mesin FilmCraft
 	Assembly	Perakitan
 	Attach Proxies…	Lampirkan Proksi…
 	Audio Channels…	Kanal Audio…
@@ -140,9 +141,9 @@
 	File	Berkas
 	File…	Berkas…
 	Fill frame	Isi bingkai
-	FilmCraft Help…	Bantuan FilmCraft…
-	FilmCraft on GitHub	FilmCraft di GitHub
-	FilmCraft on getartcraft.com	FilmCraft di getartcraft.com
+	Native editor reference…	Referensi editor native…
+	Poema source code	Kode sumber Poema
+	About the FilmCraft engine	Tentang mesin FilmCraft
 	Find Next	Cari Berikutnya
 	Find…	Cari…
 	Fit	Pas
@@ -186,7 +187,7 @@
 	Insert Frame Hold Segment	Sisipkan Segmen Tahan Bingkai
 	Install Motion Graphics Template…	Pasang Templat Grafis Gerak…
 	Interpret Footage…	Interpretasikan Rekaman…
-	Join the ArtCraft Discord…	Gabung ke Discord ArtCraft…
+	FilmCraft upstream community…	Komunitas pengembang FilmCraft…
 	Keyboard Shortcuts…	Pintasan Keyboard…
 	Label	Label
 	Labels…	Label…
@@ -280,7 +281,7 @@
 	Render Selection	Render Pilihan
 	Replace Fonts in Projects…	Ganti Font di Proyek…
 	Replace With Clip	Ganti dengan Klip
-	Report an Issue…	Laporkan Masalah…
+	Report a Poema issue…	Laporkan masalah Poema…
 	Reset All Parameters	Atur Ulang Semua Parameter
 	Reset Duration	Atur Ulang Durasi
 	Reset to Saved Layout	Kembalikan ke Tata Letak Tersimpan
@@ -3236,7 +3237,7 @@
 	QuickTime, ProRes 4444 (4:4:4) with alpha channel, 24-bit 48 kHz PCM	QuickTime, ProRes 4444 (4:4:4) dengan kanal alfa, PCM 24-bit 48 kHz
 	QuickTime, ProRes 4444 XQ (4:4:4), 24-bit 48 kHz PCM	QuickTime, ProRes 4444 XQ (4:4:4), PCM 24-bit 48 kHz
 	QuickTime, ProRes 422, 24-bit 48 kHz PCM	QuickTime, ProRes 422, PCM 24-bit 48 kHz
-	Quit FilmCraft	Keluar dari FilmCraft
+	Quit Poema NLE	Keluar dari Poema NLE
 	Rate Stretch Tool	Alat Regang Laju
 	Razor Tool	Alat Silet
 	Rectangle Tool	Alat Persegi Panjang
@@ -3582,3 +3583,9 @@
 	Open a sequence to search its graphics	Buka sekuens untuk mencari di grafisnya
 	No text graphics in this sequence. Add text with the Type tool.	Tidak ada grafis teks di sekuens ini. Tambahkan teks dengan alat Teks.
 	No matching text.	Tidak ada teks yang cocok.
+	Hide Poema NLE	Sembunyikan Poema NLE
+	Poema	Poema
+
+	Move Up	Pindahkan ke Atas
+
+	Move Down	Pindahkan ke Bawah

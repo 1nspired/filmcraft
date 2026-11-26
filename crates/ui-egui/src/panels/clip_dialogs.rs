@@ -222,9 +222,10 @@ fn defaults(app: &FilmcraftApp, id: &str) -> (Value, Value) {
             let it = q.and_then(|q| s.state.selection.iter().find_map(|c| q.find_item(*c).map(|x| x.1.clone())));
             let fps = q.map(|q| q.settings.frame_rate.as_f64()).unwrap_or(24.0);
             let speed = it.as_ref().map_or(1.0, |i| i.speed);
+            let reverse = it.as_ref().is_some_and(|i| i.reverse);
             let interp = it.as_ref().map_or(filmcraft_project::TimeInterpolation::default(), |i| i.time_interpolation);
             (
-                json!({"speed": (speed.abs() * 100.0 * 100.0).round() / 100.0, "reverse": speed < 0.0, "ripple": false, "interpolation": interp.name()}),
+                json!({"speed": speed.abs() * 100.0, "reverse": reverse, "ripple": false, "interpolation": interp.name()}),
                 json!({"duration": it.as_ref().map_or(0, |i| i.duration.0), "speed": speed.abs(), "fps": fps}),
             )
         }
@@ -591,6 +592,11 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     }
     match action {
         Some("cancel") => {
+            if d.command == "app.quit"
+                && let Some(panel) = app.composer_panel.as_mut()
+            {
+                panel.close.cancel();
+            }
             app.ui.clip_dialog = None;
             return;
         }
@@ -612,6 +618,11 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     app.file_dialog("file.save", &json!({})).map(|_| ())
                 };
                 if let Err(e) = saved {
+                    if d.command == "app.quit"
+                        && let Some(panel) = app.composer_panel.as_mut()
+                    {
+                        panel.close.cancel();
+                    }
                     app.ui.status = e;
                     app.ui.clip_dialog = None;
                     return;
@@ -627,6 +638,13 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             let close = d.command != "app.quit" || app.session.is_dirty();
             if close && let Err(e) = app.session.execute("file.closeProject", json!({"force": true})) {
                 app.ui.status = e.to_string();
+                if d.command == "app.quit"
+                    && let Some(panel) = app.composer_panel.as_mut()
+                {
+                    panel.close.cancel();
+                }
+                app.ui.clip_dialog = None;
+                return;
             }
             if d.command == "app.quit" {
                 app.quit_confirmed = true;

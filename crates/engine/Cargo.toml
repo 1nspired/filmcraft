@@ -40,10 +40,22 @@ filmcraft-speech = { workspace = true }
 filmcraft-tts = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "=0.10.9"
 thiserror = { workspace = true }
 log = { workspace = true }
 craft-docpath = { workspace = true }
 web-time = "1"
+getrandom = { version = "0.4.3", features = ["wasm_js"] }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+# sha2 0.10's ARM SHA-256 hardware backend is gated by this official feature.
+# Runtime CPU detection retains its software fallback; complete-file proof is unchanged.
+sha2 = { version = "=0.10.9", features = ["asm"] }
+
+[target.'cfg(unix)'.dependencies]
+# Constants only, through safe std OpenOptions: do not follow a redirected
+# original leaf or block opening a FIFO substituted after metadata observation.
+libc = "=0.2.189"
 
 [dev-dependencies]
 filmcraft-testkit = { workspace = true }

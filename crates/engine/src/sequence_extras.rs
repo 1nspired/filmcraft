@@ -16,11 +16,11 @@
 //! caption tracks), keep only video or only audio.
 
 use filmcraft_edit as edit;
-use filmcraft_project::{ClipId, ItemKind, Label, Marker, MarkerId, MarkerKind, Sequence, TrackId, TrackKind};
+use filmcraft_project::{ClipId, ItemKind, MarkerKind, Sequence, TrackId, TrackKind};
 use filmcraft_time::{Tick, TimeRange};
 use serde_json::{Value, json};
 
-use crate::commands::{CommandSpec, bad, bool_p, f64_p, has_seq, marker_color_p, sequence_time_p, str_p, u64_p};
+use crate::commands::{CommandSpec, bad, bool_p, f64_p, has_seq, sequence_time_p, str_p};
 use crate::{EngineError, Result, Session};
 
 type Run = fn(&mut Session, &Value) -> Result<Value>;
@@ -83,7 +83,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             "Add Flash Cue Marker…",
             &["Markers"],
             None,
-            r#"{"time":ticks?,"name":str?,"comment":str?,"color":label?}"#,
+            r#"{"time":ticks?,"name":str?,"comment":str?,"color":label?,"duration":ticks?|"durationFrames":i64?}"#,
             has_seq,
             add_flash_cue,
         ),
@@ -525,15 +525,8 @@ fn add_flash_cue(s: &mut Session, p: &Value) -> Result<Value> {
     let t = s.sequence_rate().snap(sequence_time_p(s, p, "", "markers.addFlashCue")?.unwrap_or(s.playhead()));
     let n = s.active_sequence().map(|q| q.markers.iter().filter(|m| m.kind == MarkerKind::FlashCue).count()).unwrap_or(0) + 1;
     let name = str_p(p, "name").map(str::to_string).unwrap_or_else(|| format!("Cue Point {n}"));
-    let comment = str_p(p, "comment").unwrap_or("").to_string();
-    let color = marker_color_p(p, "markers.addFlashCue")?.unwrap_or(Label::Green);
-    let dur = u64_p(p, "durationFrames").map(|f| s.sequence_rate().tick_of(f as i64)).unwrap_or(Tick::ZERO);
-    let id = s.edit_sequence("Add Flash Cue Marker", |q, ctx, _| {
-        let id = MarkerId(ctx.alloc());
-        q.markers.push(Marker { id, start: t, duration: dur, name, comment, kind: MarkerKind::FlashCue, color });
-        q.markers.sort_by_key(|m| m.start);
-        Ok(id)
-    })?;
+    let dur = crate::marker_ops::duration(p, s.sequence_rate(), Tick::ZERO, "markers.addFlashCue")?;
+    let id = crate::marker_ops::add_sequence(s, "markers.addFlashCue", "Add Flash Cue Marker", t, dur, MarkerKind::FlashCue, name, p)?;
     Ok(json!({"marker": id.0}))
 }
 

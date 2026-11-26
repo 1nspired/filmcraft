@@ -420,10 +420,108 @@ pub struct Eyedropper {
 pub struct KeyframeRef {
     pub clip: u64,
     pub effect: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_instance_id: Option<String>,
     pub param: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_instance_id: Option<String>,
     pub time: filmcraft_time::Tick,
+}
+
+impl KeyframeRef {
+    pub(crate) fn new(clip: u64, item: &filmcraft_project::TrackItem, effect: usize, param: String, mask: Option<usize>, time: filmcraft_time::Tick) -> Self {
+        let instance = item.effects.get(effect);
+        Self {
+            clip,
+            effect,
+            effect_instance_id: instance.and_then(|e| e.instance_id.clone()),
+            param,
+            mask,
+            mask_instance_id: mask.and_then(|m| instance.and_then(|e| e.masks.get(m))).and_then(|m| m.instance_id.clone()),
+            time,
+        }
+    }
+    /// Resolve existing persistent handles after human/assistant stack edits or
+    /// Undo/Redo. Missing/ambiguous IDs never fall back to a similar neighbor.
+    pub(crate) fn resolve(&mut self, item: &filmcraft_project::TrackItem) -> bool {
+        if self.clip != item.id.0 {
+            return false;
+        }
+        if self.mask_instance_id.is_some() && (self.effect_instance_id.is_none() || self.mask.is_none()) {
+            return false;
+        }
+        if let Some(id) = &self.effect_instance_id {
+            let mut found = item.effects.iter().enumerate().filter(|(_, e)| e.instance_id.as_ref() == Some(id));
+            let Some((index, _)) = found.next() else {
+                return false;
+            };
+            if found.next().is_some() {
+                return false;
+            }
+            self.effect = index;
+        }
+        let Some(effect) = item.effects.get(self.effect) else {
+            return false;
+        };
+        if let Some(id) = &self.mask_instance_id {
+            let mut found = effect.masks.iter().enumerate().filter(|(_, m)| m.instance_id.as_ref() == Some(id));
+            let Some((index, _)) = found.next() else {
+                return false;
+            };
+            if found.next().is_some() {
+                return false;
+            }
+            self.mask = Some(index);
+        }
+        if self.effect_instance_id.is_none() {
+            self.effect_instance_id = effect.instance_id.clone();
+        }
+        if self.mask_instance_id.is_none() {
+            self.mask_instance_id = self.mask.and_then(|i| effect.masks.get(i)).and_then(|m| m.instance_id.clone());
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod effect_reference_tests {
+    use super::KeyframeRef;
+    use filmcraft_project::{Mask, MaskPath};
+    use filmcraft_time::Tick;
+    use serde_json::json;
+    #[test]
+    fn persistent_keyframe_reference_follows_duplicate_effect_and_mask_reorders_and_refuses_removed_identity() {
+        let mut session = filmcraft_engine::Session::default();
+        session.execute("file.openDemoProject", json!({})).unwrap();
+        let mut item = session.active_sequence().unwrap().video_tracks[0].items[0].clone();
+        let mut first = filmcraft_project::find_effect("gaussian_blur").unwrap().instance();
+        first.instance_id = Some("a".repeat(32));
+        let mut second = first.clone();
+        second.instance_id = Some("b".repeat(32));
+        let mut mask = Mask::new("Mask", MaskPath::rect(0.0, 0.0, 10.0, 10.0));
+        mask.instance_id = Some("c".repeat(32));
+        let mut other = mask.clone();
+        other.instance_id = Some("d".repeat(32));
+        first.masks = vec![mask, other];
+        item.effects = vec![first, second];
+        let mut key = KeyframeRef::new(item.id.0, &item, 0, "opacity".into(), Some(0), Tick::ZERO);
+        item.effects.swap(0, 1);
+        item.effects[1].masks.swap(0, 1);
+        assert!(key.resolve(&item));
+        assert_eq!((key.effect, key.mask), (1, Some(1)));
+        let saved = serde_json::to_value(&key).unwrap();
+        let mut restored: KeyframeRef = serde_json::from_value(saved).unwrap();
+        assert!(restored.resolve(&item));
+        item.effects.remove(1);
+        assert!(!key.resolve(&item));
+        let mut legacy: KeyframeRef = serde_json::from_value(json!({"clip":item.id.0,"effect":0,"param":"blurriness","mask":null,"time":0})).unwrap();
+        assert!(legacy.resolve(&item));
+        assert_eq!(legacy.effect_instance_id, Some("b".repeat(32)));
+        legacy.mask_instance_id = Some("c".repeat(32));
+        assert!(!legacy.resolve(&item));
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

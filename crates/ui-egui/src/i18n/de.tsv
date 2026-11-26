@@ -1,4 +1,5 @@
 # German (de) catalog. Same format as `es.tsv`: context <TAB> source <TAB> translation.
+	Poema notes & protection…	Poema-Notizen und Schutz…
 #
 # Clean-room: every entry was written from the plain meaning of the English label using ordinary
 # German video-editing vocabulary. No proprietary localisation resource, string table or product UI
@@ -20,7 +21,7 @@
 # Option = Wahl, Ctrl = Strg.
 
 	AAF…	AAF…
-	About FilmCraft	Über FilmCraft
+	About Poema NLE	Über Poema NLE
 	Add Audio Submix Track	Audio-Submix-Spur hinzufügen
 	Add Caption at Playhead	Untertitel an Abspielposition hinzufügen
 	Add Chapter Marker…	Kapitelmarker hinzufügen…
@@ -46,7 +47,7 @@
 	Apply Default Transitions to Selection	Standardübergänge auf Auswahl anwenden
 	Apply Video Transition	Videoübergang anwenden
 	Arrange	Anordnen
-	ArtCraft Website	ArtCraft-Website
+	FilmCraft engine website	Website der FilmCraft-Engine
 	Assembly	Montage
 	Attach Proxies…	Proxys anhängen…
 	Audio	Audio
@@ -150,9 +151,9 @@
 	File	Datei
 	File…	Datei…
 	Fill frame	Bild füllen
-	FilmCraft Help…	FilmCraft-Hilfe…
-	FilmCraft on GitHub	FilmCraft auf GitHub
-	FilmCraft on getartcraft.com	FilmCraft auf getartcraft.com
+	Native editor reference…	Referenz des nativen Editors…
+	Poema source code	Poema-Quellcode
+	About the FilmCraft engine	Über die FilmCraft-Engine
 	Final Cut Pro XML…	Final Cut Pro XML…
 	Find Next	Weitersuchen
 	Find…	Suchen…
@@ -186,7 +187,7 @@
 	Guide Templates	Hilfslinienvorlagen
 	Help	Hilfe
 	Hide All Caption Tracks	Alle Untertitelspuren ausblenden
-	Hide FilmCraft	FilmCraft ausblenden
+	Hide Poema NLE	Poema NLE ausblenden
 	Hide Others	Andere ausblenden
 	High Quality Playback	Wiedergabe in hoher Qualität
 	History	Verlauf
@@ -201,7 +202,7 @@
 	Install Motion Graphics Template…	Motion-Graphics-Vorlage installieren…
 	Interpret Footage…	Material interpretieren…
 	Iris	Iris
-	Join the ArtCraft Discord…	Dem ArtCraft-Discord beitreten…
+	FilmCraft upstream community…	FilmCraft-Upstream-Community…
 	Keyboard Shortcuts…	Tastenkürzel…
 	Label	Farbmarkierung
 	Labels…	Farbmarkierungen…
@@ -279,7 +280,7 @@
 	Properties	Eigenschaften
 	Proxy	Proxy
 	Purple	Lila
-	Quit FilmCraft	FilmCraft beenden
+	Quit Poema NLE	Poema NLE beenden
 	Reconnect Full Resolution Media…	Medien in voller Auflösung neu verknüpfen…
 	Recover Unsaved Changes…	Nicht gespeicherte Änderungen wiederherstellen…
 	Rectangle	Rechteck
@@ -299,7 +300,7 @@
 	Render Selection	Auswahl rendern
 	Replace Fonts in Projects…	Schriften in Projekten ersetzen…
 	Replace With Clip	Durch Clip ersetzen
-	Report an Issue…	Problem melden…
+	Report a Poema issue…	Ein Poema-Problem melden…
 	Reset All Parameters	Alle Parameter zurücksetzen
 	Reset Duration	Dauer zurücksetzen
 	Reset to Saved Layout	Auf gespeichertes Layout zurücksetzen
@@ -3613,3 +3614,8 @@
 	Shows the version, community links and credits in a FilmCraft window.	Zeigt Version, Community-Links und Credits in einem FilmCraft-Fenster.
 	Couldn't open your web browser	Dein Webbrowser konnte nicht geöffnet werden
 	Open this address in your browser yourself:	Öffne diese Adresse selbst in deinem Browser:
+	Poema	Poema
+
+	Move Up	Nach oben
+
+	Move Down	Nach unten

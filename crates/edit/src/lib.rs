@@ -136,8 +136,11 @@ pub fn clear_track_range(track: &mut Track, range: TimeRange, ctx: &mut EditCtx,
     if range.is_empty() {
         return Vec::new();
     }
-    split_track_at(track, range.start, ctx, links);
+    // Split the retained right side first. With J/L edges one member may
+    // already start at In: cutting In first would fork only its partner and
+    // then allocate different right-side link groups at Out.
     split_track_at(track, range.end(), ctx, links);
+    split_track_at(track, range.start, ctx, links);
     let mut removed = Vec::new();
     track.items.retain(|i| {
         let inside = i.start >= range.start && i.end() <= range.end();
@@ -348,7 +351,23 @@ pub fn lift(seq: &mut Sequence, tracks: &[TrackId], range: TimeRange, ctx: &mut 
             removed.extend(clear_track_range(tr, range, ctx, &mut links));
         }
     }
+    // A partial linked member may already start at/after Out and never split.
+    // Join that retained right side to its partners' new group, but never
+    // change untargeted/locked tracks. All boundary splits must finish first.
+    for tr in seq.all_tracks_mut().filter(|t| !t.locked && tracks.contains(&t.id)) {
+        relink_right_of_range(tr, range, &links);
+    }
     removed
+}
+
+fn relink_right_of_range(track: &mut Track, range: TimeRange, links: &HashMap<u64, u64>) {
+    for item in &mut track.items {
+        if item.start >= range.end()
+            && let Some(link) = item.link.and_then(|old| links.get(&old))
+        {
+            item.link = Some(*link);
+        }
+    }
 }
 
 /// Extract: remove `range` on targeted and sync-locked tracks and close the gap.
@@ -360,6 +379,9 @@ pub fn extract(seq: &mut Sequence, tracks: &[TrackId], range: TimeRange, ctx: &m
             continue;
         }
         removed.extend(clear_track_range(tr, range, ctx, &mut links));
+    }
+    for tr in seq.all_tracks_mut().filter(|t| !t.locked && (tracks.contains(&t.id) || t.sync_lock)) {
+        relink_right_of_range(tr, range, &links);
         shift_track_from(tr, range.end(), -range.duration);
     }
     for ct in seq.caption_tracks.iter_mut().filter(|c| !c.locked && c.sync_lock) {
@@ -469,6 +491,9 @@ pub fn ripple_delete_items(seq: &mut Sequence, items: &[ClipId]) -> Result<Vec<T
             }
             shift_track_from(tr, span.end(), -span.duration);
         }
+        for track in work.caption_tracks.iter_mut().filter(|track| !track.locked && track.sync_lock) {
+            captions::extract_range(track, *span);
+        }
     }
     *seq = work;
     Ok(spans)
@@ -501,6 +526,9 @@ pub fn close_gap(seq: &mut Sequence, track: TrackId, t: Tick) -> Result<()> {
             }
         }
         shift_track_from(tr, gap.end(), -gap.duration);
+    }
+    for track in work.caption_tracks.iter_mut().filter(|track| !track.locked && track.sync_lock) {
+        captions::extract_range(track, gap);
     }
     *seq = work;
     Ok(())
@@ -737,6 +765,7 @@ pub fn trim(seq: &mut Sequence, clip: ClipId, edge: Edge, mode: TrimMode, delta:
         let (_, it) = work.find_item_mut(clip).ok_or(EditError::NoItem(clip))?;
         move_edge(it, edge, d, mode == TrimMode::Regular);
     }
+    let mut next = *ctx.next_id;
     if mode == TrimMode::Ripple {
         let (at, shift) = match edge {
             Edge::In => (old_start + Tick(1), -d),
@@ -764,11 +793,14 @@ pub fn trim(seq: &mut Sequence, clip: ClipId, edge: Edge, mode: TrimMode, delta:
                 tr.sort();
             }
         }
+        let mut caption_ctx = EditCtx { next_id: &mut next, media_duration: ctx.media_duration, media_start: ctx.media_start, min_duration: ctx.min_duration };
+        captions::ripple_trim(&mut work.caption_tracks, edge, if edge == Edge::In { old_start } else { old_end }, d, &mut caption_ctx)?;
         transitions_follow_cuts(seq, &mut work);
     } else if let Ok(track) = track_mut(&mut work, tid) {
         fades_follow_edges(track, clip);
     }
     work.check().map_err(EditError::Other)?;
+    *ctx.next_id = next;
     *seq = work;
     Ok(d)
 }
@@ -877,18 +909,28 @@ pub fn ripple_trim_group(seq: &mut Sequence, clips: &[ClipId], edge: Edge, delta
             return Err(EditError::SyncLockConflict(track_label(seq, tr.id)));
         }
     }
+    let mut next = *ctx.next_id;
+    let mut caption_ctx = EditCtx { next_id: &mut next, media_duration: ctx.media_duration, media_start: ctx.media_start, min_duration: ctx.min_duration };
+    captions::ripple_trim(&mut work.caption_tracks, edge, if edge == Edge::In { main_from - Tick(1) } else { main_from }, d, &mut caption_ctx)?;
     transitions_follow_cuts(seq, &mut work);
     work.check().map_err(EditError::Other)?;
+    *ctx.next_id = next;
     *seq = work;
     Ok(d)
 }
 
 /// Rolling edit between two adjacent items on one track: moves the cut by `delta`.
 pub fn roll(seq: &mut Sequence, left: ClipId, right: ClipId, delta: Tick, ctx: &mut EditCtx) -> Result<Tick> {
+    if left == right {
+        return Err(EditError::Other("rolling edit needs two distinct adjacent items on one track".into()));
+    }
     unlocked_track(seq, left)?;
     unlocked_track(seq, right)?;
-    let (_, l) = seq.find_item(left).ok_or(EditError::NoItem(left))?;
-    let (_, r) = seq.find_item(right).ok_or(EditError::NoItem(right))?;
+    let (lt, l) = seq.find_item(left).ok_or(EditError::NoItem(left))?;
+    let (rt, r) = seq.find_item(right).ok_or(EditError::NoItem(right))?;
+    if lt != rt {
+        return Err(EditError::Other("rolling edit needs two adjacent items on the same track".into()));
+    }
     if l.end() != r.start {
         return Err(EditError::Other("items are not adjacent".into()));
     }
@@ -1094,6 +1136,16 @@ pub fn set_speed(seq: &mut Sequence, clip: ClipId, speed: f64, reverse: bool, ri
     set_speed_group(seq, &[clip], speed, reverse, ripple, ctx)
 }
 
+/// Unconstrained native tick duration for a speed ratio (1 = 100%). Human speed
+/// edits apply their room/minimum/neighbour clamps afterwards; guarded exact
+/// edits compare against this SAME rounding rule to detect unwanted clamping.
+pub fn duration_at_speed(source_length: Tick, speed: f64) -> Result<Tick> {
+    if !(speed.is_finite() && speed > 0.0) {
+        return Err(EditError::Other("speed must be positive".into()));
+    }
+    Ok(Tick((source_length.0 as f64 / speed).round() as i64))
+}
+
 /// Speed/Duration on a clip and its linked partners on other tracks (its sound) as a single edit.
 /// `clips` holds at most one clip per track. Every member takes the speed, and with `ripple` the
 /// later material moves once, on the members' tracks and on sync-locked tracks. Rippling each
@@ -1101,6 +1153,28 @@ pub fn set_speed(seq: &mut Sequence, clip: ClipId, speed: f64, reverse: bool, ri
 /// by different amounts (a split edit), the later material moves by the largest change, so no
 /// member is overlapped and the tracks stay in sync. Nothing changes when the edit fails.
 pub fn set_speed_group(seq: &mut Sequence, clips: &[ClipId], speed: f64, reverse: bool, ripple: bool, ctx: &mut EditCtx) -> Result<()> {
+    set_speed_group_with_ripple(seq, clips, speed, reverse, ripple, ctx).map(|_| ())
+}
+
+/// The actual shared ripple performed by one linked speed group. Coordinates
+/// refer to the sequence at this group's execution, after earlier groups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpeedRipple {
+    pub cut: Tick,
+    pub delta: Tick,
+}
+
+/// Apply the same speed edit and return its authoritative group timing. Caption
+/// tracks follow the shared out-edge Extract/Insert policy; their words are not
+/// stretched or reversed with the source. Allocation remains atomic with media.
+pub fn set_speed_group_with_ripple(
+    seq: &mut Sequence,
+    clips: &[ClipId],
+    speed: f64,
+    reverse: bool,
+    ripple: bool,
+    ctx: &mut EditCtx,
+) -> Result<Option<SpeedRipple>> {
     if !(speed.is_finite() && speed > 0.0) {
         return Err(EditError::Other("speed must be positive".into()));
     }
@@ -1118,7 +1192,7 @@ pub fn set_speed_group(seq: &mut Sequence, clips: &[ClipId], speed: f64, reverse
         let src_len = it.source_out() - it.source_in;
         // a tiny speed saturates the cast: keep the clip's end representable
         let room = Tick(Tick::MAX.0.saturating_sub(it.start.0.max(0)));
-        let mut new_dur = Tick((src_len.0 as f64 / speed).round() as i64).min(room).max(ctx.min_duration);
+        let mut new_dur = duration_at_speed(src_len, speed)?.min(room).max(ctx.min_duration);
         let old_end = it.end();
         let tr = work.track(tid).ok_or(EditError::NoTrack(tid))?;
         let (_, next_start) = neighbours(tr, *clip);
@@ -1135,6 +1209,7 @@ pub fn set_speed_group(seq: &mut Sequence, clips: &[ClipId], speed: f64, reverse
     }
     let main_from = origins.first().map(|o| o.1).unwrap_or_default();
     let shift = origins.iter().map(|o| o.2).max().unwrap_or_default();
+    let mut next = *ctx.next_id;
     if ripple && shift != Tick::ZERO {
         for tr in work.all_tracks_mut() {
             if tr.locked {
@@ -1154,13 +1229,19 @@ pub fn set_speed_group(seq: &mut Sequence, clips: &[ClipId], speed: f64, reverse
             }
             tr.sort();
         }
+        if !work.caption_tracks.is_empty() {
+            let mut caption_ctx =
+                EditCtx { next_id: &mut next, media_duration: ctx.media_duration, media_start: ctx.media_start, min_duration: ctx.min_duration };
+            captions::ripple_trim(&mut work.caption_tracks, Edge::Out, main_from, shift, &mut caption_ctx)?;
+        }
     }
     if ripple {
         transitions_follow_cuts(seq, &mut work);
     }
     work.check().map_err(EditError::Other)?;
     *seq = work;
-    Ok(())
+    *ctx.next_id = next;
+    Ok((ripple && shift != Tick::ZERO).then_some(SpeedRipple { cut: main_from, delta: shift }))
 }
 
 /// Add a transition at the cut between `from` and `to` (or at a single clip edge).

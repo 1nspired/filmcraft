@@ -4,7 +4,7 @@
 # using Ukrainian video-editing vocabulary. No proprietary localization resources were used.
 # Core menu coverage; other interface strings fall back to English.
 
-	About FilmCraft	Про FilmCraft
+	About Poema NLE	Про Poema NLE
 	Add Audio Submix Track	Додати доріжку підміксу аудіо
 	Add Caption at Playhead	Додати субтитр у позиції курсора відтворення
 	Add Chapter Marker…	Додати маркер розділу…
@@ -30,7 +30,7 @@
 	Apply Default Transitions to Selection	Застосувати типові переходи до виділення
 	Apply Video Transition	Застосувати відеоперехід
 	Arrange	Упорядкувати
-	ArtCraft Website	Вебсайт ArtCraft
+	FilmCraft engine website	Сайт рушія FilmCraft
 	Assembly	Компонування
 	Attach Proxies…	Приєднати проксі…
 	Audio	Аудіо
@@ -126,9 +126,9 @@
 	File	Файл
 	File…	Файл…
 	Fill frame	Заповнити кадр
-	FilmCraft Help…	Довідка FilmCraft…
-	FilmCraft on GitHub	FilmCraft на GitHub
-	FilmCraft on getartcraft.com	FilmCraft на getartcraft.com
+	Native editor reference…	Довідник нативного редактора…
+	Poema source code	Вихідний код Poema
+	About the FilmCraft engine	Про рушій FilmCraft
 	Find Next	Знайти далі
 	Find…	Знайти…
 	Fit	Умістити
@@ -172,7 +172,7 @@
 	Insert Frame Hold Segment	Вставити сегмент стоп-кадру
 	Install Motion Graphics Template…	Установити шаблон анімаційної графіки…
 	Interpret Footage…	Інтерпретувати матеріал…
-	Join the ArtCraft Discord…	Приєднатися до Discord ArtCraft…
+	FilmCraft upstream community…	Спільнота розробників FilmCraft…
 	Keyboard Shortcuts…	Клавіатурні скорочення…
 	Label	Мітка
 	Labels…	Мітки…
@@ -264,7 +264,7 @@
 	Render Selection	Рендерити виділення
 	Replace Fonts in Projects…	Замінити шрифти в проєктах…
 	Replace With Clip	Замінити кліпом
-	Report an Issue…	Повідомити про проблему…
+	Report a Poema issue…	Повідомити про проблему Poema…
 	Reset All Parameters	Скинути всі параметри
 	Reset Duration	Скинути тривалість
 	Reset to Saved Layout	Відновити збережене компонування
@@ -359,4 +359,4 @@
 	Zoom Out	Зменшити
 	Zoom to Sequence	Умістити секвенцію
 	Project Notes	Нотатки проєкту
-
+	Poema	Poema

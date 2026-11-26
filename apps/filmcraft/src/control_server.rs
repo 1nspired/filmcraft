@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
+use filmcraft_engine::AgentOperationControl;
 use filmcraft_ui_egui::ControlRequest;
 use serde_json::{Value, json};
 
@@ -22,7 +23,7 @@ pub const MAX_LINE: usize = 4 * 1024 * 1024;
 /// Connections served at once; further ones get an error line and are closed.
 pub const MAX_CONNECTIONS: usize = 16;
 
-pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
+pub fn start(port: u16, ctx: egui::Context, operations: AgentOperationControl) -> Receiver<ControlRequest> {
     let (tx, rx) = channel::<ControlRequest>();
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
@@ -32,11 +33,17 @@ pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
         }
     };
     eprintln!("filmcraft: control server listening on 127.0.0.1:{port}");
-    std::thread::spawn(move || accept_loop(listener, tx, ctx));
+    let started = std::thread::Builder::new().name("control-listener".into()).spawn(move || {
+        operations.enable_transport();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| accept_loop(listener, tx, ctx, operations)));
+    });
+    if let Err(e) = started {
+        eprintln!("filmcraft: control listener could not start: {e}");
+    }
     rx
 }
 
-fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context) {
+fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context, operations: AgentOperationControl) {
     let open = Arc::new(AtomicUsize::new(0));
     for mut stream in listener.incoming().flatten() {
         if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
@@ -46,12 +53,13 @@ fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Con
         }
         let tx = tx.clone();
         let ctx = ctx.clone();
+        let operations = operations.clone();
         // The slot is given back when the guard drops: after `serve` returns, if it panics, or if
         // the thread can't be started (the closure, and with it the guard, is dropped).
         let slot = Slot(Arc::clone(&open));
         let spawned = std::thread::Builder::new().name("control-conn".into()).spawn(move || {
             let _slot = slot;
-            serve(stream, &tx, &ctx);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serve(stream, &tx, &ctx, &operations)));
         });
         if let Err(e) = spawned {
             eprintln!("filmcraft: control server could not start a connection thread: {e}");
@@ -68,14 +76,29 @@ impl Drop for Slot {
     }
 }
 
-fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context) {
+fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context, operations: &AgentOperationControl) {
     let Ok(read) = stream.try_clone() else { return };
     serve_lines(read, stream, |method, params| {
+        if method == "engine.cancelOperation" {
+            return Some(match operations.cancel(&params) {
+                Ok(result) => json!({"ok":true,"result":result}),
+                Err(error) => json!({"ok":false,"error":error.to_string()}),
+            });
+        }
+        let wait = Duration::from_millis(filmcraft_engine::session_worker::control_reply_wait_ms(&method, &params));
         let (req, rrx) = ControlRequest::new(method, params);
         tx.send(req).ok()?;
         ctx.request_repaint();
-        Some(rrx.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|_| json!({"ok": false, "error": "timeout"})))
+        Some(wait_for_reply(&rrx, wait))
     });
+}
+
+fn wait_for_reply(reply: &std::sync::mpsc::Receiver<Value>, timeout: Duration) -> Value {
+    reply.recv_timeout(timeout).unwrap_or_else(|_| {
+        // The request was forwarded. Its worker may still commit or may have
+        // committed before the reply disappeared; timeout is never a rejection.
+        json!({"ok":false,"error":"native reply unavailable; reconcile the original request before another edit","outcome":"unknown"})
+    })
 }
 
 /// One parsed line.
@@ -167,6 +190,16 @@ fn serve_lines<R: Read, W: Write>(read: R, mut out: W, mut handle: impl FnMut(St
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn forwarded_timeout_and_lost_reply_never_claim_an_edit_was_rejected() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let timed_out = super::wait_for_reply(&receiver, std::time::Duration::ZERO);
+        assert_eq!(timed_out["outcome"], "unknown");
+        sender.send(serde_json::json!({"ok":true,"result":{"status":"committed"}})).unwrap();
+        assert_eq!(super::wait_for_reply(&receiver, std::time::Duration::ZERO)["result"]["status"], "committed");
+        drop(sender);
+        assert_eq!(super::wait_for_reply(&receiver, std::time::Duration::ZERO)["outcome"], "unknown");
+    }
     use super::*;
 
     fn run(input: &[u8]) -> (Vec<Value>, Vec<String>) {
@@ -275,7 +308,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, _rx) = channel::<ControlRequest>();
-        std::thread::spawn(move || accept_loop(listener, tx, egui::Context::default()));
+        std::thread::spawn(move || accept_loop(listener, tx, egui::Context::default(), AgentOperationControl::default()));
         // Idle connections are accepted in order and held open.
         let held: Vec<TcpStream> = (0..16).map(|_| TcpStream::connect(addr).unwrap()).collect();
         let mut extra = TcpStream::connect(addr).unwrap();
@@ -284,5 +317,59 @@ mod tests {
         BufReader::new(&mut extra).read_line(&mut line).unwrap();
         assert!(line.contains("too many control connections"), "{line}");
         drop(held);
+    }
+
+    #[test]
+    fn cancellation_bypasses_a_queued_ui_write_and_prevents_its_late_publication() {
+        use filmcraft_engine::Session;
+        let mut session = Session::default();
+        session.execute("file.openDemoProject", json!({})).unwrap();
+        let token = "independent-cancel-ticket-000000000000000001";
+        let doc = session.execute("agent.snapshot", json!({"token":token})).unwrap();
+        let revision = session.revision;
+        let project = session.project.clone();
+        let operations = session.agent_operation_control();
+        operations.enable_transport();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = channel::<ControlRequest>();
+        let server = std::thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let tx = tx.clone();
+                let control = operations.clone();
+                handlers.push(std::thread::spawn(move || serve(stream, &tx, &egui::Context::default(), &control)));
+            }
+            for h in handlers {
+                h.join().unwrap();
+            }
+        });
+        let clip = doc["sequence"]["video"][0]["items"][0]["clip"].clone();
+        let writer = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(address).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            writeln!(s,"{}",json!({"id":1,"method":"engine.execute","params":{"command":"agent.apply","params":{"token":token,"label":"Generated queued edit","operations":[{"command":"timeline.razor","params":{"clip":clip,"time":1}}]}}})).unwrap();
+            let mut line = String::new();
+            BufReader::new(s).read_line(&mut line).unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        });
+        let queued = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut cancel = TcpStream::connect(address).unwrap();
+        cancel.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        writeln!(cancel, "{}", json!({"id":2,"method":"engine.cancelOperation","params":{"token":token}})).unwrap();
+        let mut line = String::new();
+        BufReader::new(cancel).read_line(&mut line).unwrap();
+        let ack: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(ack["id"], 2);
+        assert_eq!(ack["result"]["cancellationAccepted"], true);
+        assert!(rx.try_recv().is_err(), "Cancel never entered the blocked UI queue");
+        let result = session.execute(queued.params["command"].as_str().unwrap(), queued.params["params"].clone());
+        assert!(result.as_ref().unwrap_err().to_string().contains("cancelled"));
+        queued.reply.send(json!({"ok":false,"error":result.unwrap_err().to_string()})).unwrap();
+        assert_eq!(writer.join().unwrap()["ok"], false);
+        server.join().unwrap();
+        assert_eq!(session.revision, revision);
+        assert!(Arc::ptr_eq(&session.project, &project));
     }
 }

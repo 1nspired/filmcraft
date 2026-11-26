@@ -319,6 +319,12 @@ fn audio_gain_reports_only_audio_items_it_updates() {
             for linked in [true, false] {
                 let mut s = demo();
                 s.execute("sequence.linkedSelection", json!({"on": linked})).unwrap();
+                if !linked && target == 29 {
+                    let revision = s.revision;
+                    assert!(s.execute("clip.audioGain", json!({"clips": [target], "mode": mode, "db": -6})).is_err());
+                    assert_eq!(s.revision, revision);
+                    continue;
+                }
                 let r = s.execute("clip.audioGain", json!({"clips": [target], "mode": mode, "db": -6})).unwrap();
                 let applied = linked || target == 30;
                 assert_eq!(r["clips"], usize::from(applied), "{mode}, target {target}, linked {linked}: {r}");
@@ -338,14 +344,18 @@ fn audio_gain_reports_only_audio_items_it_updates() {
 }
 
 #[test]
-fn audio_gain_reports_the_clamped_stored_gain() {
+fn audio_gain_reports_exact_boundary_values_and_refuses_clamping() {
     for mode in ["set", "adjust"] {
         for db in [-200.0_f64, 200.0] {
             let mut s = demo();
             s.execute("sequence.linkedSelection", json!({"on": false})).unwrap();
-            let r = s.execute("clip.audioGain", json!({"clips": [30], "mode": mode, "db": db})).unwrap();
+            let revision = s.revision;
+            assert!(s.execute("clip.audioGain", json!({"clips": [30], "mode": mode, "db": db})).is_err());
+            assert_eq!(s.revision, revision);
+            let requested = db.signum() * 96.0;
+            let r = s.execute("clip.audioGain", json!({"clips": [30], "mode": mode, "db": requested})).unwrap();
             let stored = s.active_sequence().unwrap().find_item(ClipId(30)).unwrap().1.gain_db;
-            assert_eq!(stored, db.clamp(-96.0, 96.0));
+            assert_eq!(stored, requested);
             assert_eq!(r["gainDb"], json!([{"clip": 30, "gainDb": stored}]));
         }
     }

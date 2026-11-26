@@ -350,14 +350,37 @@ pub fn layer_uid(e: &EffectInstance) -> u64 {
 }
 
 /// Give every layer without a uid a fresh one (unique among `layers`).
-pub fn ensure_uids(layers: &mut [EffectInstance]) {
-    let mut next = layers.iter().map(layer_uid).max().unwrap_or(0) + 1;
-    for l in layers.iter_mut() {
-        if layer_uid(l) == 0 {
-            l.layer.get_or_insert_with(Default::default).uid = next;
-            next += 1;
+pub fn ensure_uids(layers: &mut [EffectInstance]) -> Result<(), TemplateError> {
+    let mut used = std::collections::BTreeSet::new();
+    for l in layers.iter() {
+        let uid = layer_uid(l);
+        if uid != 0 && !used.insert(uid) {
+            return Err(TemplateError::Invalid("graphic layer identities are ambiguous".into()));
         }
     }
+    // A dangling reference must remain dangling; allocating it would silently attach a pin.
+    for l in layers.iter() {
+        if let Some(crate::graphic_design::Pin { to: crate::graphic_design::PinTarget::Layer(uid), .. }) = l.layer.as_ref().and_then(|l| l.pin.as_ref())
+            && *uid != 0
+        {
+            used.insert(*uid);
+        }
+    }
+    let mut next = used.last().copied().unwrap_or(0).checked_add(1).unwrap_or(1);
+    for l in layers.iter_mut() {
+        if layer_uid(l) == 0 {
+            let fresh = (0..used.len().saturating_add(1))
+                .find_map(|_| {
+                    let candidate = next;
+                    next = next.checked_add(1).unwrap_or(1);
+                    (!used.contains(&candidate)).then_some(candidate)
+                })
+                .ok_or_else(|| TemplateError::Invalid("graphic layer identity space is exhausted".into()))?;
+            used.insert(fresh);
+            l.layer.get_or_insert_with(Default::default).uid = fresh;
+        }
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -703,6 +726,22 @@ pub fn builtin_templates() -> Vec<GraphicsTemplate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layer_uid_allocation_preserves_maximum_ids_and_never_revives_missing_pin_targets() {
+        let mut layers = builtin_templates().remove(0).layers;
+        let mut base = layers[0].clone();
+        base.layer.get_or_insert_with(Default::default).uid = u64::MAX;
+        base.layer.as_mut().unwrap().pin = None;
+        let mut missing = base.clone();
+        missing.layer.as_mut().unwrap().uid = 0;
+        missing.layer.as_mut().unwrap().pin =
+            Some(crate::graphic_design::Pin { to: crate::graphic_design::PinTarget::Layer(1), left: true, ..Default::default() });
+        layers = vec![base, missing];
+        ensure_uids(&mut layers).unwrap();
+        assert_eq!(layer_uid(&layers[0]), u64::MAX);
+        assert_eq!(layer_uid(&layers[1]), 2);
+    }
 
     #[test]
     fn base64_round_trip() {

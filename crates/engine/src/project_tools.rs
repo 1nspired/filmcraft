@@ -348,15 +348,15 @@ fn has_find(s: &Session) -> std::result::Result<(), String> {
 
 /// Project items the command works on: `items`, else the Project panel selection, else the media
 /// of the selected timeline clips.
-fn targets(s: &Session, p: &Value) -> Vec<ItemId> {
-    if let Some(a) = p.get("items").and_then(Value::as_array) {
-        return a.iter().filter_map(|v| v.as_u64().map(ItemId)).filter(|i| s.project.items.contains_key(i)).collect();
+fn targets(s: &Session, p: &Value) -> Result<Vec<ItemId>> {
+    if let Some(ids) = crate::commands::ids_p(p, "items")? {
+        return Ok(ids.into_iter().map(ItemId).filter(|i| s.project.items.contains_key(i)).collect());
     }
-    if let Some(i) = u64_p(p, "item") {
-        return vec![ItemId(i)];
+    if let Some(i) = u64_p(p, "item")? {
+        return Ok(vec![ItemId(i)]);
     }
     if !s.state.project_selection.is_empty() {
-        return s.state.project_selection.clone();
+        return Ok(s.state.project_selection.clone());
     }
     let mut out = Vec::new();
     if let Some(q) = s.active_sequence() {
@@ -368,7 +368,7 @@ fn targets(s: &Session, p: &Value) -> Vec<ItemId> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// The media clip behind an item (subclips resolve to their parent).
@@ -384,10 +384,10 @@ fn file_path(m: &filmcraft_project::MediaClip) -> Option<&str> {
 }
 
 fn has_media_selection(s: &Session) -> std::result::Result<(), String> {
-    if targets(s, &Value::Null).iter().any(|i| media_of(&s.project, *i).is_some()) { Ok(()) } else { Err("select a clip".into()) }
+    if targets(s, &Value::Null).map_err(|e| e.to_string())?.iter().any(|i| media_of(&s.project, *i).is_some()) { Ok(()) } else { Err("select a clip".into()) }
 }
 fn has_file_selection(s: &Session) -> std::result::Result<(), String> {
-    if targets(s, &Value::Null).iter().any(|i| media_of(&s.project, *i).is_some_and(|(_, m)| file_path(m).is_some())) {
+    if targets(s, &Value::Null).map_err(|e| e.to_string())?.iter().any(|i| media_of(&s.project, *i).is_some_and(|(_, m)| file_path(m).is_some())) {
         Ok(())
     } else {
         Err("select a clip with a media file".into())
@@ -397,7 +397,7 @@ fn has_original(s: &Session) -> std::result::Result<(), String> {
     has_file_selection(s)
 }
 fn has_audio_selection(s: &Session) -> std::result::Result<(), String> {
-    if targets(s, &Value::Null).iter().any(|i| media_of(&s.project, *i).is_some_and(|(_, m)| m.info.has_audio())) {
+    if targets(s, &Value::Null).map_err(|e| e.to_string())?.iter().any(|i| media_of(&s.project, *i).is_some_and(|(_, m)| m.info.has_audio())) {
         Ok(())
     } else {
         Err("select a clip with audio".into())
@@ -407,7 +407,7 @@ fn is_offline(s: &Session, id: ItemId) -> bool {
     media_of(&s.project, id).is_some_and(|(mid, m)| m.offline || s.media.offline_status(mid).is_some())
 }
 fn has_offline_selection(s: &Session) -> std::result::Result<(), String> {
-    if targets(s, &Value::Null).iter().any(|i| is_offline(s, *i)) { Ok(()) } else { Err("select an offline clip".into()) }
+    if targets(s, &Value::Null).map_err(|e| e.to_string())?.iter().any(|i| is_offline(s, *i)) { Ok(()) } else { Err("select an offline clip".into()) }
 }
 fn has_loggable(s: &Session) -> std::result::Result<(), String> {
     if s.project.items.keys().any(|i| media_of(&s.project, *i).is_some()) { Ok(()) } else { Err("the project has no clips to log".into()) }
@@ -442,56 +442,52 @@ pub fn query_p(p: &Value, cmd: &str) -> Result<FindQuery> {
     Ok(FindQuery { rows, match_all: bool_p(p, "matchAll").unwrap_or(true), case_sensitive: bool_p(p, "caseSensitive").unwrap_or(false) })
 }
 
-fn search_bin_json(p: &Project, b: &SearchBin) -> Value {
-    json!({"bin": b.id.0, "name": b.name, "query": b.query, "items": b.query.find(p).iter().map(|i| i.0).collect::<Vec<_>>()})
+fn search_bin_json(p: &Project, b: &SearchBin) -> Result<Value> {
+    let items = crate::search_organization::results(p, &b.query)?;
+    Ok(json!({"bin":b.id.0,"name":b.name,"query":b.query,"items":items.iter().map(|i|i.0).collect::<Vec<_>>()}))
 }
-
+fn search_name<'a>(p: &'a Value, cmd: &str) -> Result<Option<&'a str>> {
+    p.get("name").map(|v| v.as_str().ok_or_else(|| bad(cmd, "search-bin name must be text"))).transpose()
+}
 fn new_search_bin(s: &mut Session, p: &Value) -> Result<Value> {
-    let q = query_p(p, "file.newSearchBin")?;
-    if q.is_empty() {
-        return Err(bad("file.newSearchBin", "enter text to search for"));
-    }
-    let name = str_p(p, "name").map(str::to_string).unwrap_or_else(|| q.rows.iter().find(|r| !r.text.is_empty()).map(|r| r.text.clone()).unwrap_or_default());
-    let b = s.edit("New Search Bin", |pr, _| {
-        let id = filmcraft_project::BinId(pr.alloc_id());
-        let b = SearchBin { id, name, query: q };
-        pr.search_bins.push(b.clone());
-        Ok(b)
-    })?;
-    Ok(search_bin_json(&s.project, &b))
+    let q = crate::search_organization::query_params(p, "file.newSearchBin")?;
+    let name = search_name(p, "file.newSearchBin")?;
+    crate::search_organization::validate_inventory(&s.project)?;
+    s.edit("New Search Bin", |pr, _| {
+        let b = crate::search_organization::create(pr, name, q)?;
+        search_bin_json(pr, &b)
+    })
 }
-
 fn bin_p(s: &Session, p: &Value, cmd: &str) -> Result<SearchBin> {
-    let id = u64_p(p, "bin").ok_or_else(|| bad(cmd, "need `bin`"))?;
-    s.project.search_bins.iter().find(|b| b.id.0 == id).cloned().ok_or_else(|| bad(cmd, format!("no search bin {id}")))
+    let id = u64_p(p, "bin")?.ok_or_else(|| bad(cmd, "need `bin`"))?;
+    crate::search_organization::get(&s.project, filmcraft_project::BinId(id))
 }
-
 fn search_bin_items(s: &mut Session, p: &Value) -> Result<Value> {
     let b = bin_p(s, p, "project.searchBinItems")?;
-    Ok(search_bin_json(&s.project, &b))
+    search_bin_json(&s.project, &b)
 }
-
 fn edit_search_bin(s: &mut Session, p: &Value) -> Result<Value> {
     let b = bin_p(s, p, "project.editSearchBin")?;
-    let q = if p.get("rows").is_some() || p.get("text").is_some() { Some(query_p(p, "project.editSearchBin")?) } else { None };
-    let name = str_p(p, "name").map(str::to_string);
-    let out = s.edit("Edit Search Bin", |pr, _| {
-        let x = pr.search_bins.iter_mut().find(|x| x.id == b.id).ok_or_else(|| bad("project.editSearchBin", "gone"))?;
-        if let Some(q) = q {
-            x.query = q;
+    let query_keys = ["rows", "text", "column", "operator", "op", "matchAll", "caseSensitive"];
+    let q = if query_keys.iter().any(|key| p.get(*key).is_some()) {
+        if p.get("rows").is_none() && p.get("text").is_none() {
+            return Err(bad("project.editSearchBin", "supply the complete query rows or legacy text with query changes"));
         }
-        if let Some(n) = name {
-            x.name = n;
-        }
-        Ok(x.clone())
-    })?;
-    Ok(search_bin_json(&s.project, &out))
+        Some(crate::search_organization::query_params(p, "project.editSearchBin")?)
+    } else {
+        None
+    };
+    let name = search_name(p, "project.editSearchBin")?;
+    s.edit("Edit Search Bin", |pr, _| {
+        let b = crate::search_organization::update(pr, b.id, name, q)?;
+        search_bin_json(pr, &b)
+    })
 }
-
 fn delete_search_bin(s: &mut Session, p: &Value) -> Result<Value> {
-    let b = bin_p(s, p, "project.deleteSearchBin")?;
+    let id = u64_p(p, "bin")?.ok_or_else(|| bad("project.deleteSearchBin", "need `bin`"))?;
+    crate::search_organization::validate_inventory(&s.project)?;
     s.edit("Delete Search Bin", |pr, _| {
-        pr.search_bins.retain(|x| x.id != b.id);
+        crate::search_organization::delete(pr, filmcraft_project::BinId(id))?;
         Ok(())
     })?;
     Ok(Value::Null)
@@ -792,8 +788,8 @@ pub fn project_subset(p: &Project, keep: &BTreeSet<ItemId>) -> Project {
 
 fn export_selection(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.exportSelectionProject", "need `path`"))?.to_string();
-    let roots = match p.get("items").and_then(Value::as_array) {
-        Some(a) => a.iter().filter_map(|v| v.as_u64().map(ItemId)).collect(),
+    let roots = match crate::commands::ids_p(p, "items")? {
+        Some(ids) => ids.into_iter().map(ItemId).collect(),
         None => s.state.project_selection.clone(),
     };
     if roots.is_empty() {
@@ -813,8 +809,8 @@ fn export_selection(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn export_ale(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.exportAle", "need `path`"))?.to_string();
-    let mut items: Vec<ItemId> = match p.get("items").and_then(Value::as_array) {
-        Some(a) => a.iter().filter_map(|v| v.as_u64().map(ItemId)).collect(),
+    let mut items: Vec<ItemId> = match crate::commands::ids_p(p, "items")? {
+        Some(ids) => ids.into_iter().map(ItemId).collect(),
         None => s.state.project_selection.clone(),
     };
     if items.is_empty() {
@@ -862,7 +858,7 @@ pub fn info_json(name: &str, path: Option<&str>, info: &filmcraft_media::MediaIn
 
 fn media_properties(s: &mut Session, p: &Value) -> Result<Value> {
     let mut out = Vec::new();
-    for id in targets(s, p) {
+    for id in targets(s, p)? {
         let Some((mid, m)) = media_of(&s.project, id) else { continue };
         let name = s.project.item(id).map(|i| i.name.clone()).unwrap_or_default();
         let mut v = info_json(&name, file_path(m), &m.info);
@@ -1120,7 +1116,7 @@ pub(crate) fn openable_original(path: &str) -> std::result::Result<(), String> {
 
 fn edit_original(s: &mut Session, p: &Value) -> Result<Value> {
     let mut paths = Vec::new();
-    for id in targets(s, p) {
+    for id in targets(s, p)? {
         if let Some(path) = media_of(&s.project, id).and_then(|(_, m)| file_path(m))
             && !paths.iter().any(|x: &String| x == path)
         {
@@ -1141,7 +1137,7 @@ pub const OFFLINE_FIELDS: [(&str, &str); 5] =
     [("tapeName", "Tape Name"), ("description", "Description"), ("scene", "Scene"), ("shot", "Shot"), ("logNote", "Log Note")];
 
 fn edit_offline(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = targets(s, p).into_iter().find(|i| is_offline(s, *i)).ok_or_else(|| EngineError::Other("select an offline clip".into()))?;
+    let id = targets(s, p)?.into_iter().find(|i| is_offline(s, *i)).ok_or_else(|| EngineError::Other("select an offline clip".into()))?;
     let name = str_p(p, "mediaName").map(str::to_string);
     let fields: Vec<(&'static str, String)> = OFFLINE_FIELDS.iter().filter_map(|(k, key)| str_p(p, k).map(|v| (*key, v.to_string()))).collect();
     s.edit("Edit Offline", |pr, _| {
@@ -1163,7 +1159,7 @@ fn edit_offline(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn source_settings(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = targets(s, p).into_iter().find(|i| media_of(&s.project, *i).is_some()).ok_or_else(|| EngineError::Other("select a clip".into()))?;
+    let id = targets(s, p)?.into_iter().find(|i| media_of(&s.project, *i).is_some()).ok_or_else(|| EngineError::Other("select a clip".into()))?;
     let (_, m) = media_of(&s.project, id).ok_or_else(|| EngineError::Other("select a clip".into()))?;
     let codec = m.info.video.as_ref().map(|v| v.codec.clone()).or_else(|| m.info.audio().map(|a| a.codec.clone())).unwrap_or_default();
     Ok(json!({
@@ -1207,7 +1203,7 @@ pub fn sidecar_path(media: &str) -> String {
 fn update_metadata(s: &mut Session, p: &Value) -> Result<Value> {
     let mut written = Vec::new();
     let mut skipped = Vec::new();
-    for id in targets(s, p) {
+    for id in targets(s, p)? {
         let Some(it) = s.project.item(id) else { continue };
         let Some(path) = media_of(&s.project, id).and_then(|(_, m)| file_path(m)) else { continue };
         let side = sidecar_path(path);
@@ -1229,7 +1225,8 @@ fn update_metadata(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn generate_waveform(s: &mut Session, p: &Value) -> Result<Value> {
-    let items: Vec<u64> = targets(s, p).into_iter().filter_map(|i| media_of(&s.project, i).filter(|(_, m)| m.info.has_audio()).map(|(mid, _)| mid.0)).collect();
+    let items: Vec<u64> =
+        targets(s, p)?.into_iter().filter_map(|i| media_of(&s.project, i).filter(|(_, m)| m.info.has_audio()).map(|(mid, _)| mid.0)).collect();
     if items.is_empty() {
         return Err(EngineError::Other("select a clip with audio".into()));
     }
@@ -1256,8 +1253,8 @@ fn automate_to_sequence(s: &mut Session, p: &Value) -> Result<Value> {
     let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
     let rate = q.settings.frame_rate;
     let fd = rate.frame_duration();
-    let mut items: Vec<ItemId> = match p.get("items").and_then(Value::as_array) {
-        Some(a) => a.iter().filter_map(|v| v.as_u64().map(ItemId)).collect(),
+    let mut items: Vec<ItemId> = match crate::commands::ids_p(p, "items")? {
+        Some(ids) => ids.into_iter().map(ItemId).collect(),
         None => s.state.project_selection.clone(),
     };
     let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
@@ -1276,8 +1273,8 @@ fn automate_to_sequence(s: &mut Session, p: &Value) -> Result<Value> {
     if vdest.is_none() && adest.is_none() {
         return Err(EngineError::Other("no destination track (check source patching, or don't ignore both audio and video)".into()));
     }
-    let overlap = if placement == "sequentially" { rate.tick_of(u64_p(p, "overlapFrames").unwrap_or(30) as i64) } else { Tick::ZERO };
-    let still = u64_p(p, "stillFrames").map(|f| rate.tick_of(f as i64));
+    let overlap = if placement == "sequentially" { rate.tick_of(u64_p(p, "overlapFrames")?.unwrap_or(30) as i64) } else { Tick::ZERO };
+    let still = u64_p(p, "stillFrames")?.map(|f| rate.tick_of(f as i64));
     // each item's range (In/Out marks; stills: `stillFrames` or the default still duration)
     let mut plan: Vec<(ItemId, TimeRange)> = Vec::new();
     for id in &items {

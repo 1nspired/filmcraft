@@ -72,7 +72,7 @@ pub(crate) fn select_all_keyframes(app: &mut FilmcraftApp) -> bool {
     let mut keys = Vec::new();
     for (clip, it, _) in selected_clips(app) {
         for (effect, e) in it.effects.iter().enumerate() {
-            let key = |param: &str, mask, time| KeyframeRef { clip: clip.0, effect, param: param.to_string(), mask, time };
+            let key = |param: &str, mask, time| KeyframeRef::new(clip.0, &it, effect, param.to_string(), mask, time);
             for (param, p) in &e.params {
                 keys.extend(p.keyframes.iter().map(|kf| key(param, None, kf.time)));
             }
@@ -129,7 +129,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let clips = selected_clips(app);
     // keep only selected keyframes that still exist on a clip shown here
-    app.ui.keyframe_selection.retain(|k| clips.iter().any(|(c, it, _)| c.0 == k.clip && keyframe_exists(it, k)));
+    app.ui.keyframe_selection.retain_mut(|k| clips.iter().any(|(c, it, _)| c.0 == k.clip && k.resolve(it) && keyframe_exists(it, k)));
     let Some((clip, it, _)) = clips.first().cloned() else {
         // a transition clicked in the Timeline (#430)
         if let Some(id) = crate::panels::transition_controls::selected(app) {
@@ -209,7 +209,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 } else {
                     std::mem::take(&mut after_fixed)
                 };
-                let key = format!("{}:{}", clip.0, idx);
+                let key = e.instance_id.as_ref().map_or_else(|| format!("{}:{}", clip.0, idx), |id| format!("{}:effect:{id}", clip.0));
                 let open = !app.ui.collapsed_fx.contains(&key);
                 let selected = app.session.state.selected_effect.as_ref().is_some_and(|s| s.clip == clip && s.index(&it.effects) == Some(idx));
                 let (r, resp) = bui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::click());
@@ -262,6 +262,22 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let mut save_preset = false;
                 let fx_id = e.effect.clone();
                 resp.context_menu(|ui| {
+                    if !def.intrinsic {
+                        for (label, suffix, destination) in [
+                            (tl!("Move Up"), "moveUp", idx.checked_sub(1)),
+                            (tl!("Move Down"), "moveDown", idx.checked_add(1).filter(|n| *n < it.effects.len())),
+                        ] {
+                            let movable = destination.and_then(|n| it.effects.get(n)).is_some_and(|e| e.def().is_some_and(|d| !d.intrinsic));
+                            let response = ui.add_enabled(movable, egui::Button::new(label));
+                            app.auto.add(&format!("effectControls.clip.{}.effect.{idx}.{suffix}", clip.0), response.rect, label);
+                            if response.clicked() {
+                                if let Some(to) = destination {
+                                    actions.push(("effects.reorder".into(), json!({"clip":clip.0,"from":idx,"to":to})));
+                                }
+                                ui.close();
+                            }
+                        }
+                    }
                     let sp = ui.button(tl!("Save Preset…"));
                     app.auto.add(&format!("effectControls.effect.{fx_id}.savePreset"), sp.rect, "Save Preset…");
                     if sp.clicked() {
@@ -713,7 +729,7 @@ pub(crate) fn param_row(
             let id = egui::Id::new(("kf", clip.0, idx, pkey, k.time.0));
             let original = Rect::from_center_size(pos2(lane.min.x + f * lane.width(), y), vec2(15.0, 15.0));
             let resp = ui.interact(original.expand(2.0), id, Sense::click_and_drag());
-            let reference = KeyframeRef { clip: clip.0, effect: idx, param: pd.id.to_string(), mask, time: k.time };
+            let reference = KeyframeRef::new(clip.0, it, idx, pd.id.to_string(), mask, k.time);
             let kr = keys.key(app, ui, reference.clone(), it, *lane, original, &resp, k.interp);
             app.auto.add(&format!("effectControls.{}.{}.keyframe.{}", e.effect, pkey, k.time.0), kr, "keyframe");
             let selected = app.ui.keyframe_selection.contains(&reference);
@@ -723,7 +739,7 @@ pub(crate) fn param_row(
                 actions.push(("playhead.set".into(), json!({"time": tl.0})));
             }
             resp.context_menu(|ui| {
-                keyframe_menu(app, ui, KeyframeRef { clip: clip.0, effect: idx, param: pd.id.to_string(), mask, time: k.time }, actions);
+                keyframe_menu(app, ui, KeyframeRef::new(clip.0, it, idx, pd.id.to_string(), mask, k.time), actions);
             });
         }
     }
@@ -1047,8 +1063,18 @@ pub(crate) fn run(app: &mut FilmcraftApp, ctx: &egui::Context, actions: Vec<(Str
             p["begin"] = json!(begun != press && !wrote);
             wrote = true;
         }
-        if let Err(e) = app.session.execute(&cmd, p) {
-            app.ui.status = e.to_string();
+        let reordered_clip = (cmd == "effects.reorder").then(|| p.get("clip").and_then(Value::as_u64)).flatten();
+        match app.session.execute(&cmd, p) {
+            Err(e) => app.ui.status = e.to_string(),
+            Ok(_) => {
+                if let Some(clip) = reordered_clip {
+                    // Tracked references resolve by ID on the next frame. An old
+                    // untracked ordinal cannot safely survive a stack reorder.
+                    app.ui.keyframe_selection.retain(|key| key.clip != clip || key.effect_instance_id.is_some());
+                    let prefix = format!("{clip}:");
+                    app.ui.collapsed_fx.retain(|key| !key.starts_with(&prefix) || key.starts_with(&format!("{clip}:effect:")));
+                }
+            }
         }
     }
     if down && (wrote || begun.is_some()) {
@@ -1207,7 +1233,7 @@ pub(crate) fn graph_rows(
             let r = Rect::from_center_size(c, vec2(10.0, 10.0));
             let resp = ui.interact(r.expand(2.0), id, Sense::click_and_drag());
             resp.context_menu(|ui| {
-                keyframe_menu(app, ui, KeyframeRef { clip: clip.0, effect: idx, param: pd.id.to_string(), mask, time: k.time }, actions);
+                keyframe_menu(app, ui, KeyframeRef::new(clip.0, it, idx, pd.id.to_string(), mask, k.time), actions);
             });
             let auto_id = match (comps.len(), ci) {
                 (1, _) => format!("effectControls.{}.graph.keyframe.{}", pd.id, k.time.0),

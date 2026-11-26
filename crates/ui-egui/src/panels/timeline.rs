@@ -265,7 +265,7 @@ pub fn max_scroll(sequence_seconds: f64, width: f32, pps: f64) -> f64 {
 /// Where the left edge goes so the playhead at `ph` seconds shows in a view `width` points wide
 /// (the page-scroll margin from the left), or `None` when it is in view already.
 pub fn scroll_to_reveal(ph: f64, scroll: f64, pps: f64, width: f64) -> Option<f64> {
-    if !ph.is_finite() || !scroll.is_finite() || !(pps > 0.0 && pps.is_finite()) {
+    if !(ph.is_finite() && scroll.is_finite() && pps > 0.0 && pps.is_finite()) {
         return None;
     }
     let px = (ph - scroll) * pps;
@@ -944,6 +944,10 @@ fn draw_clip(
         }
         if (it.speed - 1.0).abs() > 1e-6 || it.reverse {
             label = format!("{label} [{}%]", ((if it.reverse { -1.0 } else { 1.0 }) * it.speed * 100.0).round());
+        }
+        if let Some(identity) = it.identity.as_ref().filter(|i| i.protection.is_some()) {
+            label = format!("[P] {label}");
+            app.auto.add(&format!("timeline.poema.protected.{}", it.id.0), body, identity.protection.as_deref().unwrap_or_default());
         }
         clip_p.text(
             pos2(body.min.x + 6.0, body.min.y + 8.5),
@@ -2025,6 +2029,7 @@ fn marker_menu(app: &mut FilmcraftApp, ctx: &egui::Context, ui: &mut egui::Ui, m
 }
 
 pub(crate) const CLIP_MENU: &[&[(&str, &str)]] = &[
+    &[("Poema notes & protection…", "clip.poemaNotes")],
     &[
         ("Cut", "edit.cut"),
         ("Copy", "edit.copy"),
@@ -2562,10 +2567,8 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                 Drag::Scrub { initial } => {
                     app.session.set_playhead(initial);
                 }
-                Drag::Volume(v) => {
-                    if v.changed() {
-                        let _ = app.session.execute("edit.undo", json!({}));
-                    }
+                Drag::Volume(v) if v.changed() => {
+                    let _ = app.session.execute("edit.undo", json!({}));
                 }
                 Drag::Pan { start_scroll, start_v, .. } => {
                     let v = &mut app.ui.timeline;
@@ -2911,10 +2914,12 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                     "clip.link" if linked => tl!("Unlink"),
                     _ => crate::i18n::t(label),
                 };
-                let r = ui.add_enabled(!sel.is_empty() && app.session.is_enabled(cmd), egui::Button::new(label));
+                let r = ui.add_enabled(!sel.is_empty() && (cmd == "clip.poemaNotes" || app.session.is_enabled(cmd)), egui::Button::new(label));
                 app.auto.add(&format!("timeline.clipMenu.{cmd}"), r.rect, label);
                 if r.clicked() {
-                    match crate::menus::invoke(app, &ctx, cmd, json!({})) {
+                    let params =
+                        if cmd == "clip.poemaNotes" { json!({"clip": ctx.data(|d| d.get_temp::<ClipId>(menu_clip_id)).map(|id| id.0)}) } else { json!({}) };
+                    match crate::menus::invoke(app, &ctx, cmd, params) {
                         // Unlink (#220): the clips were selected together because they were linked;
                         // keep only the one right-clicked, so it can be dragged away from the others
                         Ok(v) if cmd == "clip.link" && v["linked"] == json!(false) => {

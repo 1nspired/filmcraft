@@ -858,9 +858,11 @@ pub(crate) fn mix_graph_at(
     let ovs = live.filter(|l| l.is_active()).map(LiveMix::overrides).unwrap_or_default();
     let plan = Plan::build(seq, &ovs);
     let key = plan.structure_hash(sr);
-    let taken = {
+    let taken = if sources.reuse_audio_state() {
         let mut c = lock(cache());
         c.get_mut(&key).and_then(|v| v.iter().position(|g| g.next_out == start).map(|i| v.swap_remove(i)))
+    } else {
+        None
     };
     let (mut st, skip) = match taken {
         Some(st) => (st, 0usize),
@@ -937,7 +939,7 @@ pub(crate) fn mix_graph_at(
         }
     }
     st.next_out = start + frames as i64;
-    {
+    if sources.reuse_audio_state() {
         let mut c = lock(cache());
         let v = c.entry(key).or_default();
         v.push(st);
@@ -952,4 +954,33 @@ pub(crate) fn mix_graph_at(
         l.post_meters(&meters);
     }
     AudioBuffer { sample_rate: sr, channels: out.into_iter().map(|c| c[skip..].to_vec()).collect() }
+}
+
+#[cfg(test)]
+mod inspection_cache_tests {
+    use super::*;
+    #[test]
+    fn independent_mix_does_not_consume_or_publish_cached_graph_states() {
+        struct Independent;
+        impl SourceProvider for Independent {
+            fn source(&self, _: ItemId) -> Option<filmcraft_media::SharedSource> {
+                None
+            }
+            fn reuse_audio_state(&self) -> bool {
+                false
+            }
+        }
+        use filmcraft_project::ItemId;
+        let mut p = Project::new("cache isolation");
+        let id = p.new_sequence("isolated", Default::default(), 0, 1, None);
+        p.sequence_mut(id).unwrap().audio_tracks[0].id = TrackId(77_451_999);
+        let seq = p.sequence(id).unwrap();
+        let key = Plan::build(seq, &HashMap::new()).structure_hash(seq.settings.sample_rate);
+        let map = crate::SourceMap::default();
+        mix_graph(&p, seq, 0, 16, &map, None);
+        let before = lock(cache()).get(&key).unwrap().iter().map(|s| s.next_out).collect::<Vec<_>>();
+        mix_graph(&p, seq, 16, 16, &Independent, None);
+        let after = lock(cache()).get(&key).unwrap().iter().map(|s| s.next_out).collect::<Vec<_>>();
+        assert_eq!(before, after, "inspection cannot steal or advance a playback state");
+    }
 }

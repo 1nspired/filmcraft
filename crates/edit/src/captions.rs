@@ -3,7 +3,7 @@
 //! Captions live on caption tracks ([`CaptionTrack`]); like track items they never overlap. Every
 //! function validates first and returns an error leaving the sequence untouched, or applies the
 //! whole edit. Locked caption tracks refuse edits. Sync-locked caption tracks follow insert and
-//! extract edits on the media tracks (see [`crate::insert`] / [`crate::extract`]).
+//! extract, ripple-delete, gap-closing and ripple-trim edits on the media tracks.
 
 use filmcraft_project::{Caption, CaptionTrack, ClipId, Sequence, TrackId};
 use filmcraft_time::{Tick, TimeRange};
@@ -292,6 +292,134 @@ pub fn extract_range(tr: &mut CaptionTrack, range: TimeRange) {
     tr.sort();
 }
 
+/// Follow a media Ripple Trim at the original cut. Shortening extracts its removed time;
+/// extension inserts time at the cut, splitting a straddling cue by the existing insert policy.
+/// Locked and non-sync-locked tracks stay fixed. Preserve exact ticks, including sub-frame cues.
+pub fn ripple_trim(tracks: &mut [CaptionTrack], edge: Edge, cut: Tick, delta: Tick, ctx: &mut EditCtx) -> Result<()> {
+    if delta == Tick::ZERO {
+        return Ok(());
+    }
+    let magnitude = delta.0.checked_abs().ok_or_else(|| EditError::Other("caption trim delta overflow".into()))?;
+    let extension = (edge == Edge::Out) == (delta > Tick::ZERO);
+    let at = if !extension && edge == Edge::Out { cut.0.checked_sub(magnitude) } else { Some(cut.0) }
+        .filter(|at| *at >= 0)
+        .ok_or_else(|| EditError::Other("caption trim precedes the sequence".into()))?;
+    at.checked_add(magnitude).ok_or_else(|| EditError::Other("caption trim range overflow".into()))?;
+    // Validate every shifted end and reserve enough native IDs before changing tracks or allocator.
+    let mut splits = 0_u64;
+    for track in tracks.iter().filter(|t| !t.locked && t.sync_lock) {
+        for cue in &track.captions {
+            let end = cue.start.0.checked_add(cue.duration.0).ok_or_else(|| EditError::Other("caption end overflow".into()))?;
+            if cue.start < Tick::ZERO || cue.duration <= Tick::ZERO {
+                return Err(EditError::Other("caption trim needs valid positive cue ranges".into()));
+            }
+            if extension && end > at {
+                end.checked_add(magnitude).ok_or_else(|| EditError::Other("caption insertion exceeds exact time".into()))?;
+            }
+        }
+        if extension && track.caption_at(Tick(at)).is_some_and(|c| c.start.0 < at) {
+            splits = splits.checked_add(1).ok_or_else(|| EditError::Other("caption split count overflow".into()))?;
+        }
+    }
+    if extension {
+        ctx.next_id.checked_add(splits).ok_or_else(|| EditError::Other("caption identity allocation overflow".into()))?;
+    }
+    for track in tracks.iter_mut().filter(|t| !t.locked && t.sync_lock) {
+        if extension {
+            insert_gap(track, Tick(at), Tick(magnitude), ctx);
+        } else {
+            extract_range(track, TimeRange::new(Tick(at), Tick(magnitude)));
+        }
+    }
+    Ok(())
+}
+
+/// Lost cue content in one explicitly owned removed interval. `caption.start`
+/// is an offset within that interval; duration and all other metadata are exact.
+/// `may_create` is granted only when a native removal made this cue absent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestoreFragment {
+    pub caption: Caption,
+    pub may_create: bool,
+}
+
+/// Invert owned caption removal while retaining current authored text/metadata.
+/// Other cues follow the ordinary insert-gap service. Existing owned cues must
+/// still touch the cut; ambiguous moved/deleted cues and overlaps refuse atomically.
+pub fn restore_gap(track: &mut CaptionTrack, at: Tick, duration: Tick, fragments: &[RestoreFragment], ctx: &mut EditCtx) -> Result<()> {
+    if track.locked || !track.sync_lock {
+        return if fragments.is_empty() { Ok(()) } else { Err(EditError::Locked) };
+    }
+    track.check().map_err(EditError::Other)?;
+    if track.captions.iter().map(|cue| cue.id).collect::<std::collections::BTreeSet<_>>().len() != track.captions.len() {
+        return Err(EditError::Other("caption restoration needs unique native identities".into()));
+    }
+    if at < Tick::ZERO || duration <= Tick::ZERO || at.0.checked_add(duration.0).is_none() {
+        return Err(EditError::Other("caption restoration needs a positive bounded gap".into()));
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    let mut restored = Vec::new();
+    for fragment in fragments {
+        let archived = &fragment.caption;
+        if archived.id.0 == 0
+            || archived.id.0 >= *ctx.next_id
+            || !ids.insert(archived.id)
+            || archived.start < Tick::ZERO
+            || archived.duration <= Tick::ZERO
+            || archived.start.0.checked_add(archived.duration.0).is_none_or(|end| end > duration.0)
+        {
+            return Err(EditError::Other("invalid or duplicate owned caption fragment".into()));
+        }
+        let cue = if let Some(current) = track.caption(archived.id) {
+            let left = current.start < at && current.end() >= at;
+            let right = current.start == at && current.end() > at;
+            if !(left && archived.start == Tick::ZERO && (current.end() == at || archived.duration == duration)
+                || right && archived.start + archived.duration == duration)
+            {
+                return Err(EditError::Other("a human caption no longer meets its owned restoration cut".into()));
+            }
+            let mut cue = current.clone();
+            if right {
+                cue.start = Tick(at.0.checked_add(archived.start.0).ok_or_else(|| EditError::Other("caption restoration overflow".into()))?);
+            }
+            cue.duration = Tick(cue.duration.0.checked_add(archived.duration.0).ok_or_else(|| EditError::Other("caption duration overflow".into()))?);
+            cue
+        } else {
+            if !fragment.may_create {
+                return Err(EditError::Other("a retained caption was deleted outside the owned removal".into()));
+            }
+            let mut cue = archived.clone();
+            cue.start = Tick(at.0.checked_add(cue.start.0).ok_or_else(|| EditError::Other("caption restoration overflow".into()))?);
+            cue
+        };
+        if cue.start.0.checked_add(cue.duration.0).is_none() {
+            return Err(EditError::Other("restored caption exceeds native time".into()));
+        }
+        restored.push(cue);
+    }
+    let mut work = track.clone();
+    work.captions.retain(|cue| !ids.contains(&cue.id));
+    for cue in &work.captions {
+        if cue.end() > at && cue.end().0.checked_add(duration.0).is_none() {
+            return Err(EditError::Other("caption gap would overflow later human work".into()));
+        }
+    }
+    let splits = u64::from(work.caption_at(at).is_some_and(|cue| cue.start < at));
+    ctx.next_id.checked_add(splits).ok_or_else(|| EditError::Other("caption restoration identity overflow".into()))?;
+    let mut next = *ctx.next_id;
+    let mut local = EditCtx { next_id: &mut next, media_duration: ctx.media_duration, media_start: ctx.media_start, min_duration: ctx.min_duration };
+    insert_gap(&mut work, at, duration, &mut local);
+    work.captions.extend(restored);
+    work.sort();
+    work.check().map_err(EditError::Other)?;
+    if work.captions.iter().map(|cue| cue.id).collect::<std::collections::BTreeSet<_>>().len() != work.captions.len() {
+        return Err(EditError::Other("restoration would reuse an existing native caption identity".into()));
+    }
+    *track = work;
+    *ctx.next_id = next;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +449,142 @@ mod tests {
     fn ctx(next: &mut u64) -> EditCtx<'_> {
         static NONE: fn(filmcraft_project::ItemId) -> Option<Tick> = |_| None;
         EditCtx { next_id: next, media_duration: &NONE, media_start: &|_| Tick::ZERO, min_duration: Tick(10) }
+    }
+
+    fn fragment(cue: &Caption, gap: TimeRange, may_create: bool) -> RestoreFragment {
+        let mut caption = cue.clone();
+        let first = cue.start.max(gap.start);
+        let last = cue.end().min(gap.end());
+        caption.start = first - gap.start;
+        caption.duration = last - first;
+        RestoreFragment { caption, may_create }
+    }
+
+    #[test]
+    fn restore_owned_gap_recovers_exact_partial_missing_and_subframe_cues_with_current_human_words() {
+        for (start, duration) in [(0, 100), (0, 30), (25, 50), (25, 5), (39, 1)] {
+            let (mut seq, tid) = seq_with(&[(start, duration, "Original words"), (150, 23, "Later words")]);
+            let track = seq.caption_track_mut(tid).unwrap();
+            track.captions[0].speaker = Some("Speaker".into());
+            track.captions[0].cue_id = Some("original-cue".into());
+            track.captions[0].settings = "align:start".into();
+            track.vtt_blocks.push("NOTE original annotation".into());
+            let mut expected = track.clone();
+            let gap = TimeRange::new(Tick(20), Tick(20));
+            let original = track.captions[0].clone();
+            extract_range(track, gap);
+            let missing = track.caption(original.id).is_none();
+            if let Some(cue) = track.caption_mut(original.id) {
+                cue.text = "Human correction".into();
+                expected.captions[0].text = cue.text.clone();
+            }
+            let mut next = 2000;
+            restore_gap(track, gap.start, gap.duration, &[fragment(&original, gap, missing)], &mut ctx(&mut next)).unwrap();
+            assert_eq!(*track, expected);
+            assert_eq!(next, 2000);
+            assert!(seq.check().is_ok());
+        }
+    }
+
+    #[test]
+    fn restore_owned_gap_preserves_and_splits_new_human_cues_while_resurrecting_original_identity() {
+        let (mut seq, tid) = seq_with(&[(25, 5, "Removed words")]);
+        let track = seq.caption_track_mut(tid).unwrap();
+        let original = track.captions[0].clone();
+        let gap = TimeRange::new(Tick(20), Tick(20));
+        extract_range(track, gap);
+        let mut human = original.clone();
+        human.id = ClipId(1500);
+        human.start = Tick(15);
+        human.duration = Tick(10);
+        human.text = "Later human work".into();
+        human.cue_id = Some("human-cue".into());
+        track.captions.push(human);
+        let mut next = 2000;
+        restore_gap(track, gap.start, gap.duration, &[fragment(&original, gap, true)], &mut ctx(&mut next)).unwrap();
+        assert_eq!(
+            track.captions.iter().map(|c| (c.id.0, c.start.0, c.duration.0, c.text.as_str())).collect::<Vec<_>>(),
+            vec![(1500, 15, 5, "Later human work"), (1000, 25, 5, "Removed words"), (2000, 40, 5, "Later human work")]
+        );
+        assert_eq!(track.captions[0].cue_id.as_deref(), Some("human-cue"));
+        assert_eq!(track.captions[2].cue_id, None);
+        assert_eq!(next, 2001);
+    }
+
+    #[test]
+    fn restore_adjacent_owned_gaps_rejoins_a_cue_removed_across_two_passages_in_either_order() {
+        for reverse in [false, true] {
+            let (mut seq, tid) = seq_with(&[(25, 30, "Cross-passage words")]);
+            let track = seq.caption_track_mut(tid).unwrap();
+            let original = track.captions[0].clone();
+            let before = track.clone();
+            let first = TimeRange::new(Tick(20), Tick(20));
+            let second = TimeRange::new(Tick(40), Tick(20));
+            let a = fragment(&original, first, true);
+            let b = fragment(&original, second, true);
+            extract_range(track, second);
+            extract_range(track, first);
+            assert!(track.captions.is_empty());
+            let mut next = 2000;
+            if reverse {
+                restore_gap(track, Tick(20), second.duration, &[b], &mut ctx(&mut next)).unwrap();
+                restore_gap(track, first.start, first.duration, &[a], &mut ctx(&mut next)).unwrap();
+            } else {
+                restore_gap(track, first.start, first.duration, &[a], &mut ctx(&mut next)).unwrap();
+                restore_gap(track, second.start, second.duration, &[b], &mut ctx(&mut next)).unwrap();
+            }
+            assert_eq!(*track, before);
+            assert_eq!(next, 2000);
+        }
+    }
+
+    #[test]
+    fn restore_owned_gap_refuses_deleted_moved_locked_overlapping_or_overflowing_work_atomically() {
+        for mode in 0..9 {
+            let (mut seq, tid) = seq_with(&[(0, 100, "Original")]);
+            let track = seq.caption_track_mut(tid).unwrap();
+            let original = track.captions[0].clone();
+            let gap = TimeRange::new(Tick(20), Tick(20));
+            extract_range(track, gap);
+            let mut fragments = vec![fragment(&original, gap, false)];
+            let mut next = 2000;
+            match mode {
+                0 => track.captions.clear(),
+                1 => track.captions[0].start = Tick(21),
+                2 => track.locked = true,
+                3 => track.sync_lock = false,
+                4 => fragments.push(fragments[0].clone()),
+                5 => {
+                    track.captions.clear();
+                    let mut human = original.clone();
+                    human.id = ClipId(1500);
+                    human.start = Tick(15);
+                    human.duration = Tick(10);
+                    track.captions.push(human);
+                    fragments[0].may_create = true;
+                    next = u64::MAX;
+                }
+                6 => {
+                    fragments[0].caption.start = Tick(19);
+                    fragments[0].caption.duration = Tick(2);
+                }
+                7 => {
+                    fragments[0].caption.id = ClipId(next);
+                }
+                _ => {
+                    track.captions.clear();
+                    fragments[0].may_create = true;
+                    let mut other = fragments[0].clone();
+                    other.caption.id = ClipId(1001);
+                    fragments.push(other);
+                }
+            }
+            let before = track.clone();
+            let counter = next;
+            assert!(restore_gap(track, gap.start, gap.duration, &fragments, &mut ctx(&mut next)).is_err(), "mode {mode}");
+            assert_eq!(*track, before);
+            assert_eq!(next, counter);
+        }
     }
 
     fn spans(seq: &Sequence, tid: TrackId) -> Vec<(i64, i64, String)> {

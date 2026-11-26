@@ -43,34 +43,63 @@ fn has_captions(s: &Session) -> std::result::Result<(), String> {
 
 /// The caption track named by `track` (id or "C1"…), else the first one.
 pub fn track_param(s: &Session, p: &Value) -> Option<TrackId> {
-    let seq = s.active_sequence()?;
+    track_on_sequence(s.active_sequence()?, p)
+}
+
+fn track_on_sequence(seq: &filmcraft_project::Sequence, p: &Value) -> Option<TrackId> {
     match p.get("track") {
         Some(Value::Number(n)) => n.as_u64().map(TrackId).filter(|t| seq.caption_track(*t).is_some()),
         Some(Value::String(name)) => {
             let idx: usize = name.trim_start_matches(['C', 'c']).parse().ok()?;
             seq.caption_tracks.get(idx.checked_sub(1)?).map(|t| t.id)
         }
-        _ => seq.caption_tracks.first().map(|t| t.id),
+        None => seq.caption_tracks.first().map(|t| t.id),
+        _ => None,
     }
 }
 
-fn caption_ids(s: &Session, p: &Value) -> Vec<ClipId> {
-    if let Some(a) = p.get("captions").and_then(Value::as_array) {
-        return a.iter().filter_map(Value::as_u64).map(ClipId).collect();
+pub(crate) fn new_track(id: TrackId, p: &Value) -> CaptionTrack {
+    let format = str_p(p, "format").and_then(CaptionFormat::from_name).unwrap_or_default();
+    let name = str_p(p, "name").map(str::to_string).unwrap_or_else(|| format.label().to_string());
+    let mut track = CaptionTrack::new(id, name, format);
+    track.language = str_p(p, "language").unwrap_or("en").to_string();
+    if format == CaptionFormat::Cea608 {
+        track.style.background_color = [0, 0, 0, 255];
     }
-    if let Some(c) = u64_p(p, "caption") {
-        return vec![ClipId(c)];
+    track
+}
+
+pub(crate) fn valid_style(s: &CaptionStyle) -> bool {
+    !s.font.is_empty()
+        && s.font.len() <= 256
+        && !s.font.contains('\0')
+        && s.size.is_finite()
+        && (4.0..=400.0).contains(&s.size)
+        && s.margin.is_finite()
+        && (0.0..=0.45).contains(&s.margin)
+        && s.line_spacing.is_finite()
+        && (0.8..=4.0).contains(&s.line_spacing)
+        && s.outline.is_finite()
+        && (0.0..=40.0).contains(&s.outline)
+}
+
+fn caption_ids(s: &Session, p: &Value) -> Result<Vec<ClipId>> {
+    if let Some(ids) = crate::commands::ids_p(p, "captions")? {
+        return Ok(ids.into_iter().map(ClipId).collect());
+    }
+    if let Some(c) = u64_p(p, "caption")? {
+        return Ok(vec![ClipId(c)]);
     }
     if !s.state.caption_selection.is_empty() {
-        return s.state.caption_selection.clone();
+        return Ok(s.state.caption_selection.clone());
     }
     // the caption under the playhead on the first caption track that has one
     let t = s.playhead();
-    s.active_sequence().and_then(|q| q.caption_tracks.iter().find_map(|tr| tr.caption_at(t).map(|c| c.id))).into_iter().collect()
+    Ok(s.active_sequence().and_then(|q| q.caption_tracks.iter().find_map(|tr| tr.caption_at(t).map(|c| c.id))).into_iter().collect())
 }
 
 fn one_caption(s: &Session, p: &Value, cmd: &str) -> Result<ClipId> {
-    caption_ids(s, p).first().copied().ok_or_else(|| bad(cmd, "no caption (pass `caption` or select one)"))
+    caption_ids(s, p)?.first().copied().ok_or_else(|| bad(cmd, "no caption (pass `caption` or select one)"))
 }
 
 fn parse_color(v: &Value) -> Option<[u8; 4]> {
@@ -108,42 +137,68 @@ pub fn detect(path: &str, bytes: &[u8]) -> Option<Format> {
 /// Import a caption file as a new caption track in the active sequence (a new sequence is made
 /// when none is open), snapped to the sequence's frames. One undo step.
 pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format, name: Option<&str>) -> Result<Value> {
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err(bad("captions.import", "caption file exceeds 4 MiB"));
+    }
     let mut doc = filmcraft_captions::parse(bytes, format).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    if doc.cues.len() > 100_000
+        || doc.blocks.len() > 1024
+        || doc.cues.iter().any(|c| {
+            c.end.0.checked_sub(c.start.0).is_none()
+                || c.text.len() > 8192
+                || c.settings.len() > 2048
+                || c.speaker.as_ref().is_some_and(|s| s.len() > 1024)
+                || c.id.as_ref().is_some_and(|s| s.len() > 1024)
+        })
+    {
+        return Err(bad("captions.import", "caption file exceeds bounded import metadata/time"));
+    }
+    // Check persisted arithmetic before snap_to_frames performs start + frame duration.
+    let bounds = filmcraft_captions::track_from_document(&doc, TrackId(1), "Import bounds", format.track_format(), &mut || 1);
+    bounds.check_bounds().map_err(EngineError::Other)?;
     let stem = std::path::Path::new(path).file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Captions".into());
     let track_name = name.map(str::to_string).unwrap_or_else(|| stem.clone());
-    let seq_id = match s.state.active_sequence.filter(|id| s.project.sequence(*id).is_some()) {
-        Some(id) => id,
-        None => {
-            let id = s.edit("New Sequence", |p, _| Ok(p.new_sequence(&stem, SequenceSettings::default(), 3, 3, None)))?;
-            s.state.active_sequence = Some(id);
-            s.state.open_sequences.push(id);
-            id
-        }
-    };
-    let rate = s.project.sequence(seq_id).map(|q| q.settings.frame_rate).unwrap_or_default();
+    let existing = s.state.active_sequence.filter(|id| s.project.sequence(*id).is_some());
+    let rate = existing.and_then(|id| s.project.sequence(id)).map(|q| q.settings.frame_rate).unwrap_or_default();
+    let period = (filmcraft_time::TICKS_PER_SECOND as i128 * rate.den as i128).checked_div(rate.num as i128);
+    if rate.num <= 0 || rate.den <= 0 || period.is_none_or(|p| p < 1 || p > Tick::MAX.0 as i128) {
+        return Err(bad("captions.import", "invalid bounded sequence frame rate"));
+    }
     doc.snap_to_frames(rate);
     let n = doc.cues.len();
     let warnings = doc.warnings.clone();
-    let tid = s.edit(&format!("Import Captions {stem}"), |p, st| {
-        let tid = TrackId(p.alloc_id());
-        let mut next = p.next_id;
-        let mut alloc = || {
-            let v = next;
-            next += 1;
-            v
+    let input = crate::caption_import::TrackData {
+        name: track_name,
+        language: "en".into(),
+        format: format.track_format().label().into(),
+        enabled: true,
+        locked: false,
+        sync_lock: true,
+        style: None,
+        blocks: doc.blocks,
+        cues: doc
+            .cues
+            .into_iter()
+            .map(|c| crate::caption_import::CueData { start: c.start.0, end: c.end.0, text: c.text, speaker: c.speaker, cue_id: c.id, settings: c.settings })
+            .collect(),
+    };
+    let (seq_id, tid) = s.edit(&format!("Import Captions {stem}"), |p, st| {
+        let seq_id = if let Some(id) = existing {
+            id
+        } else {
+            // new_sequence uses six track IDs and one item ID. Reserve before its allocator.
+            p.next_id = crate::project_ids::allocation_start(p, 7)?;
+            let id = p.new_sequence(&stem, SequenceSettings::default(), 3, 3, None);
+            st.active_sequence = Some(id);
+            st.open_sequences.push(id);
+            id
         };
-        let mut track = filmcraft_captions::track_from_document(&doc, tid, &track_name, format.track_format(), &mut alloc);
-        if format == Format::Scc {
-            track.style.background_color = [0, 0, 0, 255];
-        }
-        p.next_id = next;
-        let q = p.sequence_mut(seq_id).ok_or(EngineError::NoSequence)?;
-        q.caption_tracks.insert(0, track);
-        q.check().map_err(EngineError::Other)?;
+        let imported = crate::caption_import::append(p, &crate::caption_import::ImportData { sequence: seq_id.0, source_document: None, tracks: vec![input] })?;
+        let tid = imported.tracks.first().map(|t| t.track).ok_or_else(|| bad("captions.import", "missing imported track"))?;
         st.caption_selection.clear();
-        Ok(tid)
+        Ok((seq_id, tid))
     })?;
-    Ok(json!({"format": format.name(), "sequence": seq_id.0, "track": tid.0, "captions": n, "warnings": warnings}))
+    Ok(json!({"format": format.name(), "sequence": seq_id.0, "track": tid, "captions": n, "warnings": warnings}))
 }
 
 /// Delete captions (Clear / Ripple Delete with captions selected).
@@ -229,30 +284,21 @@ pub fn commands() -> Vec<CommandSpec> {
             r#"{"format":"Subtitle|CEA-608|CEA-708|Teletext","name":str?,"language":str?}"#,
             has_seq,
             |s, p| {
-                let format = str_p(p, "format").and_then(CaptionFormat::from_name).unwrap_or_default();
-                let name = str_p(p, "name").map(str::to_string).unwrap_or_else(|| format.label().to_string());
-                let lang = str_p(p, "language").unwrap_or("en").to_string();
                 let seq = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
+                let start = crate::project_ids::allocation_start(&s.project, 1)?;
                 let id = s.edit("Add Caption Track", |pr, _| {
+                    pr.next_id = start;
                     let id = TrackId(pr.alloc_id());
-                    let mut t = CaptionTrack::new(id, name, format);
-                    t.language = lang;
-                    if format == CaptionFormat::Cea608 {
-                        t.style.background_color = [0, 0, 0, 255];
-                    }
-                    pr.sequence_mut(seq).ok_or(EngineError::NoSequence)?.caption_tracks.insert(0, t);
+                    pr.sequence_mut(seq).ok_or(EngineError::NoSequence)?.caption_tracks.insert(0, new_track(id, p));
                     Ok(id)
                 })?;
                 Ok(json!({"track": id.0}))
             },
         ),
         spec("captions.deleteTrack", "Delete Caption Track", &[], None, r#"{"track":id|"C1"}"#, has_caption_track, |s, p| {
+            crate::track_ops::fields(p, &["track"], "captions.deleteTrack")?;
             let tid = track_param(s, p).ok_or_else(|| bad("captions.deleteTrack", "no such caption track"))?;
-            s.edit_sequence("Delete Caption Track", |q, _, st| {
-                q.caption_tracks.retain(|t| t.id != tid);
-                st.caption_selection.retain(|c| q.find_caption(*c).is_some());
-                Ok(())
-            })?;
+            crate::track_ops::remove(s, &[tid], "Delete Caption Track", "captions.deleteTrack")?;
             Ok(Value::Null)
         }),
         spec(
@@ -367,21 +413,30 @@ pub fn commands() -> Vec<CommandSpec> {
             "Add Caption at Playhead",
             &["Sequence", "Captions"],
             Some("Cmd+Alt+C"),
-            r#"{"track":id|"C1"?,"text":str?,"time":ticks?,"seconds":f64?,"durationSeconds":f64=3}"#,
+            r#"{"track":id|"C1"?,"text":str?,"time":ticks?,"seconds":f64?,"duration":ticks?,"durationSeconds":f64=3}"#,
             has_seq,
             |s, p| {
-                // a caption track is created when the sequence has none
-                if s.active_sequence().is_some_and(|q| q.caption_tracks.is_empty()) {
-                    s.execute("captions.newTrack", json!({}))?;
-                }
-                let tid = track_param(s, p).ok_or_else(|| bad("captions.add", "no such caption track"))?;
                 let t = time_p(s, p, "").unwrap_or(s.playhead());
                 let rate = s.sequence_rate();
-                let dur = Tick::from_seconds_f64(f64_p(p, "durationSeconds").unwrap_or(edit::captions::DEFAULT_SECONDS as f64));
+                let dur = if let Some(v) = p.get("duration") {
+                    Tick(v.as_i64().ok_or_else(|| bad("captions.add", "duration must be exact ticks"))?)
+                } else {
+                    Tick::from_seconds_f64(f64_p(p, "durationSeconds").unwrap_or(edit::captions::DEFAULT_SECONDS as f64))
+                };
                 let dur = rate.snap_nearest(dur).max(rate.frame_duration());
                 let text = str_p(p, "text").unwrap_or("New caption").to_string();
                 let t = rate.snap(t);
                 let id = s.edit_sequence("Add Caption", |q, ctx, st| {
+                    // Track creation and caption insertion share one candidate,
+                    // publication, revision and Undo step. Any later failure
+                    // discards both, including allocated IDs and selection.
+                    let required = if q.caption_tracks.is_empty() { 2 } else { 1 };
+                    ctx.next_id.checked_add(required).ok_or_else(|| bad("captions.add", "project ID space exhausted"))?;
+                    if q.caption_tracks.is_empty() {
+                        let track = new_track(TrackId(ctx.alloc()), &Value::Null);
+                        q.caption_tracks.push(track);
+                    }
+                    let tid = track_on_sequence(q, p).ok_or_else(|| bad("captions.add", "no such caption track"))?;
                     let id = edit::captions::add_caption(q, tid, t, dur, &text, ctx)?;
                     st.caption_selection = vec![id];
                     st.selection.clear();
@@ -392,7 +447,7 @@ pub fn commands() -> Vec<CommandSpec> {
         ),
         spec("captions.split", "Split Caption", &[], None, r#"{"caption":id?,"time":ticks?}"#, has_captions, |s, p| {
             let t = time_p(s, p, "").unwrap_or(s.playhead());
-            let explicit = u64_p(p, "caption").map(ClipId);
+            let explicit = u64_p(p, "caption")?.map(ClipId);
             let ids = s.edit_sequence("Split Caption", |q, ctx, st| {
                 let ids = match explicit {
                     Some(c) => vec![edit::captions::split_caption(q, c, t, ctx)?],
@@ -407,7 +462,7 @@ pub fn commands() -> Vec<CommandSpec> {
             Ok(json!({"captions": ids.iter().map(|c| c.0).collect::<Vec<_>>()}))
         }),
         spec("captions.merge", "Merge Captions", &[], None, r#"{"captions":[id]?}"#, has_captions, |s, p| {
-            let ids = caption_ids(s, p);
+            let ids = caption_ids(s, p)?;
             let id = s.edit_sequence("Merge Captions", |q, _, st| {
                 let id = edit::captions::merge_captions(q, &ids)?;
                 st.caption_selection = vec![id];
@@ -458,13 +513,13 @@ pub fn commands() -> Vec<CommandSpec> {
             Ok(json!({"applied": applied.0}))
         }),
         spec("captions.move", "Move Captions", &[], None, r#"{"captions":[id]?,"delta":ticks|"deltaFrames":i64}"#, has_captions, |s, p| {
-            let ids = caption_ids(s, p);
+            let ids = caption_ids(s, p)?;
             let d = delta_p(s, p).ok_or_else(|| bad("captions.move", "need `delta` or `deltaFrames`"))?;
             let applied = s.edit_sequence("Move Captions", |q, _, _| Ok(edit::captions::move_captions(q, &ids, d)?))?;
             Ok(json!({"applied": applied.0}))
         }),
         spec("captions.delete", "Delete Captions", &[], None, r#"{"captions":[id]?,"ripple":bool=false}"#, has_captions, |s, p| {
-            let ids = caption_ids(s, p);
+            let ids = caption_ids(s, p)?;
             delete(s, &ids, bool_p(p, "ripple").unwrap_or(false))
         }),
         spec("captions.select", "Select Captions", &[], None, r#"{"captions":[id],"add":bool?}"#, has_seq, |s, p| {
@@ -503,6 +558,7 @@ pub fn commands() -> Vec<CommandSpec> {
             let format = filmcraft_captions::detect(&bytes, ext.as_deref()).ok_or_else(|| EngineError::Other(format!("{path}: not a caption file")))?;
             import(s, &path, &bytes, format, str_p(p, "name"))
         }),
+        crate::caption_import::command(),
         spec(
             "captions.export",
             "Captions…",

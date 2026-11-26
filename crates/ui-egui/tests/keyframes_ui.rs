@@ -21,6 +21,53 @@ struct Driver {
     shots: Option<std::path::PathBuf>,
 }
 
+#[test]
+fn effect_stack_reorder_menu_preserves_duplicate_effect_mask_and_keyframe_targets_through_undo_redo() {
+    let (mut d, clip) = Driver::demo();
+    for _ in 0..2 {
+        d.exec("effects.apply", json!({"clips":[clip.id],"effect":"gaussian_blur"}));
+    }
+    d.exec("poema.trackEffects", json!({}));
+    let positions = {
+        let item = d.harness.state().session.active_sequence().unwrap().find_item(ClipId(clip.id)).unwrap().1;
+        item.effects.iter().enumerate().filter(|(_, e)| e.effect == "gaussian_blur").map(|(i, e)| (i, e.instance_id.clone().unwrap())).collect::<Vec<_>>()
+    };
+    assert_eq!(positions.len(), 2);
+    let (first, identity) = positions[0].clone();
+    let second = positions[1].0;
+    assert_eq!(second, first + 1);
+    d.seek(1.0);
+    d.exec("effects.setParam", json!({"clip":clip.id,"effect":first,"param":"blurriness","value":17,"keyframe":true}));
+    let time = d.parameter(&clip, "gaussian_blur", "blurriness").keyframes[0].time.0;
+    d.click(&format!("effectControls.gaussian_blur.blurriness.keyframe.{time}"));
+    d.exec("masks.add", json!({"clip":clip.id,"effect":first,"shape":"rectangle"}));
+    assert_eq!(d.harness.state().ui.keyframe_selection[0].effect_instance_id.as_ref(), Some(&identity));
+    let undo = d.undo_len();
+    d.right_click("effectControls.effect.gaussian_blur");
+    let down = format!("effectControls.clip.{}.effect.{first}.moveDown", clip.id);
+    let up = format!("effectControls.clip.{}.effect.{second}.moveUp", clip.id);
+    let action = if d.find(&down).is_some() { down } else { up };
+    d.shot("effect-stack-reorder-menu");
+    d.click(&action);
+    assert_eq!(d.undo_len(), undo + 1);
+    let assert_target = |d: &Driver, position: usize| {
+        let session = &d.harness.state().session;
+        let item = session.active_sequence().unwrap().find_item(ClipId(clip.id)).unwrap().1;
+        assert_eq!(item.effects[position].instance_id.as_ref(), Some(&identity));
+        assert_eq!(session.state.selected_mask.unwrap().effect, position);
+        let selected = &d.harness.state().ui.keyframe_selection;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].effect, position);
+        assert_eq!(selected[0].effect_instance_id.as_ref(), Some(&identity));
+    };
+    assert_target(&d, second);
+    d.shot("effect-stack-after-reorder");
+    d.exec("edit.undo", json!({}));
+    assert_target(&d, first);
+    d.exec("edit.redo", json!({}));
+    assert_target(&d, second);
+}
+
 impl Driver {
     /// The demo project with its first video clip selected and both panels showing.
     fn demo() -> (Self, Clip) {
@@ -438,8 +485,10 @@ fn lane_keys(d: &mut Driver, clip: &Clip, specs: &[(&str, f64)]) -> Vec<filmcraf
             filmcraft_ui_egui::state::KeyframeRef {
                 clip: clip.id,
                 effect: it.effects.iter().position(|e| e.effect == "motion").unwrap(),
+                effect_instance_id: None,
                 param: (*param).into(),
                 mask: None,
+                mask_instance_id: None,
                 time: it.source_time_at(Tick(time)),
             }
         })
@@ -587,8 +636,10 @@ fn effect_and_mask_keyframes_move_together_without_crossing_parameters() {
         keys.push(filmcraft_ui_egui::state::KeyframeRef {
             clip: clip.id,
             effect: it.effects.iter().position(|e| e.effect == "opacity").unwrap(),
+            effect_instance_id: None,
             param: "opacity".into(),
             mask,
+            mask_instance_id: None,
             time: it.source_time_at(time),
         });
     }

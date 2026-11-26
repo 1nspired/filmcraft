@@ -48,6 +48,11 @@ pub use image::Image;
 /// Resolves project items to media sources (the engine owns the media pool).
 pub trait SourceProvider: Sync {
     fn source(&self, item: ItemId) -> Option<SharedSource>;
+    /// Playback/export may continue cached DSP state between blocks. Independent evidence
+    /// reads opt out (including nested mixes), so they neither consume nor publish that state.
+    fn reuse_audio_state(&self) -> bool {
+        true
+    }
 }
 
 impl<F: Fn(ItemId) -> Option<SharedSource> + Sync> SourceProvider for F {

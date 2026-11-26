@@ -598,15 +598,15 @@ fn snap(v: f32, grid: f32) -> f32 {
     (v / grid).round() * grid
 }
 
-fn items_p(s: &Session, p: &Value) -> Vec<ItemId> {
-    match p.get("items").and_then(Value::as_array) {
-        Some(a) => a.iter().filter_map(|v| v.as_u64().map(ItemId)).collect(),
-        None => item_p(p, "item").map(|i| vec![i]).unwrap_or_else(|| s.state.project_selection.clone()),
-    }
+fn items_p(s: &Session, p: &Value) -> Result<Vec<ItemId>> {
+    Ok(match crate::commands::ids_p(p, "items")? {
+        Some(ids) => ids.into_iter().map(ItemId).collect(),
+        None => item_p(p, "item")?.map(|i| vec![i]).unwrap_or_else(|| s.state.project_selection.clone()),
+    })
 }
 
-fn bin_p(p: &Value) -> Option<BinId> {
-    u64_p(p, "bin").map(BinId)
+fn bin_p(p: &Value) -> Result<Option<BinId>> {
+    Ok(crate::commands::nullable_u64_p(p, "bin")?.map(BinId))
 }
 
 fn layout_json(s: &Session, bin: Option<BinId>, width: f32) -> Value {
@@ -629,7 +629,7 @@ fn freeform_move(s: &mut Session, p: &Value) -> Result<Value> {
             targets.push((ItemId(id), x, y));
         }
     } else {
-        let items = items_p(s, p);
+        let items = items_p(s, p)?;
         if items.is_empty() {
             return Err(bad("project.freeform.move", "need `items` (or a Project panel selection) and `x`, `y`"));
         }
@@ -678,7 +678,7 @@ fn pin_all(pr: &mut Project, bin: Option<BinId>, opts: &FreeformOptions, width: 
 }
 
 fn freeform_resize(s: &mut Session, p: &Value) -> Result<Value> {
-    let items = items_p(s, p);
+    let items = items_p(s, p)?;
     if items.is_empty() {
         return Err(bad("project.freeform.resize", "need `items` (or a Project panel selection)"));
     }
@@ -711,7 +711,7 @@ fn freeform_resize(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn freeform_align(s: &mut Session, p: &Value) -> Result<Value> {
-    let bin = bin_p(p);
+    let bin = bin_p(p)?;
     let opts = s.prefs.project_panel.freeform.clone();
     let width = f64_p(p, "width").unwrap_or(800.0) as f32;
     let grid = f64_p(p, "grid").map(|g| g as f32).unwrap_or(opts.grid).max(1.0);
@@ -724,7 +724,7 @@ fn freeform_align(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// Reset to Grid: forget positions and stacks (cards return to the automatic grid).
 fn freeform_reset(s: &mut Session, p: &Value) -> Result<Value> {
-    let bin = bin_p(p);
+    let bin = bin_p(p)?;
     let ids = freeform_items(&s.project, bin);
     s.edit("Reset to Grid", |pr, _| {
         for i in &ids {
@@ -739,7 +739,7 @@ fn freeform_reset(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn freeform_stack(s: &mut Session, p: &Value, on: bool) -> Result<Value> {
-    let items = items_p(s, p);
+    let items = items_p(s, p)?;
     let cmd = if on { "project.freeform.stack" } else { "project.freeform.unstack" };
     if items.is_empty() || (on && items.len() < 2) {
         return Err(bad(cmd, if on { "select two or more items to stack" } else { "need `items` (or a Project panel selection)" }));
@@ -810,7 +810,7 @@ fn arrangement_names(p: &Project, bin: Option<BinId>) -> Vec<String> {
 
 fn arrangement_save(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad("project.freeform.saveArrangement", "need `name`"))?.to_string();
-    let bin = bin_p(p);
+    let bin = bin_p(p)?;
     let opts = s.prefs.project_panel.freeform.clone();
     let cards = freeform_layout(&s.project, bin, &opts, f64_p(p, "width").unwrap_or(800.0) as f32);
     let key = format!("{ARRANGEMENT_PREFIX}{name}");
@@ -827,7 +827,7 @@ fn arrangement_save(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn arrangement_restore(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "name").ok_or_else(|| bad("project.freeform.restoreArrangement", "need `name`"))?.to_string();
-    let bin = bin_p(p);
+    let bin = bin_p(p)?;
     if !arrangement_names(&s.project, bin).contains(&name) {
         return Err(bad("project.freeform.restoreArrangement", format!("no arrangement named `{name}`")));
     }
@@ -853,7 +853,7 @@ fn arrangement_restore(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn arrangement_delete(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "name").ok_or_else(|| bad("project.freeform.deleteArrangement", "need `name`"))?.to_string();
-    let bin = bin_p(p);
+    let bin = bin_p(p)?;
     let key = format!("{ARRANGEMENT_PREFIX}{name}");
     let ids = freeform_items(&s.project, bin);
     s.edit("Delete Arrangement", |pr, _| {
@@ -1028,7 +1028,7 @@ fn sort(s: &mut Session, p: &Value) -> Result<Value> {
 /// `project.items {bin?, recursive?}`: the rows of a bin as the List view shows them.
 fn items(s: &mut Session, p: &Value) -> Result<Value> {
     let pr = &s.project;
-    let bin = match bin_p(p) {
+    let bin = match bin_p(p)? {
         Some(b) => pr.root.find_bin(b).ok_or_else(|| bad("project.items", "no such bin"))?,
         None => &pr.root,
     };
@@ -1057,7 +1057,7 @@ fn items(s: &mut Session, p: &Value) -> Result<Value> {
 // ------------------------------------------------------------------------------------ presets
 
 fn slot_p(p: &Value, cmd: &str) -> Result<usize> {
-    let n = u64_p(p, "slot").ok_or_else(|| bad(cmd, "need `slot` (1–10)"))? as usize;
+    let n = u64_p(p, "slot")?.ok_or_else(|| bad(cmd, "need `slot` (1–10)"))? as usize;
     if !(1..=PRESET_SLOTS).contains(&n) {
         return Err(bad(cmd, "`slot` is 1–10"));
     }
@@ -1085,7 +1085,7 @@ fn preset_save(s: &mut Session, p: &Value, as_new: bool) -> Result<Value> {
     let pp = &mut prefs.project_panel;
     ensure_slots(pp);
     let slot = if as_new {
-        match u64_p(p, "slot") {
+        match u64_p(p, "slot")? {
             Some(_) => slot_p(p, cmd)?,
             None => pp
                 .presets
@@ -1094,7 +1094,7 @@ fn preset_save(s: &mut Session, p: &Value, as_new: bool) -> Result<Value> {
                 .ok_or_else(|| bad(cmd, "all 10 view preset slots are used: delete one in Manage Saved View Presets"))?,
         }
     } else {
-        match u64_p(p, "slot") {
+        match u64_p(p, "slot")? {
             Some(_) => slot_p(p, cmd)?,
             None => pp.current_preset.ok_or_else(|| bad(cmd, "no view preset is current: use Save As New View Preset"))?,
         }
@@ -1159,15 +1159,9 @@ fn has_presets(s: &Session) -> std::result::Result<(), String> {
 }
 
 fn rename_bin(s: &mut Session, p: &Value) -> Result<Value> {
-    let bin = bin_p(p).ok_or_else(|| bad("project.renameBin", "need `bin`"))?;
+    let bin = bin_p(p)?.ok_or_else(|| bad("project.renameBin", "need `bin`"))?;
     let name = str_p(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad("project.renameBin", "need a non-empty `name`"))?.to_string();
-    if bin == s.project.root.id {
-        return Err(bad("project.renameBin", "the project's root bin is named after the project"));
-    }
-    s.edit("Rename Bin", |pr, _| {
-        pr.root.find_bin_mut(bin).ok_or_else(|| bad("project.renameBin", "no such bin"))?.name = name.clone();
-        Ok(())
-    })?;
+    s.edit("Rename Bin", |pr, _| crate::project_organization::rename(pr, bin, &name))?;
     Ok(json!({"bin": bin.0, "name": name}))
 }
 
@@ -1238,7 +1232,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         c("project.viewPreset.rename", "Rename View Preset", r#"{"slot":1..10,"name":str}"#, has_presets, preset_rename),
         c("project.viewPreset.delete", "Delete View Preset", r#"{"slot":1..10}"#, has_presets, preset_delete),
         q("project.freeform.layout", "Freeform Layout", r#"{"bin":binId?,"width":f32?}"#, |s, p| {
-            Ok(layout_json(s, bin_p(p), f64_p(p, "width").unwrap_or(800.0) as f32))
+            Ok(layout_json(s, bin_p(p)?, f64_p(p, "width").unwrap_or(800.0) as f32))
         }),
         c("project.freeform.move", "Move Clip Cards", r#"{"items":[id]?,"x":f32,"y":f32,"snap":bool?} | {"positions":{"<id>":[x,y]}}"#, always, freeform_move),
         c("project.freeform.resize", "Clip Size", r#"{"items":[id]?,"size":f32?,"step":1|-1?}"#, always, freeform_resize),
@@ -1250,7 +1244,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         c("project.freeform.restoreArrangement", "Restore Arrangement", r#"{"name":str,"bin":binId?}"#, always, arrangement_restore),
         c("project.freeform.deleteArrangement", "Delete Arrangement", r#"{"name":str,"bin":binId?}"#, always, arrangement_delete),
         q("project.freeform.arrangements", "List Arrangements", r#"{"bin":binId?}"#, |s, p| {
-            Ok(json!({"arrangements": arrangement_names(&s.project, bin_p(p))}))
+            Ok(json!({"arrangements": arrangement_names(&s.project, bin_p(p)?)}))
         }),
         c(
             "project.freeform.options",

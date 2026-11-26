@@ -94,6 +94,49 @@ fn project_is_named_after_its_file() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+#[test]
+fn failed_save_preserves_project_identity_dirty_state_and_both_history_branches() {
+    let d = temp_dir("failed-save-state");
+    let original = d.join("Original.fcproj");
+    let mut s = demo();
+    s.execute("file.saveAs", json!({"path":original})).unwrap();
+    let original_bytes = std::fs::read(&original).unwrap();
+    s.execute("sequence.addEdit", json!({"seconds":0.25})).unwrap();
+    s.execute("sequence.addEdit", json!({"seconds":0.5})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.is_dirty());
+    assert!(!s.history.redo.is_empty());
+    let blocker = d.join("blocked-parent");
+    std::fs::write(&blocker, "Generated failed save sentinel.").unwrap();
+    let target = blocker.join("Unexpected rename.fcproj").to_string_lossy().into_owned();
+    for command in ["file.saveAs", "file.save", "file.saveCopy"] {
+        if command == "file.save" {
+            s.path = Some(target.clone());
+        }
+        let before = s.project.clone();
+        let before_path = s.path.clone();
+        let before_revision = s.revision;
+        let before_saved = s.saved_revision;
+        let undo = s.history.undo.clone();
+        let redo = s.history.redo.clone();
+        assert!(s.execute(command, if command == "file.save" { json!({}) } else { json!({"path":target}) }).is_err());
+        assert!(std::sync::Arc::ptr_eq(&before, &s.project), "{command} replaced the project after a failed write");
+        assert_eq!(s.path, before_path);
+        assert_eq!(s.revision, before_revision);
+        assert_eq!(s.saved_revision, before_saved);
+        assert!(s.is_dirty());
+        assert_eq!(s.history.undo.len(), undo.len());
+        assert_eq!(s.history.redo.len(), redo.len());
+        for (actual, previous) in s.history.undo.iter().chain(&s.history.redo).zip(undo.iter().chain(&redo)) {
+            assert_eq!(actual.0, previous.0);
+            assert!(std::sync::Arc::ptr_eq(&actual.1, &previous.1));
+        }
+        assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
+        assert_eq!(std::fs::read_to_string(&blocker).unwrap(), "Generated failed save sentinel.");
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
 /// Opening the demo after a saved project must not keep that path: Save would overwrite it.
 #[test]
 fn open_demo_project_clears_saved_path_so_save_does_not_overwrite() {

@@ -127,7 +127,11 @@ fn a_linked_clip_gets_its_anchor_from_the_real_size_of_the_media() {
     let doc = d.join("cut.xml");
     std::fs::write(&doc, xml_with_a_scale_only_motion_filter()).unwrap();
     let mut s = Session::default();
+    let empty = s.project.clone();
+    s.execute("file.newSequence", json!({"name":"Earlier human sequence","fps":24})).unwrap();
+    let earlier_sequence = s.state.active_sequence;
     let before = s.project.clone();
+    let earlier_history = s.history.undo.clone();
     let (r, seq) = import(&mut s, &doc);
     assert_eq!(r["linkedMedia"], 1, "{r}");
     let clip = first_clip(&s, seq);
@@ -140,15 +144,26 @@ fn a_linked_clip_gets_its_anchor_from_the_real_size_of_the_media() {
     let mut t = Session::default();
     t.execute("file.open", json!({"path": path})).unwrap();
     assert_eq!(*t.project, *s.project);
-    // undo: Link Media takes the real size and the anchor back together, then the import itself
+    // One import includes linking and resolved automatic points. Its complete
+    // Undo must retain the sequence and history that existed before the import.
     let linked = s.project.clone();
-    s.execute("edit.undo", json!({})).unwrap();
-    let clip = first_clip(&s, seq);
-    assert_eq!(s.project.source_size(clip.item), Some((3840, 2160)), "the size the document declared");
-    assert!(motion_point(&clip, "anchor").x.is_nan());
+    assert_eq!(s.history.undo.len(), earlier_history.len() + 1);
     s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(*s.project, *before);
+    assert_eq!(s.state.active_sequence, earlier_sequence);
+    assert_eq!(s.history.undo, earlier_history);
     s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(*s.project, *linked);
+    let clip = first_clip(&s, seq);
+    assert_eq!(s.project.source_size(clip.item), Some((320, 180)));
+    assert_eq!(motion_point(&clip, "anchor"), Vec2::new(160.0, 90.0));
+    assert_eq!(auto_points(&s.project), Vec::<String>::new());
+    // The earlier human action remains a separate, reversible history step.
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(*s.project, *empty);
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(*s.project, *before);
     s.execute("edit.redo", json!({})).unwrap();
     assert_eq!(*s.project, *linked);
     let _ = std::fs::remove_dir_all(&d);

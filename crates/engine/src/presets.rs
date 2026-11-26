@@ -162,6 +162,7 @@ pub(crate) fn effect_instance(id: &str) -> EffectInstance {
         post_fader: false,
         essential: false,
         layer: None,
+        instance_id: None,
     })
 }
 
@@ -380,9 +381,11 @@ fn merge_keyframes(new: &mut EffectInstance, old: &EffectInstance) {
 /// outside the span the preset animates), others are inserted before the intrinsic effects.
 pub fn put_effects(it: &mut TrackItem, effects: Vec<EffectInstance>) {
     for mut e in effects {
+        e.clear_instance_ids();
         let intrinsic = e.def().is_some_and(|d| d.intrinsic);
         if intrinsic && let Some(slot) = it.effects.iter_mut().find(|x| x.effect == e.effect) {
             merge_keyframes(&mut e, slot);
+            e.instance_id = slot.instance_id.clone();
             *slot = e;
             continue;
         }
@@ -449,7 +452,7 @@ fn clip_size(s: &Session, it: &TrackItem) -> (u32, u32) {
 fn save(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad("presets.save", "need a `name`"))?.to_string();
     let seq = s.active_sequence().ok_or(EngineError::NoSequence)?;
-    let clip = clip_p(p, "clip")
+    let clip = clip_p(p, "clip")?
         .or_else(|| s.state.selection.iter().copied().find(|c| seq.find_item(*c).and_then(|(t, _)| seq.track(t)).is_some_and(|t| t.kind == TrackKind::Video)))
         .or_else(|| s.state.selection.first().copied())
         .ok_or_else(|| bad("presets.save", "select a clip"))?;

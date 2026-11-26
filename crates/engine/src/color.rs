@@ -167,7 +167,7 @@ pub(crate) fn lumetri_clip(s: &mut Session, p: &Value, cmd: &str) -> Result<(Cli
     let seq = s.active_sequence().ok_or_else(|| bad(cmd, "no active sequence"))?;
     let video = |c: &ClipId| seq.find_item(*c).is_some_and(|(t, _)| seq.track(t).is_some_and(|t| t.kind == TrackKind::Video));
     let has = |c: &ClipId| seq.find_item(*c).is_some_and(|(_, it)| it.effects.iter().any(|e| e.effect == "lumetri"));
-    let clip = match clip_p(p, "clip") {
+    let clip = match clip_p(p, "clip")? {
         Some(c) if video(&c) => c,
         Some(_) => return Err(bad(cmd, "not a video clip")),
         None => {
@@ -355,7 +355,7 @@ fn spaces(_: &mut Session, _: &Value) -> Result<Value> {
 }
 
 fn color_info(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = item_p(p, "item").ok_or_else(|| bad("media.colorInfo", "need `item`"))?;
+    let id = item_p(p, "item")?.ok_or_else(|| bad("media.colorInfo", "need `item`"))?;
     let Some(ItemKind::Media(m)) = s.project.item(id).map(|i| &i.kind) else { return Err(bad("media.colorInfo", "not a media item")) };
     let detected = m.info.video.as_ref().map(|v| ColorSpace::from_info(&v.color));
     let effective = m.interpret.color_space.or(detected);
@@ -394,7 +394,7 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "lumetri.applyPreset";
     let name = str_p(p, "name").ok_or_else(|| bad(cmd, "need `name`"))?;
     let preset = filmcraft_render::lumetri_presets::find(name).ok_or_else(|| bad(cmd, format!("no Lumetri preset `{name}`")))?;
-    let clips = crate::commands::clips_p(s, p);
+    let clips = crate::commands::clips_p(s, p)?;
     if clips.is_empty() {
         return Err(bad(cmd, "select clips first"));
     }

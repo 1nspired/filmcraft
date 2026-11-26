@@ -1,11 +1,88 @@
 # FilmCraft Roadmap
 
+- Local native recovery foundation (2026-10-22): private immutable history
+  companions preserve complete bounded Undo/Redo graphs and scoped receipts.
+  Restore keeps the current project/view, never replays recipes, and refuses
+  intervening human history or identical-value replacement snapshots. Native
+  tests and actual generated-process restart acceptance cover guarded Undo/Redo
+  and the preceding human step. Private Poema transport is present; automatic
+  coordinator/proposal recovery, unsaved crash recovery and live rollout remain
+  open. No project schema or readiness estimate changes. See engine README.
+
+- Local history follow-up (2026-10-22): read-only `agent.readHistory` shares
+  guarded native Undo/Redo ownership predicates. Poema checks retained heads
+  against actual native history, including expired tickets, without consuming
+  the read or adopting human work. Generated native/TCP/composer regressions
+  preserve human Undo. Durable restart ownership and live rollout remain open;
+  no readiness estimate or project-file schema changes.
+
+- Local source-clock follow-up (2026-10-21): read-only `agent.sourceFrames`
+  uses the existing native clip clock and exact tick ranges for original-frame
+  perception, including holds and fractional starts. Generated native/Poema
+  checks remain narrower than camera, continuous-motion and full workflow
+  qualification; no readiness estimate or live rollout changes.
+
+- Local retime validation follow-up (2026-10-21): malformed Speed/Duration
+  options reject before native publication rather than resetting speed/reverse
+  or consuming history. Omitted human defaults retain their semantics. The
+  native dialog preserves the separate Reverse flag and unrounded saved speed.
+  Generated regressions cover rejection/history, valid controls and save/reopen;
+  no new model command, live upgrade or readiness-estimate change is included.
+
+- Local mixer validation follow-up (2026-10-21): rejected insert/send/keyframe
+  deletion preserves the project and existing Redo branch. Mixer inserts reuse
+  definition-typed transition parameter handling, with checked choice width,
+  strict explicit flags and preserved automation. Generated regression coverage
+  is recorded in `crates/engine/README.md`; no new model command, live rollout
+  or readiness-estimate change is included.
+
+- Local Poema Project/mark validation follow-up (2026-10-21): remaining direct
+  target-list parsers now reject malformed lists as a whole before selection,
+  edit, export or source-removal effects. Source marks distinguish missing,
+  integer ticks and deliberate null clears before split cleanup. Generated
+  regressions cover failure invariants, valid defaults, Undo/Redo and reopen;
+  no new model commands, live rollout or readiness-estimate change.
+
+- Local Poema input-validation repair (2026-10-21): shared fallible integer/target
+  readers reject malformed IDs and lists rather than changing another clip or
+  using the selection. Explicit trim edge/mode errors no longer execute defaults;
+  omitted human defaults and intentional null root-bin/no-mask states remain.
+  Generated regressions cover rejection, Undo/Redo and saved reopen. This is not
+  a complete raw-command schema or a live upgrade; alpha/readiness estimates are
+  unchanged. See `crates/engine/README.md` and Poema's integration verification.
+
+- Local native audit fixes (2026-10-21): shared effect/animation/keyframe handlers
+  reject malformed indices without editing stack entry zero or breaking a drag's
+  Undo group. First-caption creation and its implicit track publish atomically in
+  one native history step. Generated regressions include locks, failed requests,
+  Undo/Redo and saved reopen; no new Poema tools or live app upgrade. Alpha/readiness
+  estimates remain unchanged. See `crates/engine/README.md`.
+
+- Local Poema retiming increment (2026-10-21): guarded speed/reverse/ripple and
+  interpolation call the existing human Speed/Duration operation. Native editing
+  state reads expose retiming/hold settings; Poema also projects clip enable/gain,
+  bounded effect summaries and track enable/mute/solo. The existing open app is
+  not upgraded; alpha/readiness estimates are unchanged. See `crates/engine/README.md`.
+
+- Local Poema evidence increment (2026-10-21): bounded immutable Program PNG and saved-mix
+  float-WAV reads reuse the native compositor/mixer without seeking or project/history edits.
+  Generated cross-language checks include compositing, captions, stereo/5.1 and isolated DSP
+  caches; the live working copy is not upgraded. No general readiness estimate or G6 claim changed.
+
+- Local Poema reliability experiment (2026-10-20): exact linked-group batches and agent-owned
+  guarded Undo, plus explicit insert/same-track move/reorder/ripple-delete, with generated/Canon
+  assembly and split → half trim → Undo acceptance. Guarded source-only preview marks now also
+  verify Source Monitor readback, saved-mark reopen and Undo on generated/Canon copies. A further
+  sequence-family increment verifies separate-sequence creation, six linked Canon inserts,
+  saved-child reopen, navigation without dirty/history changes, and complete owned Undo. This is measured local
+  workflow evidence, not a change to alpha/readiness estimates; see `crates/engine/README.md` and G6.
+
 - UI.6: Compact Source and Program monitors separate timecodes from view settings and retain Source drag choices. Transport controls use the shared toolbar sizing helper, with overflow actions in an operable More menu and a scrolling fallback at tiny widths.
 - UI.3: Panel tabs, edge splits, tab reordering and floating groups use the shared docking model and drop resolver. Floating geometry is saved with named workspaces while legacy layout JSON remains readable. Dock dividers use bounded shared geometry and keyboard-accessible resize handles. Tools and dock tabs expose actual widget focus, paint focus outlines, and support keyboard traversal/activation. Control input reaches focused widgets in background windows; optional input isolation supports unattended validation. Existing workspace trees and saved layout formats are retained.
 
 **Stage: alpha** · next: beta, ~19 points of ready-for-real-work and ~400–700 h away, plus opening Premiere's `.prproj` ([why](docs/target-app-parity.md#stage); passes the [core-workflow gate](docs/roadmap.md#alpha-gate))
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** minor (language table: German covers the whole interface) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-21 · **Change:** minor (local Poema native retiming, editing-state parity and native audit fixes; readiness estimates unchanged) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
 
 Progress toward parity with Adobe Premiere Pro. This page is the summary; the detail is in
 [docs/target-app-parity.md](docs/target-app-parity.md) (assessment, methodology, calibration),
@@ -166,6 +243,7 @@ Ranked; detail and "done when" in [docs/roadmap.md](docs/roadmap.md) and [docs/g
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-21 | minor | Local Poema guarded Speed/Duration and editing-state reads, with generated human/agent Program/mix/Undo parity; no live upgrade or readiness estimate change |
 | 2026-10-13 | minor | Language table: German covers the whole interface (~100%) |
 | 2026-10-12 | trivial | Progress log: Transform shutter on adjustment layers (#1088) |
 | 2026-10-11 | minor | Language table: German ships the menus (#630, 10.6%) |

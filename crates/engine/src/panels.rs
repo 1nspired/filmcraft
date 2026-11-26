@@ -136,7 +136,7 @@ pub fn log_jobs(s: &mut Session) {
 fn events_list(s: &mut Session, p: &Value) -> Result<Value> {
     log_jobs(s);
     let min = str_p(p, "level").and_then(Level::from_name).unwrap_or(Level::Info);
-    let since = u64_p(p, "since").unwrap_or(0);
+    let since = u64_p(p, "since")?.unwrap_or(0);
     let entries: Vec<&LogEntry> = s.log.entries.iter().filter(|e| e.level >= min && e.id > since).collect();
     Ok(json!({
         "entries": entries,
@@ -162,17 +162,17 @@ pub struct Field {
 
 /// The item the Metadata panel describes: `item`, else the item of timeline clip `clip`, else the
 /// Project panel selection, else the timeline selection.
-pub fn metadata_target(s: &Session, p: &Value) -> Option<ItemId> {
-    if let Some(i) = item_p(p, "item") {
-        return Some(i);
+pub fn metadata_target(s: &Session, p: &Value) -> Result<Option<ItemId>> {
+    if let Some(i) = item_p(p, "item")? {
+        return Ok(Some(i));
     }
-    let clip = u64_p(p, "clip").map(filmcraft_project::ClipId);
+    let clip = u64_p(p, "clip")?.map(filmcraft_project::ClipId);
     let seq = s.active_sequence();
     let clip_item = |c| seq.and_then(|q| q.find_item(c)).map(|(_, it)| it.item);
     if let Some(c) = clip {
-        return clip_item(c);
+        return Ok(clip_item(c));
     }
-    s.state.project_selection.first().copied().or_else(|| s.state.selection.first().and_then(|c| clip_item(*c)))
+    Ok(s.state.project_selection.first().copied().or_else(|| s.state.selection.first().and_then(|c| clip_item(*c))))
 }
 
 fn tc(t: Tick, rate: filmcraft_time::FrameRate) -> String {
@@ -272,7 +272,7 @@ fn format_bytes(b: u64) -> String {
 }
 
 fn metadata_get(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = metadata_target(s, p).ok_or_else(|| bad("metadata.get", "no item: pass `item` or `clip`, or select one"))?;
+    let id = metadata_target(s, p)?.ok_or_else(|| bad("metadata.get", "no item: pass `item` or `clip`, or select one"))?;
     let it = s.project.item(id).ok_or_else(|| bad("metadata.get", "no such item"))?;
     let fields = metadata_fields(&s.project, id);
     Ok(json!({"item": id.0, "name": it.name, "fields": fields, "metadata": it.metadata}))
@@ -282,7 +282,7 @@ fn metadata_get(s: &mut Session, p: &Value) -> Result<Value> {
 /// Name renames the item, Label sets its label, every other name is a log field (an empty value
 /// removes it).
 fn metadata_set(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = metadata_target(s, p).ok_or_else(|| bad("metadata.set", "no item: pass `item` or `clip`, or select one"))?;
+    let id = metadata_target(s, p)?.ok_or_else(|| bad("metadata.set", "no item: pass `item` or `clip`, or select one"))?;
     let mut changes: Vec<(String, String)> = Vec::new();
     if let Some(f) = str_p(p, "field") {
         let v = p.get("value").map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).unwrap_or_default();

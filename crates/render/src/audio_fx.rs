@@ -355,11 +355,19 @@ fn run(chain: &mut Chain, item: &TrackItem, in0: i64, input: &mut [Vec<f32>], sr
 /// raw planar audio (2 channels, or 6 on a 5.1 track) for timeline samples `[x0, x0 + len)`
 /// (silence outside the clip).
 pub fn process(item: &TrackItem, a0: i64, n: usize, sr: u32, read: &dyn Fn(i64, usize) -> Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+    process_with_cache(item, a0, n, sr, read, true)
+}
+
+/// Same clip DSP, with independent preroll for immutable evidence reads. This flag follows
+/// the provider through nested sequences, not only through the outer track mixer.
+pub(crate) fn process_with_cache(item: &TrackItem, a0: i64, n: usize, sr: u32, read: &dyn Fn(i64, usize) -> Vec<Vec<f32>>, reuse: bool) -> Vec<Vec<f32>> {
     let width = read(a0, 0).len().max(1);
     let key = (item.id.0, structure_hash(item), sr, width);
-    let taken = {
+    let taken = if reuse {
         let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
         c.get_mut(&key).and_then(|v| v.iter().position(|ch| ch.next_out == a0).map(|i| v.swap_remove(i)))
+    } else {
+        None
     };
     let (mut chain, mut input, skip) = match taken {
         Some(chain) => {
@@ -387,14 +395,16 @@ pub fn process(item: &TrackItem, a0: i64, n: usize, sr: u32, read: &dyn Fn(i64, 
     run(&mut chain, item, in0, &mut input, sr);
     chain.next_out = a0 + n as i64;
     let out: Vec<Vec<f32>> = input.iter().map(|c| c[skip..].to_vec()).collect();
-    let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
-    let v = c.entry(key).or_default();
-    v.push(chain);
-    if v.len() > 4 {
-        v.remove(0);
-    }
-    if c.len() > 256 {
-        c.clear();
+    if reuse {
+        let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
+        let v = c.entry(key).or_default();
+        v.push(chain);
+        if v.len() > 4 {
+            v.remove(0);
+        }
+        if c.len() > 256 {
+            c.clear();
+        }
     }
     out
 }
@@ -404,6 +414,35 @@ mod tests {
     use super::*;
     use filmcraft_audio_dsp::Unit;
     use filmcraft_project::{EffectKind, ParamKind, effect_defs};
+
+    #[test]
+    fn independent_clip_dsp_does_not_consume_or_publish_playback_state() {
+        let mut p = filmcraft_project::Project::new("clip state");
+        let id = p.add_item(
+            "graphic",
+            filmcraft_project::Label::Iris,
+            filmcraft_project::ItemKind::Graphic { width: 64, height: 64, rate: Default::default() },
+            None,
+        );
+        let mut item = p
+            .make_track_item(
+                id,
+                filmcraft_project::TrackKind::Video,
+                Tick::ZERO,
+                filmcraft_time::TimeRange::new(Tick::ZERO, Tick(254_016_000_000)),
+                Default::default(),
+            )
+            .unwrap();
+        item.id = filmcraft_project::ClipId(77_451_998);
+        item.effects.push(filmcraft_project::find_effect("studio_reverb").unwrap().instance());
+        let read = |_: i64, n: usize| vec![vec![0.25; n]; 2];
+        process(&item, 0, 16, 48000, &read);
+        let key = (item.id.0, structure_hash(&item), 48000, 2);
+        let before = cache().lock().unwrap().get(&key).unwrap().iter().map(|s| s.next_out).collect::<Vec<_>>();
+        process_with_cache(&item, 16, 16, 48000, &read, false);
+        let after = cache().lock().unwrap().get(&key).unwrap().iter().map(|s| s.next_out).collect::<Vec<_>>();
+        assert_eq!(before, after);
+    }
 
     #[test]
     fn every_audio_effect_has_dsp() {

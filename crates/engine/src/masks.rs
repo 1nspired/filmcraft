@@ -29,6 +29,55 @@ pub struct MaskSel {
     pub mask: usize,
 }
 
+/// Preserve an existing mask's identity when project history or an effect
+/// stack changes. This only maps selection; it never authors a mask or ID.
+pub(crate) fn remap_selection(before: &filmcraft_project::Project, after: &filmcraft_project::Project, state: &crate::EditorState) -> Option<MaskSel> {
+    let selected = state.selected_mask?;
+    let sequence = state.active_sequence?;
+    fn clip(q: &filmcraft_project::Sequence, id: ClipId) -> Option<&filmcraft_project::TrackItem> {
+        if q.all_tracks().flat_map(|t| &t.items).take(100_001).count() > 100_000 {
+            return None;
+        }
+        let (_, item) = q.find_item(id)?;
+        (item.effects.len() <= 4096).then_some(item)
+    }
+    let old = clip(before.sequence(sequence)?, selected.clip)?;
+    let new = clip(after.sequence(sequence)?, selected.clip)?;
+    if old.item != new.item || old.identity.as_ref().is_some_and(|id| new.identity.as_ref().is_none_or(|next| next.id != id.id)) {
+        return None;
+    }
+    let effect = old.effects.get(selected.effect)?;
+    if effect.masks.len() > 4096 {
+        return None;
+    }
+    let mask = effect.masks.get(selected.mask)?;
+    match (&effect.instance_id, &mask.instance_id) {
+        (Some(effect_id), Some(mask_id)) => {
+            if !filmcraft_project::ClipIdentity::valid_id(effect_id) || !filmcraft_project::ClipIdentity::valid_id(mask_id) {
+                return None;
+            }
+            let mut effects = new.effects.iter().enumerate().filter(|(_, e)| e.instance_id.as_ref() == Some(effect_id));
+            let (effect_index, effect) = effects.next()?;
+            if effects.next().is_some() || effect.masks.len() > 4096 {
+                return None;
+            }
+            let mut masks = effect.masks.iter().enumerate().filter(|(_, m)| m.instance_id.as_ref() == Some(mask_id));
+            let (mask_index, _) = masks.next()?;
+            masks.next().is_none().then_some(MaskSel { clip: selected.clip, effect: effect_index, mask: mask_index })
+        }
+        (None, None) => {
+            // Retain legacy coordinates only when stack structure stayed put.
+            // A tracked handle that disappeared never enters this fallback.
+            if old.effects.len() != new.effects.len() || !old.effects.iter().zip(&new.effects).all(|(a, b)| a.effect == b.effect) {
+                return None;
+            }
+            let current = new.effects.get(selected.effect)?;
+            (current.masks.len() == effect.masks.len()).then_some(selected)
+        }
+        _ => None,
+    }
+}
+
 fn spec(id: &'static str, label: &'static str, params: &'static str, run: Run) -> CommandSpec {
     CommandSpec { id, label, menu: &[], shortcut: None, params, enabled: has_seq, run, journal: true }
 }
@@ -128,7 +177,7 @@ pub fn path_to_json(p: &MaskPath) -> Value {
 
 /// Resolve the target clip (and its source size in pixels).
 fn target_clip(s: &Session, p: &Value) -> Result<ClipId> {
-    if let Some(c) = clip_p(p, "clip") {
+    if let Some(c) = clip_p(p, "clip")? {
         return Ok(c);
     }
     if let Some(sel) = s.state.selected_mask {
@@ -179,7 +228,7 @@ fn edit_mask<R>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(&mut Mas
     let sel = s.state.selected_mask;
     let ph = time_p(s, p, "").unwrap_or(s.playhead());
     let eff = p.get("effect").cloned();
-    let mask_i = u64_p(p, "mask").map(|m| m as usize).or(sel.filter(|x| x.clip == clip).map(|x| x.mask));
+    let mask_i = u64_p(p, "mask")?.map(|m| m as usize).or(sel.filter(|x| x.clip == clip).map(|x| x.mask));
     let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
     let body = move |pr: &mut filmcraft_project::Project, _: &mut crate::EditorState| -> Result<R> {
         let q = pr.sequence_mut(seq_id).ok_or(EngineError::NoSequence)?;
@@ -257,7 +306,7 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     let clip = target_clip(s, p)?;
     let sel = s.state.selected_mask;
     let eff = p.get("effect").cloned();
-    let mask_i = u64_p(p, "mask").map(|m| m as usize).or(sel.filter(|x| x.clip == clip).map(|x| x.mask)).ok_or_else(|| bad("masks.remove", "need `mask`"))?;
+    let mask_i = u64_p(p, "mask")?.map(|m| m as usize).or(sel.filter(|x| x.clip == clip).map(|x| x.mask)).ok_or_else(|| bad("masks.remove", "need `mask`"))?;
     let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
     s.edit("Delete Mask", move |pr, st| {
         let q = pr.sequence_mut(seq_id).ok_or(EngineError::NoSequence)?;
@@ -324,7 +373,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn move_vertex(s: &mut Session, p: &Value) -> Result<Value> {
-    let vi = u64_p(p, "vertex").ok_or_else(|| bad("masks.moveVertex", "need `vertex`"))? as usize;
+    let vi = u64_p(p, "vertex")?.ok_or_else(|| bad("masks.moveVertex", "need `vertex`"))? as usize;
     let handle = str_p(p, "handle").unwrap_or("point").to_string();
     let to = p.get("to").and_then(pt);
     let delta = p.get("delta").and_then(pt);
@@ -373,7 +422,7 @@ fn translate(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn add_vertex(s: &mut Session, p: &Value) -> Result<Value> {
-    let after = u64_p(p, "after").ok_or_else(|| bad("masks.addVertex", "need `after`"))? as usize;
+    let after = u64_p(p, "after")?.ok_or_else(|| bad("masks.addVertex", "need `after`"))? as usize;
     let at = p.get("at").and_then(pt).ok_or_else(|| bad("masks.addVertex", "need `at`"))?;
     edit_mask(s, p, "Add Mask Vertex", move |m, t| {
         let n = m.path_at(t).vertices.len();
@@ -412,7 +461,7 @@ fn add_vertex(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn remove_vertex(s: &mut Session, p: &Value) -> Result<Value> {
-    let vi = u64_p(p, "vertex").ok_or_else(|| bad("masks.removeVertex", "need `vertex`"))? as usize;
+    let vi = u64_p(p, "vertex")?.ok_or_else(|| bad("masks.removeVertex", "need `vertex`"))? as usize;
     edit_mask(s, p, "Delete Mask Vertex", move |m, t| {
         if m.path_at(t).len() <= 3 {
             return Err(bad("masks.removeVertex", "a mask keeps at least 3 vertices"));
@@ -441,7 +490,7 @@ fn drop_all(m: &mut Mask, _t: Tick, f: impl Fn(&mut MaskPath)) {
 }
 
 fn toggle_smooth(s: &mut Session, p: &Value) -> Result<Value> {
-    let vi = u64_p(p, "vertex").ok_or_else(|| bad("masks.toggleVertexSmooth", "need `vertex`"))? as usize;
+    let vi = u64_p(p, "vertex")?.ok_or_else(|| bad("masks.toggleVertexSmooth", "need `vertex`"))? as usize;
     edit_mask(s, p, "Convert Mask Vertex", move |m, t| {
         let mut path = m.path_at(t);
         let n = path.vertices.len();
@@ -507,7 +556,7 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
     let seq = s.active_sequence().ok_or(EngineError::NoSequence)?;
     let (_, it) = seq.find_item(clip).ok_or_else(|| bad("masks.select", "no such clip"))?;
     let ei = effect_index(&it.effects, p.get("effect"), None, clip).ok_or_else(|| bad("masks.select", "no such effect on clip"))?;
-    let mi = u64_p(p, "mask").unwrap_or(0) as usize;
+    let mi = u64_p(p, "mask")?.unwrap_or(0) as usize;
     if mi >= it.effects[ei].masks.len() {
         return Err(bad("masks.select", format!("no mask {mi}")));
     }
@@ -520,7 +569,7 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
 fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let seq = s.active_sequence().ok_or(EngineError::NoSequence)?;
     let ph = time_p(s, p, "").unwrap_or(s.playhead());
-    let only = clip_p(p, "clip");
+    let only = clip_p(p, "clip")?;
     let mut out = Vec::new();
     for tr in &seq.video_tracks {
         for it in &tr.items {
@@ -554,11 +603,11 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// The parameter a keyframe / setParam command addresses: a mask parameter when `mask` is given.
-pub(crate) fn target_param<'a>(e: &'a mut EffectInstance, p: &Value, pid: &str) -> Option<&'a mut filmcraft_project::Param> {
-    match u64_p(p, "mask") {
-        Some(mi) => e.masks.get_mut(mi as usize)?.param_mut(pid),
+pub(crate) fn target_param<'a>(e: &'a mut EffectInstance, p: &Value, pid: &str) -> Result<Option<&'a mut filmcraft_project::Param>> {
+    Ok(match crate::commands::nullable_u64_p(p, "mask")? {
+        Some(mi) => usize::try_from(mi).ok().and_then(|i| e.masks.get_mut(i)).and_then(|mask| mask.param_mut(pid)),
         None => e.params.get_mut(pid),
-    }
+    })
 }
 
 // ---------------------------------------------------------------- tracking
@@ -586,7 +635,7 @@ fn track(s: &mut Session, p: &Value) -> Result<Value> {
     let (_, it) = seq.find_item(clip).ok_or_else(|| bad("masks.track", "no such clip"))?;
     let it = it.clone();
     let ei = effect_index(&it.effects, p.get("effect"), sel, clip).ok_or_else(|| bad("masks.track", "no such effect on clip"))?;
-    let mi = u64_p(p, "mask")
+    let mi = u64_p(p, "mask")?
         .map(|m| m as usize)
         .or(sel.filter(|x| x.clip == clip && x.effect == ei).map(|x| x.mask))
         .ok_or_else(|| bad("masks.track", "need `mask`"))?;
@@ -610,7 +659,7 @@ fn track(s: &mut Session, p: &Value) -> Result<Value> {
     let (a, b) = (it.source_time_at(it.start), it.source_time_at(it.end() - Tick(1)));
     let (lo, hi) = (a.min(b), a.max(b));
     let room = if backward { (mt0 - lo).0 / fd.0.max(1) } else { (hi - mt0).0 / fd.0.max(1) };
-    let steps = match u64_p(p, "frames") {
+    let steps = match u64_p(p, "frames")? {
         Some(n) => (n as i64).min(room),
         None => room,
     }

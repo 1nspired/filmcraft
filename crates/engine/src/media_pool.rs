@@ -14,7 +14,7 @@
 //! - Paths that came from a document (the project file, a template, an interchange file) are
 //!   opened through [`crate::doc_path`] ([`MediaPool::follow`]); a refused one renders as missing.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -59,6 +59,15 @@ pub struct MediaPool {
     /// Media and proxy paths that came from a document, with that document's path (see
     /// [`Self::follow`]).
     stored: RwLock<HashMap<String, Option<PathBuf>>>,
+}
+
+/// Same authorized resolver for a live pool and a bounded immutable worker
+/// input. `None` means user-admitted; `Some(None)` means an unsaved document.
+pub(crate) fn follow_origin(path: &str, origin: Option<&Option<PathBuf>>) -> Result<String, crate::doc_path::NotFollowed> {
+    match origin {
+        Some(document) => crate::doc_path::resolve(path, document.as_deref()),
+        None => Ok(path.to_string()),
+    }
 }
 
 impl Default for MediaPool {
@@ -217,10 +226,12 @@ impl MediaPool {
         if cfg!(target_arch = "wasm32") {
             return Ok(path.to_string());
         }
-        match self.stored.read().unwrap_or_else(|e| e.into_inner()).get(path) {
-            Some(document) => crate::doc_path::resolve(path, document.as_deref()),
-            None => Ok(path.to_string()),
-        }
+        follow_origin(path, self.stored.read().unwrap_or_else(|e| e.into_inner()).get(path))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn path_origin(&self, path: &str) -> Option<Option<PathBuf>> {
+        self.stored.read().unwrap_or_else(|e| e.into_inner()).get(path).cloned()
     }
 
     /// [`Self::follow`] as a media error (a refused path is a missing file).
@@ -400,12 +411,12 @@ impl MediaPool {
 
     /// A render-side provider bound to a project snapshot (proxies when enabled).
     pub fn provider(self: &Arc<Self>, project: Arc<Project>, services: Arc<dyn Services>) -> PoolProvider {
-        PoolProvider { pool: self.clone(), project, services, full_res: false, used: None }
+        PoolProvider { pool: self.clone(), project, services, full_res: false, used: None, failures: None }
     }
 
     /// A provider that always reads full-resolution media (export).
     pub fn full_res_provider(self: &Arc<Self>, project: Arc<Project>, services: Arc<dyn Services>) -> PoolProvider {
-        PoolProvider { pool: self.clone(), project, services, full_res: true, used: None }
+        PoolProvider { pool: self.clone(), project, services, full_res: true, used: None, failures: None }
     }
 }
 
@@ -418,6 +429,7 @@ pub struct PoolProvider {
     pub full_res: bool,
     /// Items asked for so far, when recording ([`PoolProvider::recording`]).
     used: Option<Mutex<BTreeSet<ItemId>>>,
+    failures: Option<Arc<Mutex<BTreeMap<ItemId, String>>>>,
 }
 
 impl PoolProvider {
@@ -425,6 +437,7 @@ impl PoolProvider {
     /// tell which of them rendered offline.
     pub fn recording(mut self) -> Self {
         self.used = Some(Mutex::new(BTreeSet::new()));
+        self.failures = Some(Arc::default());
         self
     }
 
@@ -433,10 +446,24 @@ impl PoolProvider {
     pub fn offline_used(&self) -> Vec<OfflineMedia> {
         let Some(used) = &self.used else { return Vec::new() };
         let used = used.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let media: BTreeSet<ItemId> = used.into_iter().filter_map(|i| self.project.resolve_media(i).map(|(id, _, _)| id)).collect();
+        let media: BTreeSet<ItemId> = used.into_iter().map(|i| self.project.resolve_media(i).map_or(i, |(id, _, _)| id)).collect();
+        let failures = self.failures.as_ref().map(|f| f.lock().unwrap_or_else(|e| e.into_inner()).clone()).unwrap_or_default();
         media
             .into_iter()
             .filter_map(|id| {
+                if let Some(error) = failures.get(&id) {
+                    let name = self.project.item(id).map(|i| i.name.clone()).unwrap_or_else(|| format!("item {}", id.0));
+                    let path = self
+                        .project
+                        .item(id)
+                        .and_then(|i| i.as_media())
+                        .and_then(|m| match &m.media {
+                            MediaRef::File { path } => Some(path.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    return Some(OfflineMedia { item: id.0, name, path, status: "unreadable", error: error.clone() });
+                }
                 let st = self.pool.offline_status(id)?;
                 let status = match st.reason {
                     OfflineReason::Missing => "missing",
@@ -455,7 +482,56 @@ impl filmcraft_render::SourceProvider for PoolProvider {
         if let Some(used) = &self.used {
             used.lock().unwrap_or_else(|e| e.into_inner()).insert(item);
         }
-        if self.full_res { self.pool.full_res_source(&self.project, item, &*self.services) } else { self.pool.source_for(&self.project, item, &*self.services) }
+        let source = if self.full_res {
+            self.pool.full_res_source(&self.project, item, &*self.services)
+        } else {
+            self.pool.source_for(&self.project, item, &*self.services)
+        };
+        match (&self.failures, source) {
+            (Some(failures), Some(inner)) => {
+                Some(Arc::new(RecordedSource { inner, item: self.project.resolve_media(item).map_or(item, |(id, _, _)| id), failures: failures.clone() }))
+            }
+            (Some(failures), None) => {
+                failures.lock().unwrap_or_else(|e| e.into_inner()).entry(item).or_insert_with(|| "rendered source could not be resolved".into());
+                None
+            }
+            (None, source) => source,
+        }
+    }
+}
+
+// Compositing/mixing can intentionally keep a damaged monitor alive with blank picture or
+// silence. Export must retain every actual decode error even if a later frame succeeds.
+// The failure set belongs to this provider/job; it never poisons another job or live playback.
+struct RecordedSource {
+    inner: SharedSource,
+    item: ItemId,
+    failures: Arc<Mutex<BTreeMap<ItemId, String>>>,
+}
+impl RecordedSource {
+    fn observed<T>(&self, result: filmcraft_media::Result<T>, kind: &str) -> filmcraft_media::Result<T> {
+        if let Err(error) = &result {
+            let reason = format!("{kind}: {error}").chars().take(512).collect();
+            self.failures.lock().unwrap_or_else(|e| e.into_inner()).entry(self.item).or_insert(reason);
+        }
+        result
+    }
+}
+impl MediaSource for RecordedSource {
+    fn info(&self) -> &MediaInfo {
+        self.inner.info()
+    }
+    fn audio_channel_layout(&self) -> filmcraft_media::Result<Option<filmcraft_media::SourceAudioLayout>> {
+        self.inner.audio_channel_layout()
+    }
+    fn video_frame(&self, request: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
+        self.observed(self.inner.video_frame(request), "picture decode")
+    }
+    fn audio(&self, start: i64, frames: usize, rate: u32) -> filmcraft_media::Result<AudioBuffer> {
+        self.observed(self.inner.audio(start, frames, rate), "sound decode")
+    }
+    fn audio_stream(&self, stream: usize, start: i64, frames: usize, rate: u32) -> filmcraft_media::Result<AudioBuffer> {
+        self.observed(self.inner.audio_stream(stream, start, frames, rate), "sound stream decode")
     }
 }
 
@@ -873,6 +949,58 @@ mod tests {
         let export = pool.cached(item).unwrap();
         for _ in 0..DAMAGED_AFTER * 2 {
             assert!(matches!(frame(&export), Err(MediaError::Decode(_))));
+        }
+    }
+
+    #[test]
+    fn export_decode_errors_remain_in_their_job_report_without_poisoning_later_jobs_or_monitors() {
+        let mut session = crate::Session::default();
+        session.execute("file.openDemoProject", serde_json::json!({})).unwrap();
+        let item = session.active_sequence().unwrap().video_tracks[0].items[0].item;
+        let (_, _, source) = flaky();
+        session.media.insert(item, source.clone());
+        let job = session.media.full_res_provider(session.project.clone(), session.services.clone()).recording();
+        let rendered = filmcraft_render::SourceProvider::source(&job, item).unwrap();
+        source.set(IO);
+        assert!(frame(&rendered).is_err());
+        source.set(OK);
+        assert!(frame(&rendered).is_ok());
+        let failed = job.offline_used();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].error.contains("short read"));
+        assert_eq!(failed[0].status, "unreadable");
+        assert!(session.media.offline_status(item).is_none());
+        let next = session.media.full_res_provider(session.project.clone(), session.services.clone()).recording();
+        assert!(frame(&filmcraft_render::SourceProvider::source(&next, item).unwrap()).is_ok());
+        assert!(next.offline_used().is_empty());
+    }
+
+    #[test]
+    fn export_sound_and_nonprimary_stream_failures_are_retained_before_the_mixer_can_substitute_silence() {
+        struct BrokenAudio(MediaInfo);
+        impl MediaSource for BrokenAudio {
+            fn info(&self) -> &MediaInfo {
+                &self.0
+            }
+            fn video_frame(&self, _: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
+                Err(MediaError::NoStream("video"))
+            }
+            fn audio(&self, _: i64, _: usize, _: u32) -> filmcraft_media::Result<AudioBuffer> {
+                Err(MediaError::Io("damaged primary sound".into()))
+            }
+            fn audio_stream(&self, _: usize, _: i64, _: usize, _: u32) -> filmcraft_media::Result<AudioBuffer> {
+                Err(MediaError::Decode("damaged routed sound".into()))
+            }
+        }
+        let (_, _, good) = flaky();
+        for routed in [false, true] {
+            let failures = Arc::new(Mutex::new(BTreeMap::new()));
+            let source = RecordedSource { inner: Arc::new(BrokenAudio(good.info().clone())), item: ItemId(1), failures: failures.clone() };
+            let result = if routed { source.audio_stream(1, 0, 128, 48000) } else { source.audio(0, 128, 48000) };
+            assert!(result.is_err());
+            let entries = failures.lock().unwrap();
+            assert_eq!(entries.len(), 1);
+            assert!(entries[&ItemId(1)].contains(if routed { "damaged routed sound" } else { "damaged primary sound" }));
         }
     }
 

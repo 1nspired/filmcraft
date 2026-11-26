@@ -88,7 +88,7 @@ pub fn run(s: &mut Session, p: &Value) -> Result<Value> {
         m => return Err(bad("file.projectManager", format!("unknown mode `{m}` (collect | consolidate)"))),
     };
     let exclude_unused = bool_p(p, "excludeUnused").unwrap_or(true);
-    let handles = u64_p(p, "handles").unwrap_or(30) as i64;
+    let handles = u64_p(p, "handles")?.unwrap_or(30) as i64;
     let include_proxies = bool_p(p, "includeProxies").unwrap_or(!consolidate) && !consolidate;
     let include_previews = bool_p(p, "includePreviews").unwrap_or(false);
     let pr: &'static Preset =

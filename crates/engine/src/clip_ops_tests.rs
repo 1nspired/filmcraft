@@ -39,6 +39,104 @@ fn f64_param(it: &TrackItem, effect: &str, param: &str) -> f64 {
 }
 
 #[test]
+fn audit_effect_targets_reject_hostile_values_without_changing_project_or_history() {
+    let commands = [
+        ("effects.setParam", "effect"),
+        ("effects.toggleAnimation", "effect"),
+        ("effects.resetParam", "effect"),
+        ("effects.addKeyframe", "effect"),
+        ("effects.deleteKeyframe", "effect"),
+        ("effects.moveKeyframe", "effect"),
+        ("effects.setInterpolation", "effect"),
+        ("effects.setKeyframe", "effect"),
+        ("effects.toggleEnabled", "index"),
+        ("effects.reset", "index"),
+        ("effects.remove", "index"),
+    ];
+    for (command, field) in commands {
+        assert!(crate::commands::find(command).is_some(), "regression must exercise a real command: {command}");
+        let mut s = demo();
+        let id = v1(&s)[0].id;
+        s.execute("effects.setParam", json!({"clip":id.0,"effect":"motion","param":"scale","value":125.0})).unwrap();
+        s.undo().unwrap(); // Failed calls must retain the real Redo branch as well.
+        s.history.merge_key = Some("existing human gesture".into());
+        for target in [json!(-1), json!(0.5), json!(-0.5), json!(1.0), json!(u64::MAX), json!(999999), json!(null), json!(true), json!([]), json!({})] {
+            let project = s.project.clone();
+            let state = serde_json::to_value(&s.state).unwrap();
+            let undo = s.history.undo.clone();
+            let redo = s.history.redo.clone();
+            let merge = s.history.merge_key.clone();
+            let revision = s.revision;
+            let journal = s.journal.clone();
+            let mut args = json!({"clip":id.0,"param":"scale","value":123.0,"mediaTime":0,"to":1,"begin":true,"merge":true});
+            args[field] = target.clone();
+            assert!(s.execute(command, args).is_err(), "{command} accepted {field}={target}");
+            assert!(std::sync::Arc::ptr_eq(&project, &s.project), "{command} published a project for {target}");
+            assert_eq!(serde_json::to_value(&s.state).unwrap(), state, "{command} changed editor state");
+            assert_eq!(s.revision, revision, "{command} changed revision");
+            assert_eq!(s.history.merge_key, merge, "{command} broke a human merge group");
+            assert_eq!(s.journal, journal, "{command} journaled a failed request");
+            for (before, after) in [(&undo, &s.history.undo), (&redo, &s.history.redo)] {
+                assert_eq!(before.len(), after.len(), "{command} changed history length");
+                assert!(before.iter().zip(after).all(|((a, p), (b, q))| a == b && std::sync::Arc::ptr_eq(p, q)), "{command} replaced history");
+            }
+        }
+    }
+}
+
+#[test]
+fn audit_effect_instance_indices_keep_duplicate_instances_distinct_and_undoable() {
+    let mut s = demo();
+    let id = v1(&s)[0].id;
+    for _ in 0..2 {
+        s.execute("effects.apply", json!({"clips":[id.0],"effect":"gaussian_blur"})).unwrap();
+    }
+    let indices: Vec<_> = clip(&s, id.0).effects.iter().enumerate().filter(|(_, e)| e.effect == "gaussian_blur").map(|(i, _)| i).collect();
+    assert_eq!(indices.len(), 2);
+    let before = s.project.clone();
+    let undo = s.history.undo.len();
+    s.execute("effects.setParam", json!({"clip":id.0,"effect":indices[1],"param":"blurriness","value":37.0,"merge":true,"begin":true})).unwrap();
+    let edited = s.project.clone();
+    let actual = clip(&s, id.0);
+    assert_eq!(actual.effects[indices[0]].param("blurriness").unwrap().value.as_f64(), Some(0.0));
+    assert_eq!(actual.effects[indices[1]].param("blurriness").unwrap().value.as_f64(), Some(37.0));
+    assert_eq!(s.history.undo.len(), undo + 1);
+    s.undo().unwrap();
+    assert_eq!(serde_json::to_value(&*s.project).unwrap(), serde_json::to_value(&*before).unwrap());
+    s.redo().unwrap();
+    assert_eq!(serde_json::to_value(&*s.project).unwrap(), serde_json::to_value(&*edited).unwrap());
+}
+
+#[test]
+fn audit_failed_effect_begin_does_not_break_an_existing_native_gesture() {
+    let mut s = demo();
+    let id = v1(&s)[0].id;
+    let undo = s.history.undo.len();
+    s.execute("effects.setParam", json!({"clip":id.0,"effect":"motion","param":"scale","value":125.0,"begin":true,"merge":true})).unwrap();
+    let merge = s.history.merge_key.clone();
+    assert!(merge.is_some());
+    for args in [
+        json!({"clip":id.0,"effect":999999,"param":"scale","value":130.0,"begin":true,"merge":true}),
+        json!({"clip":id.0,"effect":"motion","param":"scale","value":[],"begin":true,"merge":true}),
+        json!({"clip":id.0,"effect":999999,"param":"scale","mediaTime":0,"to":1,"begin":true,"merge":true}),
+    ] {
+        let project = s.project.clone();
+        let revision = s.revision;
+        let command = if args.get("mediaTime").is_some() { "effects.moveKeyframe" } else { "effects.setParam" };
+        assert!(s.execute(command, args).is_err());
+        assert!(std::sync::Arc::ptr_eq(&project, &s.project));
+        assert_eq!(s.revision, revision);
+        assert_eq!(s.history.merge_key, merge);
+    }
+    s.execute("effects.setParam", json!({"clip":id.0,"effect":"motion","param":"scale","value":130.0,"merge":true})).unwrap();
+    assert_eq!(s.history.undo.len(), undo + 1, "failed begin did not split the gesture");
+    s.undo().unwrap();
+    assert_eq!(f64_param(&clip(&s, id.0), "motion", "scale"), 100.0);
+    s.redo().unwrap();
+    assert_eq!(f64_param(&clip(&s, id.0), "motion", "scale"), 130.0);
+}
+
+#[test]
 fn menus_and_shortcuts_follow_premiere() {
     let ids: Vec<&str> = crate::commands::command_specs().iter().map(|c| c.id).collect();
     let pos = |id: &str| ids.iter().position(|x| *x == id).unwrap_or_else(|| panic!("{id} missing"));
@@ -1081,4 +1179,128 @@ fn toggle_animation_creates_a_parameter_missing_from_an_older_instance() {
     let it = s.active_sequence().unwrap().find_item(clip).unwrap().1.clone();
     let rot = it.effect("motion").unwrap().param("rotation").unwrap();
     assert!(rot.is_animated(), "the stopwatch is on");
+}
+
+fn replacement_lock_setup(linked: bool, locked_track: &str) -> (Session, u64) {
+    let mut s = demo();
+    let clip = v1(&s)[0].id.0;
+    s.execute("source.open", json!({"item":5})).unwrap();
+    s.execute("playhead.set", json!({"time":0})).unwrap();
+    s.execute("sequence.linkedSelection", json!({"on":linked})).unwrap();
+    s.execute("timeline.setTrack", json!({"track":locked_track,"locked":true})).unwrap();
+    (s, clip)
+}
+
+fn replacement_refuses_without_publication(s: &mut Session, command: &str, args: serde_json::Value, message: &str) {
+    // The rejected gesture must preserve a real Redo branch and an ongoing
+    // human merge group, as well as the complete native cut and editor state.
+    s.execute("file.newBin", json!({"name":"Replacement Redo sentinel"})).unwrap();
+    s.undo().unwrap();
+    s.history.merge_key = Some("ongoing human gesture".into());
+    let project = s.project.clone();
+    let state = serde_json::to_value(&s.state).unwrap();
+    let revision = s.revision;
+    let undo = s.history.undo.clone();
+    let redo = s.history.redo.clone();
+    let merge = s.history.merge_key.clone();
+    let journal = s.journal.clone();
+    let error = s.execute(command, args).unwrap_err().to_string();
+    assert!(error.to_lowercase().contains(message), "{command}: {error}");
+    assert!(std::sync::Arc::ptr_eq(&project, &s.project), "{command} published a rejected replacement");
+    assert_eq!(serde_json::to_value(&s.state).unwrap(), state, "{command} changed editor state");
+    assert_eq!(s.revision, revision);
+    assert_eq!(s.history.merge_key, merge);
+    assert_eq!(s.journal, journal);
+    for (before, after) in [(&undo, &s.history.undo), (&redo, &s.history.redo)] {
+        assert_eq!(before.len(), after.len());
+        for ((a, p), (b, q)) in before.iter().zip(after) {
+            assert_eq!(a, b);
+            assert!(std::sync::Arc::ptr_eq(p, q));
+        }
+    }
+    assert!(!redo.is_empty());
+    s.redo().unwrap();
+    s.undo().unwrap();
+    assert_eq!(*s.project, *project, "the preceding human Redo remains usable");
+}
+
+#[test]
+fn source_replacement_refuses_locked_explicit_picture_without_losing_either_history_branch() {
+    for command in ["clip.replaceFromSource", "clip.replaceFromSourceMatchFrame", "clip.replaceFromBin"] {
+        let (mut s, clip) = replacement_lock_setup(false, "V1");
+        replacement_refuses_without_publication(&mut s, command, json!({"clips":[clip],"item":5}), "lock");
+    }
+}
+
+#[test]
+fn source_replacement_refuses_locked_linked_sound_before_changing_any_picture() {
+    for command in ["clip.replaceFromSource", "clip.replaceFromSourceMatchFrame", "clip.replaceFromBin"] {
+        let (mut s, clip) = replacement_lock_setup(true, "A1");
+        replacement_refuses_without_publication(&mut s, command, json!({"clips":[clip],"item":5}), "lock");
+    }
+}
+
+#[test]
+fn source_replacement_validates_every_explicit_target_before_mutation() {
+    for command in ["clip.replaceFromSource", "clip.replaceFromSourceMatchFrame", "clip.replaceFromBin"] {
+        for missing in [false, true] {
+            let (mut s, clip) = replacement_lock_setup(false, "A1");
+            let other = if missing { 999_999 } else { s.active_sequence().unwrap().audio_tracks[0].items[0].id.0 };
+            replacement_refuses_without_publication(&mut s, command, json!({"clips":[clip,other],"item":5}), if missing { "item" } else { "lock" });
+        }
+    }
+}
+
+#[test]
+fn source_replacement_picture_only_keeps_locked_sound_and_exact_human_undo_redo() {
+    for command in ["clip.replaceFromSource", "clip.replaceFromSourceMatchFrame", "clip.replaceFromBin"] {
+        let (mut s, clip) = replacement_lock_setup(false, "A1");
+        let before = s.project.to_json();
+        let sound = s.active_sequence().unwrap().audio_tracks.clone();
+        let undo = s.history.undo.len();
+        let result = s.execute(command, json!({"clips":[clip],"item":5})).unwrap();
+        assert_eq!(result["clips"], json!([clip]));
+        assert_eq!(s.active_sequence().unwrap().audio_tracks, sound);
+        assert!(!s.state.linked_selection, "there is no hidden Linked Selection toggle");
+        assert_eq!(s.history.undo.len(), undo + 1);
+        let after = s.project.to_json();
+        assert_ne!(before, after);
+        s.undo().unwrap();
+        assert_eq!(s.project.to_json(), before);
+        s.redo().unwrap();
+        assert_eq!(s.project.to_json(), after);
+        let saved = filmcraft_project::Project::from_json(&after).unwrap();
+        assert_eq!(saved.to_json(), after);
+    }
+}
+
+#[test]
+fn source_replacement_single_stream_keeps_incompatible_locked_linked_tracks_untouched() {
+    for command in ["clip.replaceFromSource", "clip.replaceFromSourceMatchFrame", "clip.replaceFromBin"] {
+        for video in [true, false] {
+            let (mut s, picture) = replacement_lock_setup(true, if video { "A1" } else { "V1" });
+            let source = s
+                .execute("file.newOfflineFile", json!({"name":"Single stream replacement","video":video,"audio":!video,"fps":24,"seconds":10}))
+                .unwrap()["item"]
+                .as_u64()
+                .unwrap();
+            s.execute("source.open", json!({"item":source})).unwrap();
+            let expected = if video { picture } else { s.active_sequence().unwrap().audio_tracks[0].items[0].id.0 };
+            let untouched = if video { s.active_sequence().unwrap().audio_tracks.clone() } else { s.active_sequence().unwrap().video_tracks.clone() };
+            let before = s.project.to_json();
+            let undo = s.history.undo.len();
+            let result = s.execute(command, json!({"clips":[picture],"item":source})).unwrap();
+            assert_eq!(result["clips"], json!([expected]));
+            let actual = if video { &s.active_sequence().unwrap().audio_tracks } else { &s.active_sequence().unwrap().video_tracks };
+            assert_eq!(*actual, untouched, "the unavailable source kind leaves locked tracks untouched");
+            assert!(s.state.linked_selection, "no hidden Linked Selection toggle");
+            assert_eq!(s.history.undo.len(), undo + 1);
+            let after = s.project.to_json();
+            assert_ne!(before, after);
+            s.undo().unwrap();
+            assert_eq!(s.project.to_json(), before);
+            s.redo().unwrap();
+            assert_eq!(s.project.to_json(), after);
+        }
+    }
 }

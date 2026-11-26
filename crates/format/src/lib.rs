@@ -39,6 +39,12 @@
 //!   would drop them when saving.
 //! - **v15**: project notes (`Project::notes`, Window ▸ Project Notes). No-op step; older builds
 //!   would drop them when saving.
+//! - **v16** (local Poema experiment): optional persistent clip identities, lineage, annotations
+//!   and protection reasons. Older builds must refuse these files rather than drop that data.
+//! - **v17** (local Poema experiment): optional clip-scoped effect and effect-scoped mask IDs.
+//!   Migration preserves legacy data without opting in or allocating identities.
+//! - **v18** (local Poema experiment): optional project-level metadata. Workspace identity can
+//!   exist before the first sequence; older builds must refuse rather than drop it.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
@@ -59,8 +65,10 @@ pub type Migration = fn(Value) -> Result<Value, String>;
 
 /// `MIGRATIONS[i]` upgrades schema `i + 1` to `i + 2`. Append one function per schema bump; never
 /// edit a shipped one.
-pub const MIGRATIONS: &[Migration] =
-    &[v1_to_v2, v2_to_v3, v3_to_v4, v4_to_v5, v5_to_v6, v6_to_v7, v7_to_v8, v8_to_v9, v9_to_v10, v10_to_v11, v11_to_v12, v12_to_v13, v13_to_v14, v14_to_v15];
+pub const MIGRATIONS: &[Migration] = &[
+    v1_to_v2, v2_to_v3, v3_to_v4, v4_to_v5, v5_to_v6, v6_to_v7, v7_to_v8, v8_to_v9, v9_to_v10, v10_to_v11, v11_to_v12, v12_to_v13, v13_to_v14, v14_to_v15,
+    v15_to_v16, v16_to_v17, v17_to_v18,
+];
 
 /// The schema version this build writes (and the newest it reads).
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32 + 1;
@@ -216,6 +224,7 @@ pub fn decode(bytes: &[u8]) -> Result<Loaded, FormatError> {
 /// Refuse only values that would overflow or exhaust memory later (`Sequence::check_bounds`);
 /// structural rules such as overlaps are left to the editor, so projects that open today still open.
 fn validate_loaded(mut loaded: Loaded) -> Result<Loaded, FormatError> {
+    filmcraft_project::clip_identity::validate_project(&loaded.project).map_err(FormatError::Corrupt)?;
     // Out-of-range audio stream data is repaired, not refused: failing the load would lose the
     // whole project over one bad index. A media item keeps its first `MAX_AUDIO_STREAMS` streams; a
     // clip pointing past that plays stream 0.
@@ -361,13 +370,48 @@ fn v14_to_v15(doc: Value) -> Result<Value, String> {
     Ok(doc)
 }
 
+/// v15 → v16: optional local Poema instance carriers. Legacy projects remain untracked.
+fn v15_to_v16(doc: Value) -> Result<Value, String> {
+    Ok(doc)
+}
+
+/// v16 → v17: optional clip-scoped effect/mask identities. Loading remains
+/// read-only; only an explicit native tracking edit opts a sequence in.
+fn v16_to_v17(doc: Value) -> Result<Value, String> {
+    Ok(doc)
+}
+
+/// v17 → v18: optional project-level metadata, including sequence-independent
+/// workspace identity. Legacy projects remain unassociated and unchanged.
+fn v17_to_v18(doc: Value) -> Result<Value, String> {
+    Ok(doc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn project_metadata_roundtrip_and_legacy_migration_do_not_adopt_or_drop_identity() {
+        let mut p = Project::new("Empty workspace");
+        p.metadata.insert("poema.projectWorkspace.v1".into(), "opaque preserved identity".into());
+        p.metadata.insert("human.custom".into(), "keep".into());
+        let bytes = encode(&p, false);
+        assert_eq!(decode(&bytes).unwrap().project, p);
+        let doc: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(matches!(migrate_with(&MIGRATIONS[..16], doc, 18), Err(FormatError::TooNew { found: 18, supported: 17 })));
+        let legacy = Project::new("Legacy");
+        let doc = serde_json::json!({"format":FORMAT_ID,"schema_version":17,"project":legacy});
+        let migrated = decode(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert!(migrated.migrated());
+        assert_eq!(migrated.project, legacy);
+        assert!(migrated.project.metadata.is_empty());
+        assert!(serde_json::to_value(&migrated.project).unwrap().get("metadata").is_none());
+    }
+
+    #[test]
     fn schema_version_matches_table() {
-        assert_eq!(SCHEMA_VERSION, 15);
+        assert_eq!(SCHEMA_VERSION, 18);
     }
 
     #[test]

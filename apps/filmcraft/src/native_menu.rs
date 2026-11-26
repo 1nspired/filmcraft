@@ -1,7 +1,11 @@
 //! Native macOS menu bar (muda), generated from the command registry — like Premiere, menus live in
 //! the system menu bar. Items send command ids to the app's command inbox.
 
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{Receiver, channel},
+};
 
 use filmcraft_ui_egui::FilmcraftApp;
 use filmcraft_ui_egui::menus::{MENUS, MenuItem as Item, NATIVE_APP_MENU, menu_items};
@@ -22,13 +26,13 @@ fn accel(s: &str) -> Option<Accelerator> {
 /// Updates native item labels, key equivalents and enablement when the menu tree changes.
 pub type MenuUpdater = Box<dyn FnMut(&[Item])>;
 
-pub fn install(app: &FilmcraftApp, ctx: egui::Context) -> (Receiver<String>, MenuUpdater) {
+pub fn install(app: &FilmcraftApp, ctx: egui::Context, composer_focus: Option<Arc<AtomicBool>>) -> (Receiver<String>, MenuUpdater) {
     let items = menu_items(app);
     // each native item with the menu entry it currently shows, so updates touch only what changed
     let mut native: Vec<(Item, MenuItem)> = Vec::new();
     let mut titles: Vec<(String, Submenu)> = Vec::new();
     let bar = Menu::new();
-    let app_menu = Submenu::new("FilmCraft", true);
+    let app_menu = Submenu::new(filmcraft_ui_egui::brand::NAME, true);
     let [settings_label, hide_label, hide_others_label, quit_label] = NATIVE_APP_MENU;
     // FilmCraft ▸ Settings ▸ <category> (Premiere's app-menu layout; General is Cmd+,)
     let settings = Submenu::new(app.ui.language.tr(settings_label), true);
@@ -41,8 +45,8 @@ pub fn install(app: &FilmcraftApp, ctx: egui::Context) -> (Receiver<String>, Men
     }
     // About and Discord repeat Help menu commands: same translated labels, updated with them
     let label = |id: &str, english: &str| items.iter().find(|i| i.id == id).map_or_else(|| english.to_string(), |i| i.label.clone());
-    let about = MenuItem::with_id("app.about", label("app.about", "About FilmCraft"), true, None);
-    let discord = MenuItem::with_id("help.discord", label("help.discord", "Join the ArtCraft Discord…"), true, None);
+    let about = MenuItem::with_id("app.about", label("app.about", "About Poema NLE"), true, None);
+    let discord = MenuItem::with_id("help.discord", label("help.discord", "FilmCraft upstream community…"), true, None);
     for (id, mi) in [("app.about", &about), ("help.discord", &discord)] {
         if let Some(it) = items.iter().find(|i| i.id == id) {
             // recorded as built (enabled, no shortcut), so the first update applies the real state
@@ -68,9 +72,13 @@ pub fn install(app: &FilmcraftApp, ctx: egui::Context) -> (Receiver<String>, Men
         quit,
     ]);
     let _ = bar.append(&app_menu);
+    let mut edit_menu = None;
     for top in MENUS {
         let sub = Submenu::new(app.ui.language.tr(top), true);
         titles.push((top.into(), sub.clone()));
+        if top == "Edit" {
+            edit_menu = Some(sub.clone());
+        }
         let mine: Vec<&Item> = items.iter().filter(|i| i.path.first().map(String::as_str) == Some(top) && !i.id.starts_with("app.settings.")).collect();
         // submenus by path prefix (e.g. Clip ▸ Video Options ▸ Time Interpolation), created where
         // their first item appears
@@ -110,8 +118,43 @@ pub fn install(app: &FilmcraftApp, ctx: egui::Context) -> (Receiver<String>, Men
             ctx.request_repaint();
         }
     });
+    let original_edit_items = edit_menu.as_ref().map(Submenu::items).unwrap_or_default();
+    let text_items = [
+        PredefinedMenuItem::undo(None),
+        PredefinedMenuItem::redo(None),
+        PredefinedMenuItem::separator(),
+        PredefinedMenuItem::cut(None),
+        PredefinedMenuItem::copy(None),
+        PredefinedMenuItem::paste(None),
+        PredefinedMenuItem::select_all(None),
+    ];
+    let mut shown_composer_focus = false;
     let mut shown_language = app.ui.language;
     let update: MenuUpdater = Box::new(move |items: &[Item]| {
+        let focused = composer_focus.as_ref().is_some_and(|f| f.load(Ordering::Relaxed));
+        if focused != shown_composer_focus
+            && let Some(edit) = edit_menu.as_ref()
+        {
+            // WKWebView must receive ordinary text Undo/Copy/Paste through the
+            // responder chain, never the native timeline's identically named edit.
+            for _ in 0..edit.items().len() {
+                let _ = edit.remove_at(0);
+            }
+            if focused {
+                for item in &text_items {
+                    if let Err(e) = edit.append(item) {
+                        log::error!("composer text menu: {e}");
+                    }
+                }
+            } else {
+                for item in &original_edit_items {
+                    if let Err(e) = edit.append(menu_item(item)) {
+                        log::error!("restore native edit menu: {e}");
+                    }
+                }
+            }
+            shown_composer_focus = focused;
+        }
         let checked = |id: &str| items.iter().any(|it| it.id == id && it.checked == Some(true));
         let language = if checked("app.language.japanese") {
             filmcraft_ui_egui::i18n::Language::Ja
@@ -163,4 +206,15 @@ pub fn install(app: &FilmcraftApp, ctx: egui::Context) -> (Receiver<String>, Men
         }
     });
     (rx, update)
+}
+
+/// Borrow the public menu variant without unchecked casts.
+fn menu_item(item: &muda::MenuItemKind) -> &dyn muda::IsMenuItem {
+    match item {
+        muda::MenuItemKind::MenuItem(i) => i,
+        muda::MenuItemKind::Submenu(i) => i,
+        muda::MenuItemKind::Predefined(i) => i,
+        muda::MenuItemKind::Check(i) => i,
+        muda::MenuItemKind::Icon(i) => i,
+    }
 }

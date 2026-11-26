@@ -131,11 +131,12 @@ fn clip_peaks_measure_the_stream_the_clip_plays() {
     let q = s.project.sequence(seq).unwrap();
     let (a, b) = (q.audio_tracks[0].items[0].id, q.audio_tracks[1].items[0].id);
     assert!(ids.contains(&a) && ids.contains(&b));
-    let peaks = crate::mixer::clip_peaks(&s, &[a, b]);
+    let peaks = crate::mixer::clip_peaks(&s, &[a]).unwrap();
     let db = |c: filmcraft_project::ClipId| peaks.iter().find(|(id, _)| *id == c).map(|(_, d)| *d).unwrap();
-    // The generator only has stream 0, so the clip playing stream 1 is silent, not a copy of stream 0.
+    // The generator only has stream 0. Peak measurement must not fabricate
+    // silence (or borrow stream 0) when the requested stream cannot decode.
     assert!(db(a) > -30.0, "{peaks:?}");
-    assert!(db(b) < -100.0, "{peaks:?}");
+    assert!(crate::mixer::clip_peaks(&s, &[b]).is_err());
 }
 
 #[test]

@@ -47,7 +47,7 @@ const G: &[&str] = &["Graphics and Titles"];
 
 fn has_graphic(s: &Session) -> std::result::Result<(), String> {
     has_seq(s)?;
-    target_clip(s, &Value::Null).map(|_| ()).ok_or_else(|| "select a graphic clip".into())
+    target_clip(s, &Value::Null).map_err(|e| e.to_string())?.map(|_| ()).ok_or_else(|| "select a graphic clip".into())
 }
 
 fn has_captions(s: &Session) -> std::result::Result<(), String> {
@@ -341,7 +341,7 @@ fn apply_template(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn template_controls(s: &mut Session, p: &Value) -> Result<Value> {
-    let clip = target_clip(s, p).ok_or_else(|| bad("graphics.template.controls", "no graphic clip"))?;
+    let clip = target_clip(s, p)?.ok_or_else(|| bad("graphics.template.controls", "no graphic clip"))?;
     let it = clip_item(s, clip)?;
     let mt = mt_at_playhead(s, &it);
     let Some(link) = it.graphic.as_ref().and_then(|m| m.template.as_ref()) else {
@@ -422,7 +422,7 @@ fn export_controls(it: &TrackItem, layers: &[EffectInstance], p: &Value) -> Resu
 }
 
 fn export_template(s: &mut Session, p: &Value) -> Result<Value> {
-    let clip = target_clip(s, p).ok_or_else(|| bad("graphics.template.export", "select a graphic clip"))?;
+    let clip = target_clip(s, p)?.ok_or_else(|| bad("graphics.template.export", "select a graphic clip"))?;
     let it = clip_item(s, clip)?;
     let size = match s.project.item(it.item).map(|x| &x.kind) {
         Some(ItemKind::Graphic { width, height, .. }) => [*width, *height],
@@ -439,7 +439,7 @@ fn export_template(s: &mut Session, p: &Value) -> Result<Value> {
     // layers with uids, keyframes made relative to the clip start
     let mut layers: Vec<EffectInstance> = idx.iter().map(|&i| it.effects[i].clone()).collect();
     let base_uids: Vec<u64> = layers.iter().map(layer_uid).collect();
-    ensure_uids(&mut layers);
+    ensure_uids(&mut layers).map_err(|e| bad("graphics.template.export", e.to_string()))?;
     if it.source_in != Tick::ZERO {
         for l in &mut layers {
             for prm in l.params.values_mut() {
@@ -562,7 +562,7 @@ fn remove_template(s: &mut Session, p: &Value) -> Result<Value> {
 fn template_thumbnail(s: &mut Session, p: &Value) -> Result<Value> {
     let key = str_p(p, "template").ok_or_else(|| bad("graphics.template.thumbnail", "need `template`"))?;
     let e = find_template(s, key)?;
-    let (w, h, rgba) = thumbnail(&e.template, u64_p(p, "width").unwrap_or(320) as u32);
+    let (w, h, rgba) = thumbnail(&e.template, u64_p(p, "width")?.unwrap_or(320) as u32);
     let png = filmcraft_export::encode_png(rgba, w, h).map_err(|x| EngineError::Other(x.to_string()))?;
     if let Some(path) = str_p(p, "path") {
         s.services.write_file(path, &png).map_err(|x| EngineError::Other(format!("{path}: {x}")))?;
@@ -598,7 +598,7 @@ fn edit_meta(s: &mut Session, clip: ClipId, label: &str, f: impl FnOnce(&mut Gra
 }
 
 fn set_roll(s: &mut Session, p: &Value) -> Result<Value> {
-    let clip = target_clip(s, p).ok_or_else(|| bad("graphics.setRoll", "no graphic clip"))?;
+    let clip = target_clip(s, p)?.ok_or_else(|| bad("graphics.setRoll", "no graphic clip"))?;
     let mode = match str_p(p, "mode") {
         Some(m) => Some(RollMode::from_name(m).ok_or_else(|| bad("graphics.setRoll", format!("unknown mode `{m}` (off, roll, crawlLeft, crawlRight)")))?),
         None => None,
@@ -626,7 +626,7 @@ fn set_roll(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn set_responsive_time(s: &mut Session, p: &Value) -> Result<Value> {
-    let clip = target_clip(s, p).ok_or_else(|| bad("graphics.setResponsiveTime", "no graphic clip"))?;
+    let clip = target_clip(s, p)?.ok_or_else(|| bad("graphics.setResponsiveTime", "no graphic clip"))?;
     let (intro, outro) = (dur_p(s, p, "intro"), dur_p(s, p, "outro"));
     if intro.is_none() && outro.is_none() {
         return Err(bad("graphics.setResponsiveTime", "need `introFrames` / `outroFrames` (or seconds / ticks)"));
@@ -654,24 +654,38 @@ fn set_responsive_time(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"clip": clip.0, "intro": m.intro.0, "outro": m.outro.0, "designDuration": m.design_duration.0}))
 }
 
-fn edges_p(p: &Value) -> [bool; 4] {
-    match p.get("edges") {
-        Some(Value::Array(a)) => {
-            let has = |n: &str| a.iter().any(|v| v.as_str().is_some_and(|x| x.eq_ignore_ascii_case(n)));
-            [has("left"), has("top"), has("right"), has("bottom")]
-        }
-        Some(Value::String(x)) if x != "all" => {
-            let has = |n: &str| x.split([',', ' ']).any(|v| v.eq_ignore_ascii_case(n));
-            [has("left"), has("top"), has("right"), has("bottom")]
-        }
-        _ => [true; 4],
+fn edges_p(p: &Value) -> Result<[bool; 4]> {
+    let bad_edges = || bad("graphics.pin", "edges must be all or up to four distinct left/top/right/bottom names");
+    let names: Vec<&str> = match p.get("edges") {
+        None => return Ok([true; 4]),
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("all") => return Ok([true; 4]),
+        Some(Value::String(s)) if s.len() <= 128 => s.split([',', ' ']).filter(|v| !v.is_empty()).collect(),
+        Some(Value::Array(a)) if a.len() <= 4 => a.iter().map(|v| v.as_str().ok_or_else(bad_edges)).collect::<Result<_>>()?,
+        _ => return Err(bad_edges()),
+    };
+    if names.len() > 4 {
+        return Err(bad_edges());
     }
+    let mut edges = [false; 4];
+    for name in names {
+        let index = ["left", "top", "right", "bottom"].iter().position(|edge| name.eq_ignore_ascii_case(edge)).ok_or_else(bad_edges)?;
+        if edges[index] {
+            return Err(bad_edges());
+        }
+        edges[index] = true;
+    }
+    Ok(edges)
 }
 
 fn pin_layer(s: &mut Session, p: &Value) -> Result<Value> {
-    let clip = target_clip(s, p).ok_or_else(|| bad("graphics.pin", "no graphic clip"))?;
+    prepare_pinning(s, p, crate::graphics::layout_time_p(s, p)?)?.commit(s)
+}
+
+/// Shared human/guarded preparation: one complete native project, explicit sequence time.
+pub(crate) fn prepare_pinning(s: &Session, p: &Value, at: Tick) -> Result<crate::graphics::LayoutPlan> {
+    let clip = target_clip(s, p)?.ok_or_else(|| bad("graphics.pin", "no graphic clip"))?;
     let (l, ei) = layer_effect_index(s, clip, p)?;
-    let it = clip_item(s, clip)?;
+    let it = crate::graphics::layout_target(s, clip)?.clone();
     let size = match s.project.item(it.item).map(|x| &x.kind) {
         Some(ItemKind::Graphic { width, height, .. }) => (*width, *height),
         _ => (1920, 1080),
@@ -681,7 +695,9 @@ fn pin_layer(s: &mut Session, p: &Value) -> Result<Value> {
     let target: Option<Option<usize>> = match &to {
         Value::String(x) if x == "none" || x.is_empty() => None,
         Value::String(x) if x == "frame" || x.eq_ignore_ascii_case("video frame") => Some(None),
-        Value::Number(n) => Some(Some(n.as_u64().unwrap_or(0) as usize)),
+        Value::Number(n) => Some(Some(
+            n.as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(|| bad("graphics.pin", "pin target must be a nonnegative integer layer index"))?,
+        )),
         Value::String(name) => Some(Some(
             (0..idx.len())
                 .find(|&i| layer_display_name(&it.effects[idx[i]], i).eq_ignore_ascii_case(name))
@@ -694,8 +710,8 @@ fn pin_layer(s: &mut Session, p: &Value) -> Result<Value> {
     {
         return Err(bad("graphics.pin", "pin to another layer of the same graphic"));
     }
-    let edges = edges_p(p);
-    let mt = mt_at_playhead(s, &it);
+    let edges = edges_p(p)?;
+    let mt = crate::graphics::layout_source_time(&it, at)?;
     // pins are measured at rest (without the roll / crawl offset)
     let mut rest = it.clone();
     if let Some(m) = rest.graphic.as_mut() {
@@ -704,31 +720,54 @@ fn pin_layer(s: &mut Session, p: &Value) -> Result<Value> {
     let shown = item_layer_specs(&rest, mt, size);
     let bounds_of = |e: usize| shown.iter().find(|(x, _)| *x == e).map(|(_, sp)| layer_bounds(sp));
     let own = bounds_of(ei).ok_or_else(|| bad("graphics.pin", "bad layer"))?;
-    let pin = match target {
+    if !own.iter().all(|v| v.is_finite()) {
+        return Err(bad("graphics.pin", "pin geometry is not finite"));
+    }
+    let mut layers: Vec<_> = idx.iter().map(|&i| it.effects[i].clone()).collect();
+    ensure_uids(&mut layers).map_err(|e| bad("graphics.pin", e.to_string()))?;
+    let new_pin = match target {
         None => None,
-        Some(None) => Some((PinTarget::Frame, [0.0, 0.0, size.0 as f64, size.1 as f64], None)),
-        Some(Some(t)) => Some((PinTarget::Layer(0), bounds_of(idx[t]).ok_or_else(|| bad("graphics.pin", "bad target"))?, Some(idx[t]))),
-    };
-    let r = s.edit_sequence("Responsive Design - Position", move |q, _, _| {
-        let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
-        let li = layer_indices(&it.effects);
-        let mut layers: Vec<EffectInstance> = li.iter().map(|&i| it.effects[i].clone()).collect();
-        ensure_uids(&mut layers);
-        for (k, &i) in li.iter().enumerate() {
-            it.effects[i].layer = layers[k].layer.clone();
+        Some(None) => Some(Pin::new(PinTarget::Frame, edges, own, [0.0, 0.0, size.0 as f64, size.1 as f64])),
+        Some(Some(t)) => {
+            let layer = layers.get(t).ok_or_else(|| bad("graphics.pin", "pin target layer is missing"))?;
+            let bounds = bounds_of(idx[t]).ok_or_else(|| bad("graphics.pin", "pin target geometry is missing"))?;
+            Some(Pin::new(PinTarget::Layer(layer_uid(layer)), edges, own, bounds))
         }
-        let new_pin = pin.map(|(to, tb, teff)| {
-            let to = match (to, teff) {
-                (PinTarget::Layer(_), Some(te)) => PinTarget::Layer(layer_uid(&it.effects[te])),
-                _ => PinTarget::Frame,
+    };
+    if new_pin.as_ref().is_some_and(|p| !p.offsets.iter().all(|v| v.is_finite())) {
+        return Err(bad("graphics.pin", "pin offsets are not finite"));
+    }
+    if let Some(Pin { to: PinTarget::Layer(uid), .. }) = new_pin.as_ref().filter(|p| p.any()) {
+        let own_uid = layer_uid(&layers[l]);
+        let mut current = *uid;
+        let mut seen = HashSet::new();
+        for _ in 0..layers.len() {
+            if current == own_uid || !seen.insert(current) {
+                return Err(bad("graphics.pin", "pin target would create or follow a cycle"));
+            }
+            let Some(next) = layers.iter().find(|e| layer_uid(e) == current).and_then(|e| e.layer.as_ref()).and_then(|e| e.pin.as_ref()).filter(|p| p.any())
+            else {
+                break;
             };
-            Pin::new(to, edges, own, tb)
-        });
+            match next.to {
+                PinTarget::Frame => break,
+                PinTarget::Layer(uid) => current = uid,
+            }
+        }
+    }
+    let mut expected = (*s.project).clone();
+    let sid = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
+    let result = {
+        let q = expected.sequence_mut(sid).ok_or(EngineError::NoSequence)?;
+        let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
+        for (&i, layer) in idx.iter().zip(layers) {
+            it.effects[i].layer = layer.layer;
+        }
         it.effects[ei].layer.get_or_insert_with(Default::default).pin = new_pin;
         let uid = it.effects[ei].layer.as_ref().map_or(0, |x| x.uid);
-        Ok(json!({"clip": clip.0, "layer": l, "uid": uid, "pin": it.effects[ei].layer.as_ref().and_then(|x| x.pin.as_ref()).map(|p| serde_json::to_value(p).unwrap_or_default())}))
-    })?;
-    Ok(r)
+        json!({"clip": clip.0, "layer": l, "uid": uid, "pin": it.effects[ei].layer.as_ref().and_then(|x| x.pin.as_ref()).map(|p| serde_json::to_value(p).unwrap_or_default())})
+    };
+    crate::graphics::LayoutPlan::prepared(s, expected, "Responsive Design - Position", result)
 }
 
 /// Character style from command JSON (friendly names accepted).
@@ -765,7 +804,7 @@ fn char_style_p(v: &Value) -> Result<CharStyle> {
 }
 
 fn set_char_style(s: &mut Session, p: &Value) -> Result<Value> {
-    let clip = target_clip(s, p).ok_or_else(|| bad("graphics.setCharStyle", "no graphic clip"))?;
+    let clip = target_clip(s, p)?.ok_or_else(|| bad("graphics.setCharStyle", "no graphic clip"))?;
     let (l, ei) = layer_effect_index(s, clip, p)?;
     let clear = bool_p(p, "clear").unwrap_or(false);
     let style = match p.get("style") {
@@ -774,7 +813,7 @@ fn set_char_style(s: &mut Session, p: &Value) -> Result<Value> {
         None => return Err(bad("graphics.setCharStyle", "need `style` (or `clear`)")),
     };
     let tl = s.playhead();
-    let (start, end) = (u64_p(p, "start").map(|v| v as usize), u64_p(p, "end").map(|v| v as usize));
+    let (start, end) = (u64_p(p, "start")?.map(|v| v as usize), u64_p(p, "end")?.map(|v| v as usize));
     // A pointer gesture shares one undo step only within the same clip, layer and range.
     let merge = bool_p(p, "merge").unwrap_or(false).then(|| format!("graphics.setCharStyle:{}:{ei}:{start:?}:{end:?}", clip.0));
     if bool_p(p, "begin").unwrap_or(false) {
@@ -932,7 +971,7 @@ fn upgrade_caption(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn upgrade_to_source(s: &mut Session, p: &Value) -> Result<Value> {
-    let clip = target_clip(s, p).ok_or_else(|| bad("graphics.upgradeToSourceGraphic", "select a graphic clip"))?;
+    let clip = target_clip(s, p)?.ok_or_else(|| bad("graphics.upgradeToSourceGraphic", "select a graphic clip"))?;
     let it = clip_item(s, clip)?;
     if s.project.source_graphics.contains_key(&it.item) {
         return Err(bad("graphics.upgradeToSourceGraphic", "the graphic already is a source graphic"));
@@ -1173,7 +1212,7 @@ pub fn commands() -> Vec<CommandSpec> {
             r#"{"clip":id?,"control":id|name,"value":any} or {"clip":id?,"values":{control: value}}"#,
             has_graphic,
             |s, p| {
-                let clip = target_clip(s, p).ok_or_else(|| bad("graphics.template.set", "no graphic clip"))?;
+                let clip = target_clip(s, p)?.ok_or_else(|| bad("graphics.template.set", "no graphic clip"))?;
                 let mut vals = p.get("values").and_then(Value::as_object).cloned().unwrap_or_default();
                 if let Some(c) = str_p(p, "control") {
                     vals.insert(c.to_string(), p.get("value").cloned().unwrap_or(Value::Null));
@@ -1214,7 +1253,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "graphics.pin",
             "Responsive Design - Position",
             &[],
-            r#"{"clip":id?,"layer":n|name?,"to":"frame"|"none"|layer index|layer name,"edges":["left","top","right","bottom"]|"all"="all"}"#,
+            r#"{"clip":id?,"layer":n|name?,"to":"frame"|"none"|layer index|layer name,"edges":["left","top","right","bottom"]|"all"="all","time":ticks?}"#,
             has_graphic,
             pin_layer,
         ),

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 
 use crate::media_browser::{self, DirEntry, Volume, VolumeKind};
-use crate::{Services, Session};
+use crate::{EngineError, Result, Services, Session};
 
 /// An in-memory filesystem: directories and files (with bytes).
 #[derive(Default)]
@@ -190,8 +190,7 @@ fn import_the_selection_and_open_in_source() {
     let r = s.execute("mediaBrowser.import", json!({})).unwrap();
     assert_eq!(r["items"].as_array().unwrap().len(), 2, "{r}");
     assert_eq!(s.project.items.len(), 2);
-    // undoable like any import
-    s.execute("edit.undo", json!({})).unwrap();
+    // One user import is one Undo, including all selected files.
     s.execute("edit.undo", json!({})).unwrap();
     assert!(s.project.items.is_empty());
     // File ▸ Import from Media Browser uses the selection too
@@ -326,4 +325,145 @@ fn ale_logs_are_not_offered_for_import() {
     assert_eq!(media_browser::kind_of("clips.ale"), None);
     assert!(!media_browser::extensions().contains(&"ale"));
     assert_eq!(media_browser::kind_of("cut.edl"), Some("project"));
+}
+
+#[test]
+fn import_file_limit_refuses_the_complete_folder_plan_without_creating_bins_or_history() {
+    let mut fs = FakeFs::new();
+    fs.dirs.extend(["/Shoot", "/Shoot/Sub"].map(String::from));
+    let wav = filmcraft_media::wav::write_wav16(&[0.0; 4800], 1, 48_000);
+    for name in ["/Shoot/a.wav", "/Shoot/Sub/b.wav", "/Shoot/Sub/c.wav"] {
+        fs.files.get_mut().unwrap().insert(name.into(), wav.clone());
+    }
+    let mut s = Session::new(Arc::new(fs));
+    let project = s.project.clone();
+    let revision = s.revision;
+    let history = s.history.undo.len();
+    let result = s.execute("mediaBrowser.import", json!({"paths":["/Shoot"],"maxFiles":2,"mediaOnly":true}));
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("file limit"));
+    assert!(Arc::ptr_eq(&s.project, &project));
+    assert_eq!(s.revision, revision);
+    assert_eq!(s.history.undo.len(), history);
+}
+
+#[test]
+fn import_depth_limit_and_invalid_limits_refuse_without_partial_import_or_redo_loss() {
+    let mut fs = FakeFs::new();
+    let mut dir = "/Deep".to_string();
+    fs.dirs.push(dir.clone());
+    for _ in 0..34 {
+        dir.push_str("/More");
+        fs.dirs.push(dir.clone());
+    }
+    fs.files.get_mut().unwrap().insert(format!("{dir}/take.wav"), filmcraft_media::wav::write_wav16(&[0.0; 4800], 1, 48_000));
+    let mut s = Session::new(Arc::new(fs));
+    s.execute("file.newSequence", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    let project = s.project.clone();
+    let revision = s.revision;
+    let redo = s.history.redo.len();
+    assert!(redo > 0);
+    assert!(s.execute("mediaBrowser.import", json!({"paths":["/Deep"]})).unwrap_err().to_string().contains("depth limit"));
+    for limit in [json!(0), json!(-1), json!(1.5), json!(100001), json!("2"), Value::Null] {
+        assert!(s.execute("mediaBrowser.import", json!({"paths":["/Deep"],"maxFiles":limit})).is_err());
+    }
+    assert!(s.execute("mediaBrowser.import", json!({"paths":["/Deep"],"mediaOnly":"true"})).is_err());
+    assert!(Arc::ptr_eq(&s.project, &project));
+    assert_eq!(s.revision, revision);
+    assert_eq!(s.history.redo.len(), redo);
+}
+
+#[test]
+fn media_only_folder_import_preserves_timeline_and_uses_the_same_native_file_import_service() {
+    let mut fs = FakeFs::new();
+    fs.dirs.push("/Shoot".into());
+    fs.files.get_mut().unwrap().insert("/Shoot/a.wav".into(), filmcraft_media::wav::write_wav16(&[0.0; 4800], 1, 48_000));
+    fs.files.get_mut().unwrap().insert("/Shoot/captions.srt".into(), b"1\n00:00:00,000 --> 00:00:01,000\nDo not publish\n".to_vec());
+    fs.files.get_mut().unwrap().insert("/Shoot/foreign.fcpxml".into(), b"not a project".to_vec());
+    let mut s = Session::new(Arc::new(fs));
+    s.execute("file.newSequence", json!({})).unwrap();
+    let before = serde_json::to_value(s.active_sequence()).unwrap();
+    let r = s.execute("mediaBrowser.import", json!({"paths":["/Shoot"],"mediaOnly":true,"maxFiles":2000})).unwrap();
+    assert_eq!(r["items"].as_array().unwrap().len(), 1);
+    assert_eq!(r["errors"], json!([]));
+    assert_eq!(serde_json::to_value(s.active_sequence()).unwrap(), before);
+    assert!(s.journal.iter().any(|(id, _)| id == "file.import"));
+}
+
+#[test]
+fn a_directory_with_a_media_extension_keeps_its_folder_identity() {
+    let mut fs = FakeFs::new();
+    fs.dirs.push("/Shoot.MXF".into());
+    fs.files.get_mut().unwrap().insert("/Shoot.MXF/a.wav".into(), filmcraft_media::wav::write_wav16(&[0.0; 4800], 1, 48_000));
+    let mut s = Session::new(Arc::new(fs));
+    let r = s.execute("mediaBrowser.import", json!({"paths":["/Shoot.MXF"],"mediaOnly":true,"maxFiles":2000})).unwrap();
+    assert_eq!(r["items"].as_array().unwrap().len(), 1);
+    assert_eq!(r["bins"].as_array().unwrap().len(), 1);
+    let id = filmcraft_project::ItemId(r["items"][0].as_u64().unwrap());
+    assert!(matches!(&s.project.item(id).unwrap().as_media().unwrap().media,filmcraft_project::MediaRef::File{path} if path=="/Shoot.MXF/a.wav"));
+}
+
+#[test]
+fn compound_import_preserves_the_original_history_with_a_bounded_intermediate_group() {
+    let mut s = session();
+    s.history.limit = 2;
+    s.execute("file.newSequence", json!({"name":"Existing cut"})).unwrap();
+    s.edit("Earlier edit", |p, _| {
+        p.name = "Existing film".into();
+        Ok(())
+    })
+    .unwrap();
+    let original = s.project.clone();
+    s.edit_group("Many grouped edits", |s| {
+        for n in 0..512 {
+            s.edit("Intermediate", |p, _| {
+                p.name = format!("Imported {n}");
+                Ok(())
+            })?;
+            assert!(s.history.undo.len() <= 2);
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(s.history.undo.len(), 2);
+    let after = s.project.clone();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(Arc::ptr_eq(&s.project, &original));
+    s.execute("edit.redo", json!({})).unwrap();
+    assert!(Arc::ptr_eq(&s.project, &after));
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_ne!(s.project.name, "Existing film");
+}
+#[test]
+fn refused_and_nested_groups_preserve_redo_and_one_complete_import_undo() {
+    let mut s = session();
+    s.history.limit = 2;
+    s.execute("file.newSequence", json!({"name":"Existing cut"})).unwrap();
+    s.edit("Prior edit", |p, _| {
+        p.name = "Prior film".into();
+        Ok(())
+    })
+    .unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    let original = s.project.clone();
+    let undo = s.history.undo.clone();
+    let redo = s.history.redo.clone();
+    let refused: Result<()> = s.edit_group("Refused", |s| {
+        s.edit("Temporary", |p, _| {
+            p.name = "Temporary".into();
+            Ok(())
+        })?;
+        Err(EngineError::Other("generated refusal".into()))
+    });
+    assert!(refused.is_err());
+    assert!(Arc::ptr_eq(&s.project, &original));
+    assert_eq!(s.history.undo.iter().map(|e| &e.0).collect::<Vec<_>>(), undo.iter().map(|e| &e.0).collect::<Vec<_>>());
+    assert_eq!(s.history.redo.iter().map(|e| &e.0).collect::<Vec<_>>(), redo.iter().map(|e| &e.0).collect::<Vec<_>>());
+    let result = s.execute("mediaBrowser.import", json!({"paths":["/Volumes/Card/DCIM", "/home/me/Movies/A-interview.wav"]})).unwrap();
+    assert_eq!(result["items"].as_array().unwrap().len(), 2);
+    assert_eq!(s.history.undo.last().unwrap().0, "Import Media");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(Arc::ptr_eq(&s.project, &original));
 }

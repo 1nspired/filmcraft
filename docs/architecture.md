@@ -1,6 +1,6 @@
 # Architecture
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** trivial (status line, revision history and roadmap link added; content checked against the crate list) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-21 · **Change:** minor (shared native validation and retime dialog preservation; layering and edit ownership unchanged) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
 
 FilmCraft is a Cargo workspace of small crates with strictly enforced layering. The engine is
 headless: every feature can be reached without a window, and the egui UI is one client among the
@@ -173,7 +173,7 @@ pub struct CommandSpec {
     pub params: &'static str,             // r#"{"time":ticks?}"#, shown to agents
     pub enabled: fn(&Session) -> Result<(), String>,  // Err carries the reason
     pub run: fn(&mut Session, &Value) -> Result<Value>,
-    pub journal: bool,                    // false for read-only queries
+    pub journal: bool,                    // record on success; not a read-only effect flag
 }
 ```
 
@@ -182,12 +182,30 @@ pub struct CommandSpec {
   the menu structure: `file.*`, `edit.*`, `clip.*`, `sequence.*`, `markers.*`, `timeline.*`,
   `effects.*`…
 - `Session::execute(id, params)` finds the spec, checks `enabled`, runs it and appends it to the
-  journal.
+  journal when successful and `journal` is true. Non-journaled commands can still change editor
+  state, write files or advance jobs; the flag is not an effects/authorization contract.
 - **Undo.** Edits go through `Session::edit(label, |project, state| …)` or
   `Session::edit_sequence(label, |seq, ctx, state| …)`. These clone the project, apply the closure,
   and on success push the old `Arc<Project>` with the label onto the undo stack (200 entries).
   On error nothing changes. `edit.undo` and `edit.redo` swap snapshots. Thanks to structural sharing
   a snapshot costs little.
+- **Explicit targets and compound edits.** Effect indices use checked unsigned-integer/native-width
+  resolution; invalid values never alias effect zero. Parameter/keyframe gesture starts change
+  merge ownership only after success. `captions.add` creates its implicit track and cue inside one
+  `edit_sequence` candidate, so a rejected target leaves neither an orphan track nor an Undo step.
+  This is a contract of these shared handlers, not a general guarantee that arbitrary sequences
+  of `Session::execute` calls are atomic or free of external side effects.
+- **Mixer rejection.** Insert/send/keyframe deletion reports missing targets from
+  inside the candidate edit, preserving revision, Undo, Redo and merge ownership.
+  Mixer insert and transition settings share definition-typed parameter parsing;
+  malformed explicit flags and choices cannot default or narrow into another
+  setting. Existing automation survives static parameter updates.
+- **Speed/Duration options.** The shared handler validates its object, numeric
+  speed, explicit booleans and interpolation before entering the candidate edit.
+  Only missing fields receive human defaults; malformed fields cannot reset
+  speed/reverse or publish a no-op revision. The dialog reads the native reverse
+  flag separately from speed and retains the unrounded saved percentage. Native
+  edit math and guarded retime postconditions remain the common implementation.
 - **Editor state** (`EditorState`: active sequence, playheads, selection, targeting, edit points…)
   is serde, so agents can read it with `state.inspect`.
 - **Events** (`ProjectChanged`, `Toast`, `OpenSequence`, `OpenSource`) are drained by frontends
@@ -757,6 +775,122 @@ All of these dispatch the same command ids.
 
 Protocol reference: [control-protocol.md](control-protocol.md). Agent guide: [agents.md](agents.md).
 
+### Local Poema experiment: guarded batches (not an upstream API guarantee)
+
+`engine::agent_bridge` supplies guarded commands in this experimental checkout:
+
+- `agent.snapshot {token}` takes one coherent project/active-sequence/source read and
+  retains a read ticket. Callers supply a fresh, never-reused random token (for example a
+  UUID), not a filename or a guessed revision. Snapshot/receipt commands do not enter the journal.
+- `agent.sourceFrames {token,scope,frames}` maps 1–12 ordered sequence frames through
+  the existing native clip clock, using exact half-open tick ranges, including holds
+  and fractional starts. It validates the native COW ticket and explicit workspace,
+  requires one online bound original, and refuses unsupported clocks/gaps/overlaps.
+  It does not seek, decode, edit or confer write authorization. Poema's original
+  sampler consumes these source ticks; final `agent.validateSnapshot` guards the
+  asynchronous decode. Source images remain distinct from Program composites.
+- `agent.apply {token,label,operations}` checks that ticket against the live revision,
+  active sequence, serialized editor context, project snapshot identity and path, in the
+  same engine invocation that stages and commits the batch. Stale/unknown tickets fail closed.
+- `agent.receipt {token}` returns `committed` (with the historical result), `unapplied`,
+  or `unknown`. A JSON-value-equivalent batch sent again with a retained committed
+  token returns its original receipt without another edit. Changing its payload is rejected.
+  This is bounded **in-session** deduplication, not durable exactly-once delivery.
+- `agent.bindSource {item,binding}` stores explicit Poema `projectId`, `assetId`, `mediaId`
+  and `role` (`original`/`proxy`) as JSON in `ProjectItem::metadata["poema.binding.v1"]`.
+  Existing different bindings are refused; undo remains available. Source bindings follow
+  an item's timeline uses through trims, splits and copies, and save with the existing schema.
+- `agent.undo {token,commit}` uses a fresh read ticket to undo a known agent-owned history head,
+  refusing intervening manual edits/Undo/Redo, expired commits and stale reads. Undo outcomes use
+  the same historical receipt mechanism. It cannot undo arbitrary human work.
+- `agent.replayBatch {label,operations,exact?}` is the bounded native recovery entry, not a model
+  tool. It mints an internal ticket and stages the same allowlisted operations as one history step.
+  The journal no longer flattens an agent batch and loses its Undo grouping.
+
+With `exact:true`, duplicate linked picture/audio requests collapse into one operation, conflicts
+reject, and clamped trims or incomplete splits fail before publication. Successful receipts include
+`validated:true`; snapshots advertise `capabilities.exactEdits`, `capabilities.guardedUndo` and
+current `linkedSelection`. The Poema connection requires these capabilities; there is no unguarded
+fallback on older running apps. Focused tests and limitations: `crates/engine/README.md`.
+
+Only explicit-target `timeline.trim` (bounded integer `deltaFrames`), `timeline.razor`
+(bounded nonnegative tick `time`) and `agent.bindSource` are accepted in the original batch hand.
+The local assembly increment adds internal `agent.insert`, `agent.move` and `agent.rippleDelete`
+operations in exact mode, one logical operation per batch; these are not independently dispatched
+commands or permission for arbitrary nesting. Source/track/range/channel arguments are explicit,
+full linked groups stay together, collateral ripple is checked for correspondence/protection and
+desynchronization, and occupied gap moves refuse overwrite. `capabilities.assemblyEdits` gates the
+new caller. Scope, hostile-input tests, sound routing and limitations: `crates/engine/README.md`.
+There are 1–32 operations and a 1–256-byte label. A separate staging session shares the
+read-only source pool, NOT the host's playback publication, persistence, events or undo history.
+On success the shared `Session::commit_edit` path publishes the full staged project/state, one revision and one
+undo step; on failure no staged project edit is published. Existing effect payloads are not
+rebuilt from the intentionally abbreviated `sequence.inspect` output. This is NOT a transaction
+wrapper for arbitrary commands: no file writes, exports, jobs, project lifecycle, undo or
+recursive batches are allowlisted. Active dynamic trim/mixer/multicam recording is refused.
+
+The last 256 read tickets/receipts are retained; they do not survive app restart. Expiration
+or restart yields `unknown`, which requires readback/reconciliation, never blind replay.
+A returned committed revision is historical, particularly after human edits or Undo.
+Editor-context checks are intentionally conservative: moving the playhead/selection can
+require a fresh plan even when project data did not change. The project guard uses a weak
+snapshot reference, so tickets neither retain hundreds of full projects nor accept reused
+allocation addresses; copy-on-write mutations without a revision bump are also detected.
+
+### Local Poema experiment: instance identity and editor protection
+
+This fork's schema **v16** adds optional `TrackItem::identity`: an opaque 128-bit random hex id,
+an immediate parent id, bounded whole-instance annotation strings and an optional protection
+reason. Old files load untracked; older FilmCraft builds refuse v16 files rather than silently
+dropping their notes/protection. This local version is not an upstream schema compatibility promise.
+
+Trusted editor/control commands (NOT allowlisted in `agent.apply`):
+
+- `poema.trackSequence {}` opts the active sequence into tracking (including future placements
+  after emptying it), recorded in its source-item metadata as `poema.tracking.v1`.
+- `poema.annotateClips {clips,annotations}` replaces bounded whole-instance notes/references on
+  explicit targets. Maximum 64 keys, 64-byte keys, 1024-byte values; no timed selects/bites yet.
+- `poema.protectClips {clips,reason}` freezes targets and their linked audio/picture partners
+  against guarded agent batches, regardless of Linked Selection. A nonblank reason is required;
+  explicit `null` is a human unlock. These changes are undoable and saved with the document.
+
+`Session::edit` / `edit_merged` reconcile tracked candidates before publication. Trims keep ids;
+clone-based splits/copies get fresh ids and the immediate parent's id, inheriting whole-instance
+annotations and protection. Replacing a clip's source item gets a new id with its old notes cleared and
+protection retained. Randomness comes from the fallible system/browser provider (`getrandom`);
+there is no undoable identity counter or timestamp/name matching. Undo/redo restores exact
+snapshots, whereas Undo → a new edit branch gets different identities even if numeric clip handles
+are reused. Untouched sequences stay structurally shared. Staged agent commits publish already
+reconciled carriers once, preventing phantom intermediate lineage parents. Malformed, duplicate
+or missing tracked identities fail closed on load/read/edit; at most 100000 tracked instances.
+
+Before committing, `agent.apply` checks the entire staged outcome against all protected instances:
+their source, position, track, duration, effects and identity/notes must be unchanged. Thus a ripple
+edit of an unprotected clip cannot silently shift a protected neighbour. Source items and nested
+sequence dependencies of protected clips are checked transitively with seen/count bounds. Humans
+can still edit protected clips directly; their reason remains attached until an explicit unlock.
+Canonical serialized comparison preserves auto-point NaN semantics in effect payloads.
+
+This is workflow enforcement within the guarded batch boundary, not authentication: unrestricted
+control is a trusted editor/debug surface, and must not be offered to an agent as a bypass.
+The local egui `clip.poemaNotes` dialog provides explicit note/protect/unlock controls, with a
+project/revision/sequence/identity-pinned ephemeral draft. Other annotation keys survive note saves;
+linked audio follows protection, and stale drafts cannot save over intervening human or agent edits.
+The separate Poema lab exposes only timeline-read, guarded trim/split and receipt-status tools to an
+injected provider, reusing its normalized provider contract. It deliberately does not use Poema's
+existing JS-timeline-committing AgentRun: the native session remains the only timeline writer.
+Its explicit saved project/sequence/Poema scope cannot be supplied by the model, unknown writes
+block further edits, and completion requires post-write native readback. Scripted providers test the
+contract without credentials or paid calls; this is not production tool registration or LLM evaluation.
+
+There is no automatic inference of human decisions, complete lineage
+tombstone/audit registry, timed-annotation remapping, proxy timebase conversion, crash-atomic
+receipts, Poema LLM tool registration, supervision or production adapter yet. Native numeric ids
+are still edit handles, not long-lived annotation keys. External references should use the
+persistent identity only within a known document/project context (Save As can clone a document).
+This carrier is native `.fcproj` data, not yet an interchange round-trip contract. Relinking the
+same media item does not infer a replacement source from a filename or drive path.
+
 ## 8. Not built yet
 
 The layer table reserves names for crates that don't exist yet: `riff`, `mjpeg`,
@@ -770,4 +904,5 @@ native menus) in `apps/filmcraft`. [roadmap.md](roadmap.md) has the milestone st
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-21 | minor | Shared Speed/Duration rejects malformed options before publication; dialog preserves native reverse and precise speed; existing edit math and ownership remain |
 | 2026-10-10 | trivial | Status line and revision history added (craftrules progress-docs standard); milestone link points at docs/roadmap.md |

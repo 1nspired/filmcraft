@@ -210,7 +210,7 @@ fn hostile_times_are_refused_or_clamped_never_a_panic() {
     // the sound asked far to the left and the picture far to the right in one call: out of range together
     let moves = json!([{"clip": v.id.0, "track": v_track.0, "time": Tick::MAX.0}, {"clip": a.id.0, "track": a_track.0, "time": i64::MIN}]);
     assert!(matches!(s.execute("timeline.move", json!({"moves": moves})), Err(EngineError::BadParams { .. })));
-    // junk entries are skipped as before; a call with nothing usable is a parameter error
+    // Every explicit row must be usable; malformed rows reject the whole call.
     for moves in
         [json!([]), json!([{"clip": v.id.0, "track": v_track.0, "time": "soon"}]), json!([{"clip": v.id.0, "track": v_track.0, "time": 1e300}]), json!("all")]
     {

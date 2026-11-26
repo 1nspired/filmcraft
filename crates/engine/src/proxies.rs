@@ -176,11 +176,11 @@ fn media_path(p: &Project, item: ItemId) -> Option<(MediaClip, String, String)> 
     }
 }
 
-fn items_param(s: &Session, p: &Value) -> Vec<ItemId> {
-    match p.get("items").and_then(Value::as_array) {
-        Some(a) => a.iter().filter_map(Value::as_u64).map(ItemId).collect(),
-        None => u64_p(p, "item").map(|i| vec![ItemId(i)]).unwrap_or_else(|| s.state.project_selection.clone()),
-    }
+fn items_param(s: &Session, p: &Value) -> Result<Vec<ItemId>> {
+    Ok(match crate::commands::ids_p(p, "items")? {
+        Some(ids) => ids.into_iter().map(ItemId).collect(),
+        None => u64_p(p, "item")?.map(|i| vec![ItemId(i)]).unwrap_or_else(|| s.state.project_selection.clone()),
+    })
 }
 
 /// Start a background transcode job over `work` (item, output path, preset). Returns the job id.
@@ -345,7 +345,7 @@ pub fn proxy_dir(media: &str, dest: Option<&str>) -> PathBuf {
 /// `media.createProxies {items?, preset?, destination?, wait?}`.
 pub fn create(s: &mut Session, p: &Value) -> Result<Value> {
     let pr = preset(str_p(p, "preset").unwrap_or(DEFAULT_PROXY_PRESET)).ok_or_else(|| bad("media.createProxies", "unknown preset (see media.proxyPresets)"))?;
-    let items = items_param(s, p);
+    let items = items_param(s, p)?;
     // default: Project Settings ▸ Scratch Disks ▸ Captured and Generated, else next to the media
     let dest = str_p(p, "destination").map(str::to_string).or_else(|| {
         crate::project_tools::trusted_scratch(s.project.settings.scratch.captured.as_deref(), s.path.as_deref(), &s.prefs.auto_save.scratch_folders)
@@ -518,7 +518,7 @@ pub fn commands() -> Vec<CommandSpec> {
                 let pairs: Vec<(ItemId, String)> = match (p.get("items").and_then(Value::as_array), p.get("paths").and_then(Value::as_array)) {
                     (Some(i), Some(ps)) => i.iter().zip(ps).filter_map(|(i, p)| Some((ItemId(i.as_u64()?), p.as_str()?.to_string()))).collect(),
                     _ => vec![(
-                        u64_p(p, "item").map(ItemId).ok_or_else(|| bad("media.attachProxies", "need `item`"))?,
+                        u64_p(p, "item")?.map(ItemId).ok_or_else(|| bad("media.attachProxies", "need `item`"))?,
                         str_p(p, "path").ok_or_else(|| bad("media.attachProxies", "need `path`"))?.to_string(),
                     )],
                 };
@@ -534,7 +534,7 @@ pub fn commands() -> Vec<CommandSpec> {
             params: r#"{"items":[id]?}"#,
             enabled: has_file_media,
             run: |s, p| {
-                let items = items_param(s, p);
+                let items = items_param(s, p)?;
                 let n = s.edit("Detach Proxies", |proj, _| {
                     let mut n = 0;
                     for i in &items {
@@ -558,7 +558,7 @@ pub fn commands() -> Vec<CommandSpec> {
             params: r#"{"item":id,"path":str}"#,
             enabled: has_file_media,
             run: |s, p| {
-                let item = u64_p(p, "item").map(ItemId).ok_or_else(|| bad("media.reconnectFullRes", "need `item`"))?;
+                let item = u64_p(p, "item")?.map(ItemId).ok_or_else(|| bad("media.reconnectFullRes", "need `item`"))?;
                 if s.project.item(item).and_then(|i| i.as_media()).is_none_or(|m| m.proxy.is_none()) {
                     return Err(EngineError::Other("the clip has no proxy attached".into()));
                 }

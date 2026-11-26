@@ -11,6 +11,83 @@ use filmcraft_ui_egui::FilmcraftApp;
 use filmcraft_ui_egui::control::ControlRequest;
 use serde_json::{Value, json};
 
+#[test]
+fn embedded_close_waits_for_composer_before_dirty_quit_and_cancel_preserves_the_cut() {
+    use filmcraft_ui_egui::composer_panel::{Binding, ClosePhase, Panel};
+    let mut d = Driver::new();
+    d.edit();
+    let before = d.app().session.project.clone();
+    d.app().composer_panel = Some(Panel::new(Binding {
+        version: 1,
+        http_port: 55117,
+        workspace_id: "b2113e8d-8fe4-42e2-9561-a8f39d427d61".into(),
+        project_id: "p_test".into(),
+        project_path: "/generated/edit.fcproj".into(),
+        application_release: "a".repeat(64),
+    }));
+    d.request_close();
+    assert!(d.sent(&egui::ViewportCommand::CancelClose));
+    assert!(d.app().ui.clip_dialog.is_none());
+    let gate = &mut d.app().composer_panel.as_mut().unwrap().close;
+    gate.begin("a".repeat(32)).unwrap();
+    assert!(gate.reply(&"a".repeat(32), "ready"));
+    d.request_close();
+    d.frames(3);
+    assert!(d.has("quit.cancel"));
+    d.click("quit.cancel");
+    assert!(d.app().ui.clip_dialog.is_none());
+    assert!(!d.app().quit_confirmed);
+    assert!(d.app().session.is_dirty());
+    assert!(std::sync::Arc::ptr_eq(&before, &d.app().session.project));
+    let gate = &mut d.app().composer_panel.as_mut().unwrap().close;
+    assert_eq!(gate.phase, ClosePhase::Cancelling);
+    assert_eq!(gate.take_action(), Some(("a".repeat(32), "cancel")));
+    gate.reply(&"a".repeat(32), "cancelled");
+    assert_eq!(gate.phase, ClosePhase::Open);
+}
+
+#[test]
+fn embedded_quit_save_failure_cancels_close_without_discarding_the_dirty_edit() {
+    use filmcraft_ui_egui::composer_panel::{Binding, ClosePhase, Panel};
+    let directory = std::env::temp_dir().join(format!(
+        "poema-quit-save-error-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let parent = directory.join("not-a-directory");
+    std::fs::write(&parent, "Generated save failure sentinel.").unwrap();
+    let file = parent.join("edit.fcproj");
+    let mut d = Driver::new();
+    d.edit();
+    d.app().session.path = Some(file.to_string_lossy().into_owned());
+    let before = d.app().session.project.clone();
+    let mut panel = Panel::new(Binding {
+        version: 1,
+        http_port: 55117,
+        workspace_id: "b2113e8d-8fe4-42e2-9561-a8f39d427d61".into(),
+        project_id: "p_test".into(),
+        project_path: file.to_string_lossy().into_owned(),
+        application_release: "a".repeat(64),
+    });
+    panel.close.intercept();
+    panel.close.begin("a".repeat(32)).unwrap();
+    assert!(panel.close.reply(&"a".repeat(32), "ready"));
+    d.app().composer_panel = Some(panel);
+    d.request_close();
+    d.frames(3);
+    assert!(d.has("quit.save"));
+    d.click("quit.save");
+    assert!(!d.app().quit_confirmed);
+    assert!(d.app().session.is_dirty());
+    assert!(std::sync::Arc::ptr_eq(&before, &d.app().session.project));
+    let gate = &mut d.app().composer_panel.as_mut().unwrap().close;
+    assert_eq!(gate.phase, ClosePhase::Cancelling);
+    assert_eq!(gate.take_action(), Some(("a".repeat(32), "cancel")));
+    assert_eq!(std::fs::read_to_string(&parent).unwrap(), "Generated save failure sentinel.");
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 struct Driver {
     harness: Harness<'static, FilmcraftApp>,
     tx: Sender<ControlRequest>,
@@ -287,6 +364,51 @@ fn speed_duration_from_the_clip_menu_opens_the_dialog() {
     let got = d.v1(0);
     assert_eq!(got.speed, 2.0);
     assert_eq!(got.time_interpolation, filmcraft_project::TimeInterpolation::FrameBlending);
+}
+
+#[test]
+fn speed_duration_dialog_preserves_the_native_reverse_flag() {
+    let mut d = Driver::new();
+    let c = d.v1(0);
+    d.exec("timeline.select", json!({"clips":[c.id.0]}));
+    d.exec("clip.speedDuration", json!({"speed":200,"reverse":true,"ripple":false,"interpolation":"frameBlending"}));
+    assert!(d.v1(0).reverse);
+    assert_eq!(d.v1(0).speed, 2.0, "reverse is a separate native flag, not a negative speed");
+    let before = serde_json::to_value(&*d.app().session.project).unwrap();
+    let revision = d.app().session.revision;
+    let undo = d.app().session.history.undo.len();
+    d.menu("clip.speedDuration");
+    let dlg = d.app().ui.clip_dialog.as_ref().unwrap();
+    assert_eq!(dlg.params["reverse"], json!(true));
+    assert_eq!(dlg.params["speed"], json!(200.0));
+    assert_eq!(dlg.params["interpolation"], json!("frameBlending"));
+    d.click("speedDuration.cancel");
+    assert_eq!(serde_json::to_value(&*d.app().session.project).unwrap(), before);
+    assert_eq!(d.app().session.revision, revision);
+    assert_eq!(d.app().session.history.undo.len(), undo);
+    d.menu("clip.speedDuration");
+    d.click("speedDuration.ok");
+    assert!(d.v1(0).reverse, "OK with unchanged fields must not silently turn reverse off");
+    assert_eq!(serde_json::to_value(&*d.app().session.project).unwrap(), before);
+    assert_eq!(d.app().session.history.undo.len(), undo + 1);
+    d.exec("edit.undo", json!({}));
+    assert_eq!(serde_json::to_value(&*d.app().session.project).unwrap(), before);
+}
+
+#[test]
+fn speed_duration_dialog_does_not_round_the_saved_speed_percent() {
+    let mut d = Driver::new();
+    let c = d.v1(0);
+    d.exec("timeline.select", json!({"clips":[c.id.0]}));
+    d.exec("clip.speedDuration", json!({"speed":125.555,"reverse":false,"ripple":false,"interpolation":"frameSampling"}));
+    let saved_speed = d.v1(0).speed;
+    let before = serde_json::to_value(&*d.app().session.project).unwrap();
+    d.menu("clip.speedDuration");
+    let dlg = d.app().ui.clip_dialog.as_ref().unwrap();
+    assert_eq!(dlg.params["speed"], json!(saved_speed * 100.0), "display precision must not replace the native saved value");
+    d.click("speedDuration.ok");
+    assert_eq!(d.v1(0).speed, saved_speed);
+    assert_eq!(serde_json::to_value(&*d.app().session.project).unwrap(), before);
 }
 
 /// #786: the clip's right-click Label menu lists the labels by the user's names (with their

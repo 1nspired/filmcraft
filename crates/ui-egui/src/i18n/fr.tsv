@@ -1,4 +1,5 @@
 # French (fr) catalog. Same format as `es.tsv`: context <TAB> source <TAB> translation.
+	Poema notes & protection…	Notes et protection Poema…
 #
 # Clean-room: every entry was written from the plain meaning of the English text using ordinary
 # French video-editing vocabulary. No proprietary localisation resource, string table or product UI
@@ -16,7 +17,7 @@
 # décalage, overwrite = écraser, scopes = oscilloscopes, preferences (also the native macOS
 # Settings menu) = Préférences, settings = paramètres.
 
-	About FilmCraft	À propos de FilmCraft
+	About Poema NLE	À propos de Poema NLE
 	Add Audio Submix Track	Ajouter une piste de sous-mixage audio
 	Add Caption at Playhead	Ajouter un sous-titre à la tête de lecture
 	Add Chapter Marker…	Ajouter un marqueur de chapitre…
@@ -42,7 +43,7 @@
 	Apply Default Transitions to Selection	Appliquer les transitions par défaut à la sélection
 	Apply Video Transition	Appliquer une transition vidéo
 	Arrange	Disposition
-	ArtCraft Website	Site web d'ArtCraft
+	FilmCraft engine website	Site du moteur FilmCraft
 	Assembly	Assemblage
 	Attach Proxies…	Associer des proxys…
 	Audio Channels…	Canaux audio…
@@ -135,9 +136,9 @@
 	File	Fichier
 	File…	Fichier…
 	Fill frame	Remplir l'image
-	FilmCraft Help…	Aide de FilmCraft…
-	FilmCraft on GitHub	FilmCraft sur GitHub
-	FilmCraft on getartcraft.com	FilmCraft sur getartcraft.com
+	Native editor reference…	Référence de l’éditeur natif…
+	Poema source code	Code source de Poema
+	About the FilmCraft engine	À propos du moteur FilmCraft
 	Find Next	Rechercher le suivant
 	Find…	Rechercher…
 	Fit	Adapter
@@ -181,7 +182,7 @@
 	Insert Frame Hold Segment	Insérer un segment d'image figée
 	Install Motion Graphics Template…	Installer un modèle d'animation graphique…
 	Interpret Footage…	Interpréter le métrage…
-	Join the ArtCraft Discord…	Rejoindre le Discord d'ArtCraft…
+	FilmCraft upstream community…	Communauté du projet FilmCraft…
 	Keyboard Shortcuts…	Raccourcis clavier…
 	Label	Étiquette
 	Labels…	Étiquettes…
@@ -275,7 +276,7 @@
 	Render Selection	Effectuer le rendu de la sélection
 	Replace Fonts in Projects…	Remplacer les polices dans les projets…
 	Replace With Clip	Remplacer par le clip
-	Report an Issue…	Signaler un problème…
+	Report a Poema issue…	Signaler un problème de Poema…
 	Reset All Parameters	Réinitialiser tous les paramètres
 	Reset Duration	Réinitialiser la durée
 	Reset to Saved Layout	Réinitialiser la disposition enregistrée
@@ -3219,7 +3220,7 @@
 	QuickTime, ProRes 4444 (4:4:4) with alpha channel, 24-bit 48 kHz PCM	QuickTime, ProRes 4444 (4:4:4) avec couche alpha, PCM 24 bits 48 kHz
 	QuickTime, ProRes 4444 XQ (4:4:4), 24-bit 48 kHz PCM	QuickTime, ProRes 4444 XQ (4:4:4), PCM 24 bits 48 kHz
 	QuickTime, ProRes 422, 24-bit 48 kHz PCM	QuickTime, ProRes 422, PCM 24 bits 48 kHz
-	Quit FilmCraft	Quitter FilmCraft
+	Quit Poema NLE	Quitter Poema NLE
 	Rate Stretch Tool	Outil Étirement de la vitesse
 	Razor Tool	Outil Cutter
 	Rectangle Tool	Outil Rectangle
@@ -3584,3 +3585,9 @@
 	Open a sequence to search its graphics	Ouvrez une séquence pour rechercher dans ses graphiques
 	No text graphics in this sequence. Add text with the Type tool.	Aucun graphique avec du texte dans cette séquence. Ajoutez du texte avec l'outil Texte.
 	No matching text.	Aucun texte ne correspond.
+	Hide Poema NLE	Masquer Poema NLE
+	Poema	Poema
+
+	Move Up	Monter
+
+	Move Down	Descendre

@@ -47,6 +47,8 @@ impl ControlRequest {
 
 pub enum Outcome {
     Done(Value),
+    /// The exclusive native worker owns this request's one eventual reply.
+    Pending,
     /// Try again on a later frame (e.g. the element is not on screen yet).
     Retry(String),
     /// Reply once queued synthetic input has been processed.
@@ -96,12 +98,116 @@ fn point(app: &FilmcraftApp, p: &Value) -> Result<egui::Pos2, String> {
     Ok(egui::pos2(x as f32, y as f32))
 }
 
+// A first insert into an empty timeline schedules an automatic fit on the next UI pass.
+// Do not mint a guard against the OLD view just before the frontend updates EditorState.
+// Wait only for a read; never defer/retry an agent write or remove fields from its guard.
+fn snapshot_view_pending(app: &FilmcraftApp) -> bool {
+    let Some(active) = app.session.state.active_sequence else { return false };
+    if app.timeline_view_of != Some(active) {
+        return true;
+    }
+    let visible =
+        app.ui.mode == Mode::Edit && (app.ui.dock.contains(PanelKind::Timeline) || app.ui.floating.iter().any(|g| g.panels.contains(&PanelKind::Timeline)));
+    if !visible {
+        return false;
+    }
+    let v = &app.ui.timeline;
+    let first_clip_fit = v.fit_empty.is_some() && app.session.active_sequence().is_some_and(|q| q.duration() > filmcraft_time::Tick::ZERO);
+    let unsaved_view = app.session.state.timeline_views.get(&active).is_none_or(|stored| {
+        stored.pps != v.target_pps
+            || stored.scroll != v.target_scroll
+            || stored.v_scroll != v.v_scroll
+            || stored.a_scroll != v.a_scroll
+            || stored.video_track_h != v.video_track_h
+            || stored.audio_track_h != v.audio_track_h
+    });
+    v.fit_pending || first_clip_fit || v.animating() || app.timeline_still < 2 || unsaved_view
+}
+
 pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(outcome) = crate::native_writer::intercept(app, ctx, req) {
+        return outcome;
+    }
+    if let Some(result) = crate::media_intake::handle(app, ctx, &req.method, &req.params) {
+        return match result {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        };
+    }
     let p = &req.params;
     let s = |k: &str| p.get(k).and_then(Value::as_str);
     match req.method.as_str() {
+        "ui.poemaComposer" => {
+            if req.params.as_object().is_none_or(|p| !p.is_empty()) {
+                return err("ui.poemaComposer expects empty parameters");
+            }
+            ok(match app.composer_panel.as_ref() {
+                None => json!({"enabled": false}),
+                Some(panel) => {
+                    let mut status = json!({"enabled": true, "binding": panel.binding,
+                    "lifecycle":{"native_instance_binding":true,"update_preparation":1,"new_project":1,"deferred_update_presentation":true},
+                    "close": panel.close, "update": panel.update, "newProject":panel.new_project,
+                    "connected": panel.connected, "focused": panel.focused, "status": panel.status,
+                    "visible": panel.visible, "hostState": panel.host_state,
+                    "docked": app.ui.dock.contains(PanelKind::PoemaComposer),
+                    "rect": panel.rect.map(|r| [r.min.x,r.min.y,r.width(),r.height()])});
+                    if panel.binding.version == 2 {
+                        status["documentMatched"] = json!(panel.binding.matches_session(&app.session).is_ok_and(|v| v));
+                        status["lifecycle"]["independent_project_binding"] = json!(true);
+                    }
+                    status
+                }
+            })
+        }
+
+        "ui.poemaComposer.update" => {
+            if p.as_object().is_none_or(|v| v.len() != 3 || !["action", "id", "binding"].iter().all(|k| v.contains_key(*k))) {
+                return err("native update preparation requires action, id and binding");
+            }
+            let Some(action) = s("action") else {
+                return err("missing native update action");
+            };
+            let Some(id) = s("id") else {
+                return err("missing native update identity");
+            };
+            let binding: crate::composer_panel::Binding = match serde_json::from_value(p["binding"].clone()) {
+                Ok(v) => v,
+                Err(e) => return err(e),
+            };
+            if let Err(e) = binding.validate() {
+                return err(e);
+            }
+            let Some(panel) = app.composer_panel.as_mut() else {
+                return err("no embedded composer");
+            };
+            if panel.binding != binding || !panel.document_matches(&app.session).is_ok_and(|v| v) {
+                return err("native update preparation belongs to another workspace");
+            }
+            if let Err(e) = panel.request_update(id, action) {
+                return err(e);
+            }
+            ctx.request_repaint();
+            ok(json!({"binding":panel.binding,"update":panel.update}))
+        }
+
         "engine.execute" | "ui.menu.invoke" => {
             let Some(id) = s("command").or(s("id")) else { return err("missing `command`") };
+            // A cold candidate is deliberately paused before its first editable UI
+            // pass. Its private recovery basis must be available to reconcile an
+            // unknown activation; waiting for that UI would deadlock recovery.
+            // Ordinary reads and every editable/owner view keep the same gate.
+            let paused_recovery_basis = id == "agent.readHistoryCheckpointBasis"
+                && app.session.workspace_update_status().is_some_and(|v| v["role"] == "candidate" && v["status"] == "candidate_ready");
+            if matches!(id, "agent.snapshot" | "agent.readProject" | "agent.readSourceLibrary" | "agent.readHistoryCheckpointBasis")
+                && !paused_recovery_basis
+                && snapshot_view_pending(app)
+            {
+                if ctx.input(|i| i.time) - app.last_ui_time > 0.25 {
+                    app.raise_for_control(ctx);
+                }
+                return Outcome::Retry("the editor view is settling; no read ticket or write was issued".into());
+            }
             let params = p.get("params").cloned().unwrap_or(json!({}));
             match crate::menus::invoke(app, ctx, id, params) {
                 Ok(v) => ok(v),
@@ -124,6 +230,11 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
             ok(serde_json::to_value(app.auto.query(prefix)).unwrap_or_default())
         }
         "ui.set" => {
+            if let Some(patch) = p.get("poema")
+                && let Err(e) = crate::panels::poema::patch(app, patch)
+            {
+                return err(e);
+            }
             // Text to Speech panel draft (voice, pitch, pace, text…), merged into the current one
             if let Some(patch) = p.get("tts") {
                 let mut cur = serde_json::to_value(&app.ui.tts).unwrap_or_default();
@@ -502,10 +613,12 @@ pub fn inspect(app: &FilmcraftApp, ctx: &egui::Context) -> Value {
         "window": [size.x, size.y],
         "pixelsPerPoint": ctx.pixels_per_point(),
         "fps": app.fps,
+        "nativeWrite": native_write_status(app),
         "keyboardFocus": keyboard_focus,
         "input": {"mode": if app.control_input_only { "controlOnly" } else { "interactive" },
             "nativeWindowFocused": app.native_window_focused, "effectiveWindowFocused": ctx.input(|input| input.focused)},
         "ui": app.ui,
+        "poema": crate::panels::poema::inspect(app),
         "sourcePlayback": {"playing": app.source_playback.clock.playing, "audioClock": app.source_playback.clock.audio_clock, "playhead": app.session.state.source_playhead.0},
         "playback": {"playing": app.playback.playing, "speed": app.playback.speed, "loop": app.playback.looping, "audioClock": app.playback.audio_clock, "dropped": app.playback.meter.counts().1, "shown": app.playback.meter.counts().0, "preroll": app.playback.preroll.is_some()},
         "playhead": app.session.playhead().0,
@@ -514,6 +627,18 @@ pub fn inspect(app: &FilmcraftApp, ctx: &egui::Context) -> Value {
         "elements": app.auto.previous.len(),
         "dialog": app.dialog.map(|d| format!("{d:?}")),
     })
+}
+
+fn native_write_status(app: &FilmcraftApp) -> Value {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::native_writer::inspect(app)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = app;
+        Value::Null
+    }
 }
 
 /// Save a screenshot (optionally cropped to a rect in points) as PNG; returns the reply JSON.
@@ -627,5 +752,265 @@ mod base64_tests {
         for (i, o) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {
             assert_eq!(super::base64(i.as_bytes()), o);
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    fn app() -> FilmcraftApp {
+        let mut session = filmcraft_engine::Session::default();
+        session.execute("file.openDemoProject", json!({})).unwrap();
+        let mut app = FilmcraftApp::new(session);
+        app.timeline_view_of = app.session.state.active_sequence;
+        app.timeline_still = 2;
+        app.ui.timeline.fit_pending = false;
+        app.ui.timeline.fit_empty = None;
+        let v = &app.ui.timeline;
+        let view = filmcraft_engine::project::SequenceView {
+            pps: v.target_pps,
+            scroll: v.target_scroll,
+            v_scroll: v.v_scroll,
+            a_scroll: v.a_scroll,
+            video_track_h: v.video_track_h,
+            audio_track_h: v.audio_track_h,
+        };
+        app.session.state.timeline_views.insert(app.session.state.active_sequence.unwrap(), view);
+        app
+    }
+    #[test]
+    fn snapshot_waits_for_the_first_nonempty_fit_before_minting_a_ticket() {
+        let mut app = app();
+        app.ui.timeline.fit_empty = Some(app.ui.timeline.target_pps);
+        app.last_ui_time = -1.0;
+        let raises = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let raised = raises.clone();
+        app.hooks.raise_without_focus = Some(Box::new(move || {
+            raised.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+        let before = app.session.project.clone();
+        let revision = app.session.revision;
+        let (request, _) =
+            ControlRequest::new("engine.execute", json!({"command":"agent.snapshot","params":{"token":"guard-test-ticket-000000000000000000000001"}}));
+        assert!(matches!(handle(&mut app, &egui::Context::default(), &request), Outcome::Retry(_)));
+        assert_eq!(raises.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(app.session.project, before);
+        assert_eq!(app.session.revision, revision);
+        app.ui.timeline.fit_empty = None;
+        assert!(matches!(handle(&mut app,&egui::Context::default(),&request),Outcome::Done(v) if v["ok"]==true));
+        assert_eq!(raises.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn paused_root_candidate_exposes_only_private_recovery_basis_before_first_view() {
+        use filmcraft_engine::{Session, autosave::AutosaveConfig, session_worker::SessionWorker};
+        let root = std::env::temp_dir().join(format!(
+            "filmcraft-paused-candidate-view-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let workspace = "11111111-1111-4111-8111-111111111111";
+        let update = "22222222-2222-4222-8222-222222222222";
+        let checkpoint = "33333333-3333-4333-8333-333333333333";
+        let scope = json!({"projectId":"p_paused_view","workspaceId":workspace});
+        let file = root.join("Generated.fcproj");
+        let mut source = Session::default();
+        source.execute("file.newProject", json!({"name":"Generated paused view","workspace":scope})).unwrap();
+        source.execute("file.newSequence", json!({"name":"Original timeline","fps":24})).unwrap();
+        let mut cfg = AutosaveConfig::new(root.join("source-state"));
+        cfg.journal_debounce = std::time::Duration::from_secs(600);
+        source.start_autosave(cfg).unwrap();
+        source.execute("file.saveAs", json!({"path":file})).unwrap();
+        let worker = SessionWorker::new().unwrap();
+        worker.install(&mut source).unwrap();
+        source.agent_operation_control().enable_transport();
+        let token = |n: usize| format!("{n:064x}");
+        let basis = |s: &mut Session, n| s.execute("agent.readHistoryCheckpointBasis", json!({"token":token(n),"scope":scope})).unwrap();
+        basis(&mut source, 1);
+        let saved = source
+            .execute("agent.saveHistoryCheckpoint", json!({"token":token(1),"scope":scope,"workspace":workspace,"checkpoint":checkpoint,"metadataBasis":true}))
+            .unwrap();
+        basis(&mut source, 2);
+        source.execute("agent.beginWorkspaceUpdate", json!({"token":token(2),"scope":scope,"workspace":workspace,"update":update})).unwrap();
+        basis(&mut source, 3);
+        let staged = source.execute("agent.stageProjectRecovery", json!({"token":token(3),"scope":scope,"workspace":workspace,"update":update,"pauseToken":token(2),"checkpoint":checkpoint,"checkpointSha256":saved["checkpoint"]["sha256"]})).unwrap();
+        basis(&mut source, 4);
+        source
+            .execute(
+                "agent.retireWorkspaceUpdate",
+                json!({"token":token(4),"scope":scope,"workspace":workspace,"update":update,"pauseToken":token(2),"stageSha256":staged["sha256"]}),
+            )
+            .unwrap();
+        source.shutdown();
+        drop(source);
+        let mut candidate = Session::default();
+        candidate
+            .open_project_recovery(
+                &json!({"projectPath":file,"scope":scope,"workspace":workspace,"update":update,"sha256":staged["sha256"],"activationToken":token(10)}),
+            )
+            .unwrap();
+        candidate.configure_workspace_update_persistence(AutosaveConfig::new(root.join("candidate-state"))).unwrap();
+        // A production candidate installs its own cancellation transport before
+        // activation. Reuse that real setup rather than bypassing its fence.
+        let candidate_worker = SessionWorker::new().unwrap();
+        candidate_worker.install(&mut candidate).unwrap();
+        candidate.agent_operation_control().enable_transport();
+        let mut app = FilmcraftApp::new(candidate);
+        app.timeline_view_of = None;
+        assert!(snapshot_view_pending(&app));
+        let project = app.session.project.clone();
+        let state = serde_json::to_value(&app.session.state).unwrap();
+        let revision = app.session.revision;
+        let (request, _) =
+            ControlRequest::new("engine.execute", json!({"command":"agent.readHistoryCheckpointBasis","params":{"token":token(11),"scope":scope}}));
+        assert!(
+            matches!(handle(&mut app,&egui::Context::default(),&request),Outcome::Done(v) if v["ok"]==true && v["result"]["kind"]=="native_project_history_checkpoint_basis")
+        );
+        assert_eq!(app.session.project, project);
+        assert_eq!(app.session.revision, revision);
+        assert_eq!(serde_json::to_value(&app.session.state).unwrap(), state);
+        let ready = app.session.workspace_update_status().unwrap();
+        let private = json!({"token":token(15),"scope":scope,"workspace":workspace,"update":update,"projectPath":file,
+            "activationToken":ready["token"],"nativeSession":ready["nativeSession"],"revision":ready["revision"],
+            "sequence":saved["sequence"],"checkpoint":checkpoint,"sha256":saved["checkpoint"]["sha256"]});
+        let (request, _) = ControlRequest::new("engine.execute", json!({"command":"agent.inspectPausedWorkspaceHistory","params":private}));
+        assert!(matches!(handle(&mut app,&egui::Context::default(),&request),Outcome::Done(v)
+            if v["ok"]==true && v["result"]["kind"]=="native_paused_workspace_history" && v["result"]["editingPaused"]==true));
+        let (ordinary, _) =
+            ControlRequest::new("engine.execute", json!({"command":"agent.readProject","params":{"token":token(16),"scope":scope,"projectPath":file}}));
+        assert!(matches!(handle(&mut app, &egui::Context::default(), &ordinary), Outcome::Retry(_)));
+        // The lifecycle fence rejects ordinary reads even before their view
+        // gate. The private basis exception must not widen that fence.
+        app.timeline_view_of = None;
+        assert!(snapshot_view_pending(&app));
+        for (command, n) in [("agent.snapshot", 12), ("agent.readSourceLibrary", 13)] {
+            assert!(!app.session.workspace_update_allows(command));
+            let (ordinary, _) = ControlRequest::new("engine.execute", json!({"command":command,"params":{"token":token(n),"scope":scope}}));
+            assert!(matches!(handle(&mut app, &egui::Context::default(), &ordinary), Outcome::Done(v)
+                if v["ok"] == false && v["outcome"] == "rejected" && v["error"].as_str().is_some_and(|e| e.contains("paused editing"))));
+        }
+        assert_eq!(app.session.project, project);
+        assert_eq!(app.session.revision, revision);
+        assert_eq!(serde_json::to_value(&app.session.state).unwrap(), state);
+        app.session.execute("agent.activateWorkspaceUpdate", json!({"token":token(10),"scope":scope,"workspace":workspace,"update":update,"nativeSession":app.session.workspace_update_status().unwrap()["nativeSession"]})).unwrap();
+        app.timeline_view_of = None;
+        let (active, _) =
+            ControlRequest::new("engine.execute", json!({"command":"agent.readHistoryCheckpointBasis","params":{"token":token(14),"scope":scope}}));
+        assert!(matches!(handle(&mut app, &egui::Context::default(), &active), Outcome::Retry(_)));
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn metadata_checkpoint_basis_waits_for_first_view_then_keeps_the_complete_view_guard() {
+        let mut app = app();
+        let directory = std::env::temp_dir().join(format!(
+            "filmcraft-checkpoint-view-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let file = directory.join("generated.fcproj");
+        let scope = json!({"projectId":"p_view_guard","workspaceId":"11111111-1111-4111-8111-111111111111"});
+        app.session.execute("file.newProject", json!({"name":"Generated view guard","workspace":scope})).unwrap();
+        app.session.execute("file.newSequence", json!({"name":"Generated initial timeline","fps":24})).unwrap();
+        app.session.execute("file.save", json!({"path":file})).unwrap();
+        let active = app.session.state.active_sequence.unwrap();
+        let v = &app.ui.timeline;
+        app.session.state.timeline_views.insert(
+            active,
+            filmcraft_engine::project::SequenceView {
+                pps: v.target_pps,
+                scroll: v.target_scroll,
+                v_scroll: v.v_scroll,
+                a_scroll: v.a_scroll,
+                video_track_h: v.video_track_h,
+                audio_track_h: v.audio_track_h,
+            },
+        );
+        let token = "view-checkpoint-test-basis-00000000000000000001";
+        let (request, _) = ControlRequest::new("engine.execute", json!({"command":"agent.readHistoryCheckpointBasis","params":{"token":token,"scope":scope}}));
+        let before = app.session.project.clone();
+        let revision = app.session.revision;
+        app.timeline_view_of = None;
+        assert!(matches!(handle(&mut app, &egui::Context::default(), &request), Outcome::Retry(_)));
+        assert_eq!(app.session.project, before);
+        assert_eq!(app.session.revision, revision);
+        app.timeline_view_of = Some(active);
+        // The same token can now be issued: the deferred read minted nothing.
+        assert!(
+            matches!(handle(&mut app, &egui::Context::default(), &request), Outcome::Done(v) if v["ok"]==true && v["result"]["kind"]=="native_project_history_checkpoint_basis")
+        );
+        app.session.state.timeline_views.get_mut(&active).unwrap().scroll += 1.0;
+        let workspace = "11111111-1111-4111-8111-111111111111";
+        let checkpoint = "22222222-2222-4222-8222-222222222222";
+        let error = app
+            .session
+            .execute("agent.saveHistoryCheckpoint", json!({"token":token,"scope":scope,"workspace":workspace,"checkpoint":checkpoint,"metadataBasis":true}))
+            .unwrap_err();
+        assert!(error.to_string().contains("changed before persistence"), "{error}");
+        assert!(!directory.join(format!(".poema-history-{workspace}-{checkpoint}.json")).exists());
+        assert_eq!(app.session.revision, revision);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn root_project_read_waits_for_the_settled_view_and_retains_its_editor_guard() {
+        let mut app = app();
+        let directory = std::env::temp_dir().join(format!(
+            "filmcraft-root-view-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let scope = json!({"projectId":"p_root_view","workspaceId":"11111111-1111-4111-8111-111111111111"});
+        app.session.execute("file.newProject", json!({"name":"Generated Root view guard","workspace":scope})).unwrap();
+        app.session.execute("file.newSequence", json!({"name":"Actual owning timeline","fps":24})).unwrap();
+        app.session.execute("file.save", json!({"path":directory.join("generated.fcproj")})).unwrap();
+        let active = app.session.state.active_sequence.unwrap();
+        let v = &app.ui.timeline;
+        app.session.state.timeline_views.insert(
+            active,
+            filmcraft_engine::project::SequenceView {
+                pps: v.target_pps,
+                scroll: v.target_scroll,
+                v_scroll: v.v_scroll,
+                a_scroll: v.a_scroll,
+                video_track_h: v.video_track_h,
+                audio_track_h: v.audio_track_h,
+            },
+        );
+        app.timeline_view_of = None;
+        let token = "root-view-guard-ticket-000000000000000000001";
+        let (request, _) = ControlRequest::new(
+            "engine.execute",
+            json!({"command":"agent.readProject","params":{"token":token,"scope":scope,"projectPath":directory.join("generated.fcproj")}}),
+        );
+        let before = app.session.project.clone();
+        let revision = app.session.revision;
+        assert!(matches!(handle(&mut app, &egui::Context::default(), &request), Outcome::Retry(_)));
+        assert_eq!(app.session.project, before);
+        assert_eq!(app.session.revision, revision);
+        app.timeline_view_of = Some(active);
+        // The same token is still unused: a deferred read created no ticket.
+        assert!(
+            matches!(handle(&mut app, &egui::Context::default(), &request), Outcome::Done(v) if v["ok"]==true && v["result"]["kind"]=="native_project_read")
+        );
+        app.session.state.timeline_views.get_mut(&active).unwrap().scroll += 1.0;
+        assert!(app.session.execute("agent.validateProjectRead", json!({"token":token,"scope":scope})).is_err());
+        assert_eq!(app.session.project, before);
+        assert_eq!(app.session.revision, revision);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn active_tab_and_unsaved_view_changes_wait_but_a_stable_view_does_not() {
+        let mut app = app();
+        assert!(!snapshot_view_pending(&app));
+        app.timeline_view_of = None;
+        assert!(snapshot_view_pending(&app));
+        app.timeline_view_of = app.session.state.active_sequence;
+        app.ui.timeline.target_scroll += 1.0;
+        assert!(snapshot_view_pending(&app));
     }
 }

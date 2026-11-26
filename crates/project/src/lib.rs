@@ -10,6 +10,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 pub mod caption;
+pub mod clip_identity;
 pub mod effect;
 pub mod essential;
 pub mod find;
@@ -32,6 +33,7 @@ use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick, TimeRange};
 use serde::{Deserialize, Serialize};
 
 pub use caption::{Caption, CaptionAlign, CaptionAnchor, CaptionFormat, CaptionStyle, CaptionTrack, plain_text};
+pub use clip_identity::ClipIdentity;
 pub use effect::{EffectDef, EffectInstance, EffectKind, ParamDef, ParamKind, effect_defs, find_effect};
 pub use essential::{AudioType, EssentialSound};
 pub use find::{FindOp, FindQuery, FindRow, SearchBin};
@@ -509,6 +511,9 @@ fn is_zero_stream(stream: &usize) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TrackItem {
+    /// Optional local Poema tracking carrier. Schema v16; older projects default to untracked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Box<ClipIdentity>>,
     pub id: ClipId,
     pub item: ItemId,
     pub name: String,
@@ -1232,6 +1237,10 @@ impl Default for ProjectSettings {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub name: String,
+    /// Project-scoped extension data, independent of any sequence (schema v18).
+    /// Unknown keys survive round trips; an empty map preserves legacy values.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
     pub settings: ProjectSettings,
     pub root: Bin,
     pub items: BTreeMap<ItemId, ProjectItem>,
@@ -1347,6 +1356,7 @@ impl Project {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.into(),
+            metadata: BTreeMap::new(),
             settings: ProjectSettings::default(),
             root: Bin { id: BinId(0), name: name.into(), children: Vec::new() },
             items: BTreeMap::new(),
@@ -1607,6 +1617,7 @@ impl Project {
         let id = ClipId(self.alloc_id());
         let dur = seq_rate.snap_nearest(source.duration).max(seq_rate.frame_duration());
         Some(TrackItem {
+            identity: None,
             id,
             item,
             name,

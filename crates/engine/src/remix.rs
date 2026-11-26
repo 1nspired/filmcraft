@@ -70,7 +70,7 @@ fn is_remixed(s: &Session) -> std::result::Result<(), String> {
 }
 
 fn target_clip(s: &Session, p: &Value, cmd: &str) -> Result<ClipId> {
-    let c = match u64_p(p, "clip") {
+    let c = match u64_p(p, "clip")? {
         Some(c) => ClipId(c),
         None => selected_audio(s).ok_or_else(|| bad(cmd, "select an audio clip or pass `clip`"))?,
     };

@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** major (new file: milestones moved from ROADMAP.md, Current focus rewritten from the 2026-10-10 re-measure, beta milestones added) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-21 · **Change:** minor (local retime validation and dialog preservation; milestones and readiness estimates unchanged) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
 
 Forward-looking plan: milestones with status, the current focus and what's next, with estimates in
 Opus 5.5 agent-hours (calibration in [target-app-parity.md](target-app-parity.md#calibration)).
@@ -8,6 +8,30 @@ The one-page summary is [ROADMAP.md](../ROADMAP.md); the ranked work list is [ga
 There is no `cargo xtask scorecard` or `cargo xtask parity` yet ([G7](gaps.md#g7-no-measured-parity-tool-in-ci)).
 
 ## Current focus
+
+Local retime follow-up (2026-10-21): Speed/Duration rejects malformed explicit
+options before publication, preserving existing Undo/Redo and human defaults.
+Dialog initialization retains the actual reverse flag and full saved speed
+percentage. Native and headless UI regressions cover these boundaries; G6 and
+readiness estimates remain unchanged.
+
+Local mixer follow-up (2026-10-21): failed deletions no longer publish history
+before returning an error. Insert settings share definition-typed parameter
+handling with transitions, including checked choice width and preserved
+automation. Generated regressions cover failure invariants, valid settings,
+Undo/Redo and reopen; G6 and readiness estimates remain unchanged.
+
+Local integration note (2026-10-20): Poema's explicit native-copy experiment now exercises exact
+linked edits and guarded Undo on synthetic and Canon footage. This does not close G6 or change
+the upstream priorities/readiness numbers below. See `crates/engine/README.md` for its narrow scope.
+The latest local increment also verifies separate-sequence creation, six linked Canon inserts,
+saved-child reopen, revision/dirty-free navigation and Undo of the owned sequence/insert steps.
+
+Local validation follow-up (2026-10-21): Project lists reject malformed targets
+before selection/edit/export/offline-file effects; source marks validate both
+sides before split cleanup. Synthetic regressions preserve deliberate null
+clears, omitted human defaults, native Undo/Redo and saved reopen. This repairs
+command boundaries without claiming a new workflow or changing G6/readiness.
 
 In order. Each item links to its gap entry, which says what "done" means.
 
@@ -87,5 +111,6 @@ the web app shell ([G20](gaps.md#g20-the-web-app-shell)).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-21 | minor | Local Speed/Duration validation and dialog preservation; G6, milestones and readiness estimates unchanged |
 | 2026-10-10 | minor | Alpha gate table added (craftrules core-workflow gate): six core workflows, all pass on macOS; stage stays alpha |
 | 2026-10-10 | major | Created: milestone table moved from ROADMAP.md (M5 and M9 remaining work updated), HW and L10N rows, beta milestones B1–B7, Current focus from the re-measure |

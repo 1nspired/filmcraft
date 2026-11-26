@@ -11,50 +11,94 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 pub mod aaf_omf;
+mod agent_bridge;
+#[cfg(not(target_arch = "wasm32"))]
+pub use agent_bridge::operation_control::AgentOperationControl;
 pub mod autosave;
+mod caption_import;
 pub mod captions;
+mod clip_identity;
 pub mod clip_ops;
 pub mod color;
 pub mod commands;
 pub mod demo;
 pub mod doc_path;
+mod editor_state;
+#[cfg(test)]
+mod editor_state_tests;
+mod editorial_workspace;
+pub(crate) mod effect_stack;
 pub mod essential_sound;
 pub mod export_tools;
 pub mod graphic_templates;
 pub mod graphics;
+#[cfg(test)]
+mod graphics_input_tests;
 pub mod interchange;
 pub mod keyboard;
 mod keyframe_move;
 mod marker_export;
+mod marker_ops;
 pub mod masks;
 pub mod media_browser;
 pub mod media_pool;
 pub mod media_watch;
 pub mod mixer;
+mod move_ops;
+#[cfg(test)]
+mod move_ops_tests;
 pub mod multicam;
 pub mod narration;
 pub mod panels;
 pub mod paste_media;
 pub mod perf;
+mod placement;
 pub mod presets;
 pub mod previews;
+mod project_clear;
+#[cfg(test)]
+mod project_clear_tests;
+mod project_ids;
 pub mod project_manager;
+mod project_organization;
+#[cfg(test)]
+mod project_organization_tests;
 pub mod project_panel;
 pub mod project_tools;
+mod project_workspace;
+#[cfg(test)]
+mod project_workspace_tests;
 pub mod proxies;
+mod range_ops;
+#[cfg(test)]
+mod range_ops_tests;
 pub mod relink;
 pub mod remix;
+mod saved_file;
 pub mod scene_detect;
 pub mod scopes;
+mod search_organization;
+#[cfg(test)]
+mod search_organization_tests;
+mod sequence_assembly;
+#[cfg(test)]
+mod sequence_assembly_tests;
 pub mod sequence_extras;
 pub mod sequence_tools;
 pub mod settings;
 pub mod shortcut_presets;
 pub mod shortcuts;
 pub mod source_monitor;
+mod speed_duration;
 pub mod sync;
+mod track_ops;
+#[cfg(test)]
+mod track_ops_tests;
 pub mod transcript;
 pub mod trim;
+mod trim_ops;
+#[cfg(test)]
+mod trim_ops_tests;
 pub mod voiceover;
 
 use std::sync::Arc;
@@ -71,6 +115,8 @@ pub use filmcraft_project as project;
 pub use filmcraft_render as render;
 pub use filmcraft_time as time;
 pub use media_pool::MediaPool;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod session_worker;
 
 /// The OS temp folder; `/tmp` on wasm32, where `std::env::temp_dir()` panics ("no filesystem on
 /// this platform"). Use this instead of `std::env::temp_dir()` in any code the web build runs.
@@ -92,6 +138,8 @@ pub enum EngineError {
     Edit(#[from] filmcraft_edit::EditError),
     #[error("media: {0}")]
     Media(#[from] filmcraft_media::MediaError),
+    #[error("internal error in `{command}` (see the crash log); outcome unknown, reconcile before another edit")]
+    CommandPanicked { command: String },
     #[error("{0}")]
     Other(String),
 }
@@ -243,6 +291,10 @@ pub struct EffectSel {
     pub clip: ClipId,
     pub effect: String,
     pub instance: usize,
+    /// Tracked effects keep their selection across reorders and Undo/Redo.
+    /// Older untracked documents retain the definition/occurrence fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
 }
 
 impl EffectSel {
@@ -250,11 +302,19 @@ impl EffectSel {
     pub fn of(clip: ClipId, effects: &[filmcraft_project::EffectInstance], index: usize) -> Option<Self> {
         let id = &effects.get(index)?.effect;
         let instance = effects.iter().take(index).filter(|e| &e.effect == id).count();
-        Some(Self { clip, effect: id.clone(), instance })
+        Some(Self { clip, effect: id.clone(), instance, instance_id: effects.get(index)?.instance_id.clone() })
     }
 
     /// Where the selected effect is in the clip's `effects`.
     pub fn index(&self, effects: &[filmcraft_project::EffectInstance]) -> Option<usize> {
+        if let Some(id) = &self.instance_id {
+            if !filmcraft_project::ClipIdentity::valid_id(id) {
+                return None;
+            }
+            let mut matches = effects.iter().enumerate().filter(|(_, effect)| effect.instance_id.as_ref() == Some(id) && effect.effect == self.effect);
+            let index = matches.next().map(|(index, _)| index)?;
+            return matches.next().is_none().then_some(index);
+        }
         effects.iter().enumerate().filter(|(_, e)| e.effect == self.effect).nth(self.instance).map(|(i, _)| i)
     }
 }
@@ -378,10 +438,17 @@ pub enum Event {
 }
 
 pub struct Session {
+    // A display projection never owns edit/history or persistence authority.
+    view_only: bool,
+    worker_available: bool,
+    // Only the exclusive native worker installs this transient cancellation
+    // handle. It is not serialized, copied to the display or a second writer.
+    media_import_control: Option<media_browser::ImportControl>,
     pub project: Arc<Project>,
     pub history: History,
     pub revision: u64,
     pub saved_revision: u64,
+    saved_file: Option<saved_file::Baseline>,
     pub path: Option<String>,
     pub state: EditorState,
     pub media: Arc<MediaPool>,
@@ -443,6 +510,8 @@ pub struct Session {
     pub browser: media_browser::BrowserState,
     /// Nesting depth of [`Session::execute`] (commands that run other commands).
     exec_depth: u32,
+    /// Ephemeral read tickets / batch receipts; never loaded from a project file.
+    agent_bridge: agent_bridge::Bridge,
     /// Each media file's size and modification time when last seen (Settings ▸ Media ▸
     /// Automatically refresh growing files, [`media_watch`]).
     pub media_stamps: std::collections::HashMap<String, media_watch::Stamp>,
@@ -494,12 +563,127 @@ impl Default for Session {
 }
 
 impl Session {
+    fn require_owner(&self) -> Result<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if agent_bridge::application_setup_held(self) {
+            return Err(EngineError::Other("Poema is completing this project setup; no native edit was started".into()));
+        }
+        if self.view_only {
+            return Err(EngineError::Other("a native write owns the session; this display projection cannot execute or edit".into()));
+        }
+        if agent_bridge::workspace_update_held(self) {
+            return Err(EngineError::Other("workspace update has paused native editing; cancel the update to resume".into()));
+        }
+        Ok(())
+    }
+    fn require_command_owner(&self, command: &str) -> Result<()> {
+        if self.view_only {
+            return Err(EngineError::Other("a native write owns the session; this display projection cannot execute or edit".into()));
+        }
+        agent_bridge::workspace_update_command(self, command)
+    }
+
+    /// Read-only display state while the authoritative Session runs on its native worker.
+    pub fn is_display_only(&self) -> bool {
+        self.view_only || agent_bridge::workspace_update_held(self)
+    }
+    /// Lifecycle metadata only, never a source witness or an edit ticket.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn workspace_update_status(&self) -> Option<Value> {
+        agent_bridge::workspace_update_view(self)
+    }
+    /// Only the lifecycle fence; this does not validate command arguments or
+    /// confer a read ticket, mutation permission or source-file authority.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn workspace_update_allows(&self, command: &str) -> bool {
+        agent_bridge::workspace_update_command(self, command).is_ok()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn cancel_workspace_update(&mut self) -> Result<Option<Value>> {
+        agent_bridge::cancel_workspace_update(self)
+    }
+    /// Read-only native presentation identity, including genuine sequence
+    /// absence. None denotes a legacy project without independent identity.
+    /// This grants no history, media or agent editing authority.
+    pub fn matches_project_workspace(&self, project_id: &str, workspace_id: &str) -> Result<Option<bool>> {
+        project_workspace::matches_identity(&self.project, project_id, workspace_id)
+    }
+    /// Trusted lifecycle inspection only. Captures exact native saved bytes and
+    /// read-only journal comparisons; no plan, source authority or restoration.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn capture_project_recovery_basis(&mut self, scope: &Value) -> Result<Value> {
+        agent_bridge::capture_project_recovery_basis(self, scope)
+    }
+    /// Read-only comparison of a previously captured native lifecycle basis.
+    /// It never authenticates a caller or authorizes a restore/activation. A
+    /// future cold startup must bind this into its immutable checked snapshot.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn validate_project_recovery_basis(basis: &Value) -> Result<()> {
+        agent_bridge::validate_project_recovery_basis(basis)
+    }
+    /// Trusted native startup only. Loads an opaque checked native bundle into
+    /// a fresh, paused candidate; it does not activate an editor or source proof.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_workspace_update(&mut self, params: &Value) -> Result<Value> {
+        agent_bridge::open_workspace_update(self, params)
+    }
+    /// Trusted cold startup only: recover an exact native identity decision
+    /// into a fresh paused candidate. Never a command or a live-editor restore.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_identity_publication(&mut self, params: &Value) -> Result<Value> {
+        agent_bridge::open_identity_publication(self, params)
+    }
+    /// Trusted cold startup only. Hydrates an authenticated complete independent
+    /// project snapshot into a fresh paused candidate, never a live edit.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_project_recovery(&mut self, params: &Value) -> Result<Value> {
+        agent_bridge::open_project_recovery(self, params)
+    }
+    /// Trusted virgin startup only. Creates one new empty independent project
+    /// exclusively and holds editing until the existing explicit activation.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_project_workspace(&mut self, params: &Value) -> Result<Value> {
+        agent_bridge::create_project_workspace(self, params)
+    }
+    /// Reserve a fresh private persistence root. No worker starts until this
+    /// candidate's explicit native activation commits.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn configure_workspace_update_persistence(&mut self, cfg: autosave::AutosaveConfig) -> Result<()> {
+        agent_bridge::configure_workspace_update_persistence(self, cfg)
+    }
+    /// Descriptive native setup status, never a source witness or edit ticket.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn application_project_admission(&self) -> Option<Value> {
+        agent_bridge::application_project_status(self)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn display_projection(&self) -> Self {
+        let mut display = Self::new(self.services.clone());
+        display.view_only = true;
+        display.project = self.project.clone();
+        display.revision = self.revision;
+        display.saved_revision = self.saved_revision;
+        display.path = self.path.clone();
+        display.state = self.state.clone();
+        display.media = self.media.clone();
+        display.previews = self.previews.clone();
+        display.prefs = self.prefs.clone();
+        display.loaded_schema = self.loaded_schema;
+        // No tickets, owned history, persistence, devices or pending job writers are copied.
+        display
+    }
+
     pub fn new(services: Arc<dyn Services>) -> Self {
         Self {
+            view_only: false,
+            worker_available: false,
+            media_import_control: None,
             project: Arc::new(Project::new("Untitled")),
             history: History { limit: 200, ..Default::default() },
             revision: 1,
             saved_revision: 1,
+            saved_file: None,
             path: None,
             state: EditorState {
                 snapping: true,
@@ -538,6 +722,7 @@ impl Session {
             log: Default::default(),
             browser: Default::default(),
             exec_depth: 0,
+            agent_bridge: Default::default(),
             media_stamps: Default::default(),
             media_scan: None,
         }
@@ -575,8 +760,33 @@ impl Session {
     /// the data directory and finds unsaved changes left by sessions that died
     /// ([`Session::recovery_candidates`]).
     pub fn start_autosave(&mut self, cfg: autosave::AutosaveConfig) -> std::io::Result<()> {
+        self.start_persistence(cfg, false)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn start_workspace_persistence(&mut self, cfg: autosave::AutosaveConfig) -> std::io::Result<()> {
+        self.start_persistence(cfg, true)
+    }
+    fn start_persistence(&mut self, cfg: autosave::AutosaveConfig, keep_preferences: bool) -> std::io::Result<()> {
+        if self.is_display_only()
+            && !(keep_preferences && !self.view_only && {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    agent_bridge::application_only_held(self)
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    false
+                }
+            })
+        {
+            return Err(std::io::Error::other("display-only native state cannot own persistence"));
+        }
         let prefs_path = cfg.data_dir.join("preferences.json");
-        self.prefs = autosave::Preferences::load(&prefs_path);
+        if keep_preferences {
+            self.prefs.save(&prefs_path)?;
+        } else {
+            self.prefs = autosave::Preferences::load(&prefs_path);
+        }
         self.prefs.apply_hardware_decoding();
         self.media.set_use_proxies(self.prefs.media.enable_proxies);
         self.shortcuts.set_dir(&cfg.data_dir);
@@ -605,13 +815,22 @@ impl Session {
     /// Tell the worker about the current project state if it changed (cheap: an `Arc` clone and a
     /// channel send; serialization happens on the worker). Called after every command.
     pub fn sync_persistence(&mut self) {
+        if self.view_only {
+            return;
+        }
         let dirty = self.is_dirty();
-        let Some(p) = self.persistence.as_mut() else { return };
+        let Some(p) = self.persistence.as_ref() else { return };
         let cur = autosave::Sent { revision: self.revision, saved_revision: self.saved_revision, path: self.path.clone() };
         if p.last_sent.as_ref() == Some(&cur) {
             return;
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        let native = if dirty { agent_bridge::capture_native_journal(self).map_err(|e| e.to_string()) } else { Ok(None) };
+        let Some(p) = self.persistence.as_mut() else { return };
         if dirty {
+            #[cfg(not(target_arch = "wasm32"))]
+            p.send_dirty_native(self.project.clone(), self.revision, self.path.clone(), native);
+            #[cfg(target_arch = "wasm32")]
             p.send_dirty(self.project.clone(), self.revision, self.path.clone());
         } else {
             p.send_clean();
@@ -622,18 +841,30 @@ impl Session {
     /// Apply worker notifications (call regularly, e.g. once per UI frame). Also applies the
     /// results of finished proxy / ingest jobs.
     pub fn poll_persistence(&mut self) {
+        if self.is_display_only() {
+            return;
+        }
         proxies::poll(self);
         masks::poll(self);
         scene_detect::poll(self);
         export_tools::pump_queue(self, false);
         panels::log_jobs(self);
+        self.apply_persistence_events();
+        self.sync_persistence();
+    }
+    pub(crate) fn apply_persistence_events(&mut self) {
         let Some(p) = self.persistence.as_mut() else { return };
         for ev in p.drain_events() {
             match ev {
-                autosave::WorkerEvent::SavedProject { path, revision }
-                    if self.path.as_deref() == Some(path.as_str()) && revision > self.saved_revision && revision <= self.revision =>
-                {
-                    self.saved_revision = revision;
+                autosave::WorkerEvent::SavedProject { path, revision, sha256 } if self.path.as_deref() == Some(path.as_str()) => {
+                    if revision >= self.saved_revision && revision <= self.revision {
+                        self.saved_revision = revision;
+                        self.saved_file = Some(saved_file::Baseline { path, sha256 });
+                    } else {
+                        // A late worker write cannot certify the current saved
+                        // baseline, even when its graph happens to look equal.
+                        self.saved_file = None;
+                    }
                 }
                 autosave::WorkerEvent::Error(m) => {
                     self.log.push(panels::Level::Error, "autosave", m.clone());
@@ -642,7 +873,6 @@ impl Session {
                 _ => {}
             }
         }
-        self.sync_persistence();
     }
 
     /// Replace preferences (persisting them and updating the worker).
@@ -689,8 +919,15 @@ impl Session {
         self.revision != self.saved_revision
     }
 
+    /// Independent cancellation handle for this session's guarded agent writes.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn agent_operation_control(&self) -> AgentOperationControl {
+        self.agent_bridge.operations.clone()
+    }
+
     /// Run a command by id.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
+        self.require_command_owner(id)?;
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         if self.exec_depth == 0 && spec.journal && self.trim_play.active() {
             self.settle_trim_playback(id);
@@ -706,8 +943,8 @@ impl Session {
         // Last-resort guard: a panic in a command (a bug that escaped the never-crash rules)
         // becomes an error for the caller (UI, CLI, control channel, MCP) instead of taking the
         // session and its unsaved project down. The panic hook has logged where it happened.
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)))
-            .unwrap_or_else(|_| Err(EngineError::Other(format!("internal error in `{id}` (see the crash log); the command did not complete"))));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| agent_bridge::run_command(self, id, &params, spec.run)))
+            .unwrap_or_else(|_| Err(EngineError::CommandPanicked { command: id.into() }));
         self.exec_depth -= 1;
         if self.exec_depth == 0 {
             source_monitor::track_history(self);
@@ -834,10 +1071,22 @@ impl Session {
 
     /// Apply an undoable project edit. The closure gets a mutable copy; on error nothing changes.
     pub fn edit<R>(&mut self, label: &str, f: impl FnOnce(&mut Project, &mut EditorState) -> Result<R>) -> Result<R> {
+        self.require_owner()?;
         let mut p = (*self.project).clone();
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
+        clip_identity::reconcile(&self.project, &mut p)?;
+        self.commit_edit(label, p, st)?;
+        Ok(r)
+    }
+
+    /// Publish an already reconciled candidate (also used by the isolated agent staging path).
+    /// Re-minting its split/copy identities here would introduce phantom lineage parents.
+    fn commit_edit(&mut self, label: &str, p: Project, mut st: EditorState) -> Result<()> {
+        self.require_owner()?;
+        filmcraft_project::clip_identity::validate_project(&p).map_err(EngineError::Other)?;
         self.refuse_self_nesting(&p)?;
+        editor_state::remap_committed_mask(&self.project, &p, &self.state, &mut st);
         let old = std::mem::replace(&mut self.project, Arc::new(p));
         self.history.undo.push((label.to_string(), old));
         if self.history.undo.len() > self.history.limit {
@@ -848,12 +1097,13 @@ impl Session {
         self.state = st;
         self.drop_stale_gap();
         self.bump();
-        Ok(r)
+        Ok(())
     }
 
     /// Like [`Session::edit`], but consecutive calls with the same `key` (and no other edit in
     /// between) share one undo step: dragging a control is one undoable change.
     pub fn edit_merged<R>(&mut self, label: &str, key: &str, f: impl FnOnce(&mut Project, &mut EditorState) -> Result<R>) -> Result<R> {
+        self.require_owner()?;
         let merge = self.history.merge_key.as_deref() == Some(key) && self.history.undo.last().is_some_and(|u| u.0 == label);
         if !merge {
             let r = self.edit(label, f)?;
@@ -863,7 +1113,9 @@ impl Session {
         let mut p = (*self.project).clone();
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
+        clip_identity::reconcile(&self.project, &mut p)?;
         self.refuse_self_nesting(&p)?;
+        editor_state::remap_committed_mask(&self.project, &p, &self.state, &mut st);
         self.project = Arc::new(p);
         self.state = st;
         self.drop_stale_gap();
@@ -871,43 +1123,40 @@ impl Session {
         Ok(r)
     }
 
-    /// Run several undoable edits as one undo step labelled `label`. If `f` fails, every edit it made
-    /// is rolled back and the history is as before.
+    /// Run project edits as one undo step. Keep the original history and project
+    /// explicitly, so long groups never disable the configured history bound.
+    /// Errors restore project, editor state and history; external I/O is not undone.
     pub fn edit_group<R>(&mut self, label: &str, f: impl FnOnce(&mut Session) -> Result<R>) -> Result<R> {
-        let (project, state, undo, redo, limit) =
-            (self.project.clone(), self.state.clone(), self.history.undo.len(), self.history.redo.clone(), self.history.limit);
-        // keep every step the group makes, however many, so the first one can be found afterwards
-        self.history.limit = usize::MAX;
-        // a panic inside the group must not leave the history unlimited: restore, then let it go on
+        self.require_owner()?;
+        let (project, state, history) = (self.project.clone(), self.state.clone(), self.history.clone());
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
-        self.history.limit = limit;
-        let first = self.history.undo.get(undo).map(|e| e.1.clone());
-        let rolled_back = |s: &mut Session| {
-            s.history.undo.truncate(undo);
-            s.history.redo = redo.clone();
-            s.history.merge_key = None;
-            s.project = project.clone();
-            s.state = state.clone();
-            s.bump();
-        };
-        match (r, first) {
-            (Ok(Ok(v)), Some(first)) => {
-                self.history.undo.truncate(undo);
-                self.history.undo.push((label.to_string(), first));
-                if self.history.undo.len() > limit {
-                    self.history.undo.remove(0);
+        let changed = !Arc::ptr_eq(&project, &self.project);
+        match r {
+            Ok(Ok(v)) => {
+                if changed {
+                    self.history = history;
+                    self.history.undo.push((label.to_string(), project));
+                    if self.history.undo.len() > self.history.limit {
+                        self.history.undo.remove(0);
+                    }
+                    self.history.redo.clear();
+                    self.history.merge_key = None;
                 }
-                self.history.merge_key = None;
                 Ok(v)
             }
-            (Ok(Ok(v)), None) => Ok(v),
-            (Ok(Err(e)), _) => {
-                rolled_back(self);
-                Err(e)
-            }
-            (Err(panic), _) => {
-                rolled_back(self);
-                std::panic::resume_unwind(panic)
+            result => {
+                self.project = project;
+                self.state = state;
+                self.history = history;
+                if changed {
+                    self.bump();
+                }
+                match result {
+                    Ok(Err(error)) => Err(error),
+                    Err(panic) => std::panic::resume_unwind(panic),
+                    // Handled by the successful arm; keep this branch non-panicking.
+                    Ok(Ok(value)) => Ok(value),
+                }
             }
         }
     }
@@ -934,7 +1183,8 @@ impl Session {
             n += 1;
         }
         if let Some(prev) = earliest {
-            self.project = prev;
+            let current = std::mem::replace(&mut self.project, prev);
+            self.state.selected_mask = masks::remap_selection(&current, &self.project, &self.state);
             self.history.merge_key = None;
             self.fix_state();
             self.bump();
@@ -982,9 +1232,13 @@ impl Session {
     }
 
     pub fn undo(&mut self) -> Option<String> {
+        if self.is_display_only() {
+            return None;
+        }
         let (label, prev) = self.history.undo.pop()?;
         self.history.merge_key = None;
         let cur = std::mem::replace(&mut self.project, prev);
+        self.state.selected_mask = masks::remap_selection(&cur, &self.project, &self.state);
         self.history.redo.push((label.clone(), cur));
         self.fix_state();
         self.bump();
@@ -992,62 +1246,37 @@ impl Session {
     }
 
     pub fn redo(&mut self) -> Option<String> {
+        if self.is_display_only() {
+            return None;
+        }
         let (label, next) = self.history.redo.pop()?;
         self.history.merge_key = None;
         let cur = std::mem::replace(&mut self.project, next);
-        self.history.undo.push((label.clone(), cur));
+        self.state.selected_mask = masks::remap_selection(&cur, &self.project, &self.state);
+        self.history.undo.push((label.clone(), cur.clone()));
         self.fix_state();
+        if self.state.active_sequence.is_none() {
+            match project_workspace::restored_initial_sequence(&cur, &self.project) {
+                Ok(Some(id)) => match commands::open_sequence_state(&self.project, &mut self.state, id) {
+                    Ok(()) => self.events.push(Event::OpenSequence(id)),
+                    Err(error) => self.error_toast("edit.redo", error.to_string()),
+                },
+                Ok(None) => {}
+                Err(error) => self.error_toast("edit.redo", error.to_string()),
+            }
+        }
         self.bump();
         Some(label)
     }
 
     /// Drop dangling references after undo/redo/delete.
     pub fn fix_state(&mut self) {
-        let p = self.project.clone();
-        if let Some(m) = self.state.selected_mask {
-            let ok =
-                self.active_sequence().and_then(|q| q.find_item(m.clip)).and_then(|(_, it)| it.effects.get(m.effect)).is_some_and(|e| m.mask < e.masks.len());
-            if !ok {
-                self.state.selected_mask = None;
-            }
-        }
-        if let Some(e) = &self.state.selected_effect
-            && self.active_sequence().and_then(|q| q.find_item(e.clip)).and_then(|(_, it)| e.index(&it.effects)).is_none()
-        {
-            self.state.selected_effect = None;
-        }
-        if let Some(s) = self.state.active_sequence
-            && p.sequence(s).is_none()
-        {
-            self.state.active_sequence = p.sequences().next().map(|i| i.id);
-        }
-        self.state.open_sequences.retain(|s| p.sequence(*s).is_some());
-        self.state.timeline_views.retain(|s, _| p.sequence(*s).is_some());
-        if let Some(s) = self.state.source_item
-            && p.item(s).is_none()
-        {
-            self.state.source_item = None;
-        }
-        source_monitor::track_history(self);
-        if let Some(seq) = self.state.active_sequence.and_then(|s| p.sequence(s)) {
-            self.state.selection.retain(|c| seq.find_item(*c).is_some());
-            self.state.caption_selection.retain(|c| seq.find_caption(*c).is_some());
-        } else {
-            self.state.selection.clear();
-            self.state.caption_selection.clear();
-        }
-        self.state.project_selection.retain(|i| p.item(*i).is_some());
-        self.drop_stale_gap();
+        editor_state::repair(&self.project, &mut self.state);
     }
 
-    /// Forget the selected gap when it is no longer a gap of the active sequence (a clip moved
-    /// into it or next to it, its track went, another sequence became the active one).
+    /// Forget a selected gap that no longer exists in the active sequence.
     fn drop_stale_gap(&mut self) {
-        if let Some(g) = self.state.gap_selection
-            && !self.active_sequence().and_then(|q| q.track(g.track)).is_some_and(|tr| filmcraft_edit::through::track_gaps(tr).contains(&g.range))
-        {
-            self.state.gap_selection = None;
-        }
+        editor_state::drop_stale_gap(&self.project, &mut self.state);
     }
 
     fn bump(&mut self) {
@@ -1225,6 +1454,8 @@ mod clip_ops_tests;
 #[cfg(test)]
 mod color_tests;
 #[cfg(test)]
+mod command_input_tests;
+#[cfg(test)]
 mod essential_sound_tests;
 #[cfg(test)]
 mod explicit_targets_tests;
@@ -1254,6 +1485,8 @@ mod media_browser_tests;
 mod media_test_util;
 #[cfg(test)]
 mod media_watch_tests;
+#[cfg(test)]
+mod mixer_input_tests;
 #[cfg(test)]
 mod mixer_tests;
 #[cfg(test)]

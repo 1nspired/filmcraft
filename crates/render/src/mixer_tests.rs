@@ -26,6 +26,35 @@ fn close(a: f32, b: f32, tol: f32) -> bool {
     (a - b).abs() <= tol
 }
 
+#[test]
+fn source_input_channels_match_existing_mono_stereo_surround_and_fallback_rules() {
+    let mut rig = Rig::new(&[dc]);
+    let mut item = rig.track(0).items[0].clone();
+    for available in [0, 1, 2, 3, 5, 6, 8, 64] {
+        for selected in [vec![], vec![0], vec![1], vec![1, 0], vec![5, 4, 3, 2, 1, 0], vec![99]] {
+            item.source_channels = selected;
+            for width in [2, 6] {
+                let actual = crate::audio::source_input_channels(&item, available, width);
+                if available == 0 {
+                    assert!(actual.is_empty());
+                    continue;
+                }
+                let expected = if width == 6 || item.source_channels.len() >= 6 || item.source_channels.is_empty() && available == 6 {
+                    crate::audio::source_51(&item, available)
+                } else {
+                    let (l, r) = crate::audio::source_pair(&item, available);
+                    vec![l, r]
+                };
+                assert_eq!(actual, expected);
+                assert!(actual.iter().all(|c| *c < available));
+            }
+        }
+    }
+    item.source_channels.clear();
+    assert_eq!(crate::audio::source_input_channels(&item, 6, 2), vec![0, 1, 2, 3, 4, 5]);
+    assert!(crate::audio::source_input_channels(&item, 6, 3).is_empty());
+}
+
 /// The renderer must request the stream selected by each clip, rather than reading stream zero
 /// twice when a container item has clips on two audio tracks.
 #[test]
@@ -335,6 +364,46 @@ fn render_and_playback_paths_are_identical() {
     let again = Rig::new(&[]);
     drop(again);
     assert_eq!(busy_rig(4).mix_cut(0, 24_000, &[8_000], None), export);
+}
+
+#[test]
+fn independent_reads_do_not_consume_or_publish_track_or_clip_dsp_state() {
+    struct Independent<'a>(&'a SourceMap);
+    impl crate::SourceProvider for Independent<'_> {
+        fn source(&self, item: ItemId) -> Option<filmcraft_media::SharedSource> {
+            crate::SourceProvider::source(self.0, item)
+        }
+        fn reuse_audio_state(&self) -> bool {
+            false
+        }
+    }
+    let mut r = busy_rig(2);
+    // Other renderer fixtures deliberately reuse low item/track IDs. This normal-playback
+    // comparison needs its own cache keys, just as an independent document would.
+    let q = r.p.sequence_mut(r.seq).unwrap();
+    for track in q.audio_tracks.iter_mut().chain(q.submix_tracks.iter_mut()) {
+        track.id.0 += 99_000_000;
+        for clip in &mut track.items {
+            clip.id.0 += 99_000_000;
+        }
+        if let Some(target) = &mut track.mixer.output {
+            target.0 += 99_000_000;
+        }
+        for send in &mut track.mixer.sends {
+            send.target.0 += 99_000_000;
+        }
+    }
+    // Exercise both state caches, not just the track/submix graph. Altered historical input
+    // must not leak through a same-structure, sequentially cached playback state.
+    let clip = &mut r.track(0).items[0];
+    clip.effects.push(filmcraft_project::find_effect("studio_reverb").unwrap().instance());
+    let seq = r.p.sequence(r.seq).unwrap();
+    let baseline = mix_graph(&r.p, seq, 12000, 2048, &Independent(&r.map), None);
+    let _playback = mix_graph(&r.p, seq, 0, 12000, &r.map, None);
+    let again = mix_graph(&r.p, seq, 12000, 2048, &Independent(&r.map), None);
+    assert_eq!(baseline, again);
+    let replay = mix_graph(&r.p, seq, 12000, 2048, &Independent(&r.map), None);
+    assert_eq!(baseline, replay);
 }
 
 #[test]

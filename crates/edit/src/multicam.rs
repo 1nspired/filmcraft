@@ -184,9 +184,14 @@ pub fn flatten_items(outer: &TrackItem, source_track: &Track, ctx: &mut EditCtx,
         for e in &outer.effects {
             let intrinsic = e.def().is_some_and(|d| d.intrinsic);
             if !intrinsic {
-                it.effects.push(e.clone());
+                let mut copy = e.clone();
+                copy.clear_instance_ids();
+                it.effects.push(copy);
             } else if take_intrinsics && let Some(slot) = it.effects.iter_mut().find(|x| x.effect == e.effect) {
-                *slot = e.clone();
+                let mut copy = e.clone();
+                copy.clear_instance_ids();
+                copy.instance_id = slot.instance_id.clone();
+                *slot = copy;
             }
         }
         out.push(it);

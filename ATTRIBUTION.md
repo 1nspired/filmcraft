@@ -9,6 +9,10 @@ iconography, images or other Adobe assets; open licences only; every asset attri
 
 | Asset | Author | Source | Licence |
 |---|---|---|---|
+| `crates/ui-egui/src/i18n/de.tsv` | FilmCraft contributors; Poema fork contributors | Original interface translations with Poema product labels | MIT OR Apache-2.0 |
+| `crates/ui-egui/src/i18n/zh-cn.tsv` | FilmCraft contributors; Poema fork contributors | Original interface translations with Poema product labels | MIT OR Apache-2.0 |
+| `crates/ui-egui/src/i18n/ja.tsv` | FilmCraft contributors; Poema fork contributors | Original interface translations with Poema product labels | MIT OR Apache-2.0 |
+| `crates/ui-egui/src/i18n/es.tsv` | FilmCraft contributors; Poema fork contributors | Original interface translations with Poema product labels | MIT OR Apache-2.0 |
 | `crates/ui-egui/src/i18n/it.tsv` | FilmCraft contributors | Original work: clean-room Italian interface translations | MIT OR Apache-2.0 |
 | `crates/ui-egui/src/i18n/id.tsv` | FilmCraft contributors | Original work: clean-room Indonesian interface translations | MIT OR Apache-2.0 |
 | `crates/ui-egui/src/i18n/ko.tsv` | FilmCraft contributors | Original work: clean-room Korean interface translations | MIT OR Apache-2.0 |
@@ -108,6 +112,7 @@ is traced or derived from Adobe artwork.
 | Asset | Where |
 |---|---|
 | UI icons (tools, transport, panels, header) | `crates/ui-egui/src/icons.rs`: vector paths on a 16×16 grid |
+| Poema wordmark and native application icon | `crates/ui-egui/src/brand.rs`: original generic caesura geometry and text drawn for this fork; MIT OR Apache-2.0. No upstream brand artwork or traced third-party geometry; this code attribution does not grant rights to third-party trademarks. |
 | Source and Program range braces and trim hover cues | `crates/ui-egui/src/panels/monitor.rs` and `source_range.rs`: original generic vector shapes by FilmCraft contributors, MIT OR Apache-2.0; no third-party artwork |
 | Align / distribute / paragraph-alignment glyphs in the graphics panel | `crates/ui-egui/src/panels/graphics.rs` (`align_glyph`): bars and lines drawn with the egui painter |
 | Demo footage (ocean sunset, aurora, city night, dunes, forest, plasma), bars and tone, counting leader, colour matte | `crates/media/src/generators.rs` |
@@ -131,23 +136,11 @@ carry each font's licence as `OFL-<family>.txt`.
 | Shippori Mincho Regular (FONTDASU) | Japanese fallback for serif titles (native builds) | OFL-1.1 |
 | BIZ UDMincho Regular (Morisawa) | Japanese fallback for serif titles (native builds) | OFL-1.1 |
 
-## First-party brand marks
+## Upstream brand assets excluded
 
-The ArtCraft name, wordmark and logos are trademarks of the ArtCraft Team. They are not open source and
-are not covered by the project licence; they may be used only unmodified and only in the context of
-FilmCraft, under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt). Forks and modified versions must
-remove them (AGENTS.md §1.8).
-
-| File | Author | Source | Licence |
-|---|---|---|---|
-| `docs/brand/artcraft-logo-white.png` | ArtCraft Team | Original work: first-party ArtCraft brand mark (ArtCraft wordmark, light ink for dark backgrounds) | ArtCraft trademark, not open source; `docs/brand/LICENSE-brand.txt` (not MIT/Apache) |
-| `docs/brand/artcraft-logo-white.svg` | ArtCraft Team | Original work: first-party ArtCraft brand mark (ArtCraft wordmark, light ink for dark backgrounds) | ArtCraft trademark, not open source; `docs/brand/LICENSE-brand.txt` (not MIT/Apache) |
-| `docs/brand/artcraft-logo.png` | ArtCraft Team | Original work: first-party ArtCraft brand mark (ArtCraft wordmark (symbol + "ARTCRAFT"), dark ink for light backgrounds) | ArtCraft trademark, not open source; `docs/brand/LICENSE-brand.txt` (not MIT/Apache) |
-| `docs/brand/artcraft-logo.svg` | ArtCraft Team | Original work: first-party ArtCraft brand mark (ArtCraft wordmark (symbol + "ARTCRAFT"), dark ink for light backgrounds) | ArtCraft trademark, not open source; `docs/brand/LICENSE-brand.txt` (not MIT/Apache) |
-| `docs/brand/artcraft-mark-black.png` | ArtCraft Team | Original work: first-party ArtCraft brand mark (ArtCraft symbol ("A" mark), black) | ArtCraft trademark, not open source; `docs/brand/LICENSE-brand.txt` (not MIT/Apache) |
-| `docs/brand/artcraft-mark-black.svg` | ArtCraft Team | Original work: first-party ArtCraft brand mark (ArtCraft symbol ("A" mark), black) | ArtCraft trademark, not open source; `docs/brand/LICENSE-brand.txt` (not MIT/Apache) |
-| `docs/brand/artcraft-mark.png` | ArtCraft Team | Original work: first-party ArtCraft brand mark (ArtCraft symbol ("A" mark), blue) | ArtCraft trademark, not open source; `docs/brand/LICENSE-brand.txt` (not MIT/Apache) |
-| `docs/brand/artcraft-mark.svg` | ArtCraft Team | Original work: first-party ArtCraft brand mark (ArtCraft symbol ("A" mark), blue) | ArtCraft trademark, not open source; `docs/brand/LICENSE-brand.txt` (not MIT/Apache) |
+The ArtCraft logo and wordmark assets are excluded from this modified Poema checkout.
+Their original notice is retained in `docs/brand/LICENSE-brand.txt` for provenance.
+FilmCraft source, contributor credits and applicable license notices remain attributed.
 
 ## Third-party source code
 

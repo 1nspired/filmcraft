@@ -1,7 +1,7 @@
 //! Community and project links (Help menu, About dialog, header Discord button, Home screen).
 //!
-//! FilmCraft is part of the ArtCraft family: the community lives on the ArtCraft Discord, every
-//! app has a page on the ArtCraft website and a public GitHub repository.
+//! Poema source and issue links identify this fork. The retained engine community and website
+//! links are explicitly labeled upstream; their presence does not imply endorsement.
 
 /// The app's short name, used in the website and repository URLs.
 pub const APP: &str = "filmcraft";
@@ -12,18 +12,18 @@ pub const DISCORD: &str = "https://discord.gg/artcraft";
 pub const WEBSITE: &str = "https://getartcraft.com";
 /// FilmCraft's page on the ArtCraft website.
 pub const APP_PAGE: &str = "https://getartcraft.com/apps/filmcraft";
-/// FilmCraft's source repository.
-pub const GITHUB: &str = "https://github.com/storytold/filmcraft";
-/// New issue on FilmCraft's repository.
-pub const ISSUES: &str = "https://github.com/storytold/filmcraft/issues";
+/// Poema source repository.
+pub const GITHUB: &str = "https://github.com/1nspired/poema";
+/// New issue on Poema's repository.
+pub const ISSUES: &str = "https://github.com/1nspired/poema/issues";
 
 /// (command id, label, url) for every link, in menu order.
 pub const ALL: [(&str, &str, &str); 5] = [
-    ("help.discord", "Join the ArtCraft Discord…", DISCORD),
-    ("help.website", "ArtCraft Website", WEBSITE),
-    ("help.appPage", "FilmCraft on getartcraft.com", APP_PAGE),
-    ("help.github", "FilmCraft on GitHub", GITHUB),
-    ("help.reportIssue", "Report an Issue…", ISSUES),
+    ("help.discord", "FilmCraft upstream community…", DISCORD),
+    ("help.website", "FilmCraft engine website", WEBSITE),
+    ("help.appPage", "About the FilmCraft engine", APP_PAGE),
+    ("help.github", "Poema source code", GITHUB),
+    ("help.reportIssue", "Report a Poema issue…", ISSUES),
 ];
 
 /// A link the web browser couldn't open (`ui.failedLink`): the address and the reason.
@@ -49,7 +49,7 @@ pub fn menu_hint(command: &str) -> Option<String> {
         match command {
             "help.revealLogFiles" => tl!("Saves this session's log and shows it in your file manager."),
             "help.systemCompatibilityReport" => tl!("Shows a report on this computer."),
-            "app.about" => tl!("Shows the version, community links and credits in a FilmCraft window."),
+            "app.about" => tl!("Shows the Poema version, upstream links and native-editor credits."),
             _ => return None,
         }
         .to_string(),
@@ -125,9 +125,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn urls_follow_the_artcraft_scheme() {
+    fn fork_source_and_upstream_links_are_distinct() {
         assert_eq!(APP_PAGE, format!("{WEBSITE}/apps/{APP}"));
-        assert_eq!(GITHUB, format!("https://github.com/storytold/{APP}"));
+        assert_eq!(GITHUB, "https://github.com/1nspired/poema");
+        assert_eq!(ISSUES, format!("{GITHUB}/issues"));
         assert!(ALL.iter().all(|(id, _, u)| id.starts_with("help.") && u.starts_with("https://")));
         assert_eq!(url_for("help.discord"), Some(DISCORD));
         assert_eq!(url_for("help.nope"), None);

@@ -87,6 +87,7 @@ pub fn source_command(id: &str) -> bool {
                 | "markers.clearCurrent"
                 | "markers.clearAll"
                 | "markers.edit"
+                | "markers.remove"
         )
 }
 
@@ -96,17 +97,7 @@ pub const SOURCE_HISTORY_MAX: usize = 20;
 /// Keep the Source monitor's recent clips in step with the clip it shows: the open clip moves to
 /// the front, items no longer in the project drop out.
 pub(crate) fn track_history(s: &mut Session) {
-    let current = s.state.source_item;
-    let project = &s.project;
-    let history = &mut s.state.source_history;
-    history.retain(|i| project.item(*i).is_some());
-    if let Some(cur) = current.filter(|i| project.item(*i).is_some())
-        && history.first() != Some(&cur)
-    {
-        history.retain(|i| *i != cur);
-        history.insert(0, cur);
-    }
-    history.truncate(SOURCE_HISTORY_MAX);
+    crate::editor_state::track_source_history(&s.project, &mut s.state);
 }
 
 /// Enablement of Close / Close All: a clip is open in the Source monitor.
@@ -186,10 +177,7 @@ pub(crate) fn route(s: &mut Session, id: &str, p: &Value) -> Result<Option<Value
             }
         }
         "markers.add" => {
-            let time = match p.get("time") {
-                None => cursor,
-                Some(v) => Tick(v.as_i64().ok_or_else(|| bad(id, "time must be integer ticks"))?),
-            };
+            let time = crate::marker_ops::position(p, view.rate, id)?.unwrap_or(cursor);
             if time < view.start || time >= view.end {
                 return Err(bad(id, "marker time is outside the Source clip"));
             }
@@ -198,12 +186,15 @@ pub(crate) fn route(s: &mut Session, id: &str, p: &Value) -> Result<Option<Value
             let comment = text(p, "comment", id)?.unwrap_or_default().to_string();
             let color = color(p, id)?.unwrap_or(Label::Green);
             let root = view.media;
+            let next = crate::project_ids::allocation_start(&s.project, 1)?;
+            crate::marker_ops::valid_span(time, duration, id)?;
             let marker = s.edit("Add Source Marker", |pr, _| {
-                if pr.next_id == u64::MAX {
-                    return Err(bad(id, "project ids are exhausted"));
-                }
+                pr.next_id = next;
                 let marker = MarkerId(pr.alloc_id());
                 let list = marker_list(pr, root)?;
+                if list.len() >= crate::marker_ops::MAX_MARKERS {
+                    return Err(bad(id, "marker inventory exceeds 100000"));
+                }
                 list.push(Marker { id: marker, start: time, duration, name, comment, color, kind: MarkerKind::Comment });
                 list.sort_by_key(|m| m.start);
                 Ok(marker)
@@ -222,27 +213,12 @@ pub(crate) fn route(s: &mut Session, id: &str, p: &Value) -> Result<Option<Value
             })?;
         }
         "markers.edit" => {
-            let marker = MarkerId(p.get("marker").and_then(Value::as_u64).ok_or_else(|| bad(id, "need marker id"))?);
-            let name = text(p, "name", id)?.map(str::to_string);
-            let comment = text(p, "comment", id)?.map(str::to_string);
-            let color = color(p, id)?;
-            let duration = if p.get("durationFrames").is_some() { Some(duration(p, &view, id)?) } else { None };
-            s.edit("Edit Source Marker", |pr, _| {
-                let m = marker_list(pr, view.media)?.iter_mut().find(|m| m.id == marker).ok_or_else(|| bad(id, "no such Source marker"))?;
-                if let Some(name) = name {
-                    m.name = name;
-                }
-                if let Some(comment) = comment {
-                    m.comment = comment;
-                }
-                if let Some(color) = color {
-                    m.color = color;
-                }
-                if let Some(d) = duration {
-                    m.duration = d.min(Tick(view.end.0.saturating_sub(m.start.0)));
-                }
-                Ok(())
-            })?;
+            let patch = crate::marker_ops::Patch::parse(p, view.rate)?;
+            s.edit("Edit Source Marker", |pr, _| patch.apply(marker_list(pr, view.media)?, Some((view.start, view.end))))?;
+        }
+        "markers.remove" => {
+            let marker = s.edit("Remove Source Marker", |pr, _| crate::marker_ops::remove(marker_list(pr, view.media)?, p))?;
+            return Ok(Some(json!({"removed":marker.0})));
         }
         _ => return Err(bad(id, "unsupported Source command")),
     }
@@ -277,13 +253,12 @@ fn color(p: &Value, id: &str) -> Result<Option<Label>> {
     crate::commands::marker_color_p(p, id)
 }
 fn duration(p: &Value, view: &crate::clip_ops::SourceView, id: &str) -> Result<Tick> {
-    let Some(v) = p.get("durationFrames") else { return Ok(Tick::ZERO) };
-    let f = v.as_i64().ok_or_else(|| bad(id, "durationFrames must be an integer"))?;
+    let duration = crate::marker_ops::duration(p, view.rate, Tick::ZERO, id)?;
     let span = view.end.0.saturating_sub(view.start.0).max(0);
-    if f < 0 || f > view.rate.frame_at(Tick(span)) {
+    if duration.0 > span {
         return Err(bad(id, "marker duration is outside the Source clip"));
     }
-    Ok(view.rate.tick_of(f))
+    Ok(duration)
 }
 
 #[cfg(test)]

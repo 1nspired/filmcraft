@@ -287,6 +287,39 @@ level 4 High tier, which many hardware decoders refuse; it is now level 4.1 Main
 
 ## Tests
 
+### MXF AVC decoder-registry routing (local integration experiment, 2026-10-19)
+
+The codecs layer now adapts MXF's Annex B AVC packets into four-byte
+length-prefixed packets and supplies their first access unit's SPS/PPS as an
+`avcC` sample entry to the existing registry. The encoded NAL payloads and
+presentation timestamps are unchanged. This lets MXF use the same hardware
+settings, backend selection and `HybridDecoder` fallback policy as MP4/MOV.
+No OS FFI, codec implementation or linked dependency was added.
+
+`tests/mxf_videotoolbox.rs` compares generated 10-bit 4:2:2 AVC MXF against
+ffmpeg, bit-for-bit in all three planes, including fresh random seeks. It
+also checks that Hardware Decoding Off does not secretly use hardware.
+`FILMCRAFT_REQUIRE_MXF_HARDWARE=1` makes lack of a working hardware path a
+failure instead of a skip. The optional `FILMCRAFT_MXF_SAMPLE=/absolute/file.MXF`
+check streams a local camera file and compares its first three native-resolution
+frames against ffmpeg; no camera media is bundled or uploaded.
+
+Measured on the Poema integration Mac: the synthetic test passed with hardware
+required; three real Canon EOS R5 C XF-AVC 10-bit 4:2:2 clips, including a
+5.03 GB spanned file, passed their first-three-frame comparisons exactly.
+The native application also passed a short 3840×2160 ProRes 422 10-bit export
+from a camera original with linked audio, widget-driven trim/undo and
+save/reopen. These are correctness checks, not sustained-playback benchmarks.
+
+Limitations: a decoder still needs compatible hardware; the software H.264
+decoder still does not implement 10-bit / 4:2:2. MXF access units must be at
+most 64 MiB / 4096 NAL units; parameter sets must fit avcC's count/length
+fields. Missing initial SPS/PPS retains the legacy software Annex B path.
+In-band parameter changes keep the existing hybrid fallback behavior, which
+can fail when the software decoder does not support the stream. Windows and
+Linux behavior has not been measured for this change. No parity percentage
+is raised by these local tests.
+
 | test | what |
 |---|---|
 | `tests/videotoolbox.rs` (macOS) | H.264 High, HEVC Main (open GOP: CRA + RASL) and HEVC Main 10, 640×360 (coded 368: cropping) with B-frames: every picture **bit-exact** with our software decoder, same pts order, count, colour and aspect, also after `reset` + reseek to every later sync sample, mid-stream `flush`, and a full pass after resets; forced mid-stream failures (`VtDecoder::fail_after`) at five points continue with the software decoder's exact output; seeded mutation of samples and parameter sets (bit flips, truncation, corrupt length prefixes) never panics or hangs; HEVC 4:2:2 10-bit is bit-exact with ffmpeg's decode |

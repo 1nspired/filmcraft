@@ -7,6 +7,17 @@ kerning and ligatures, bidi, line breaking, all drawn as vectors in linear light
 
 ## Model
 
+Native pin graphs resolve iteratively, including long chains and paint-order-independent
+cycle handling. The shared alignment/distribution planner compensates for pin-target movement,
+including unselected intermediate layers, then verifies selected bounds before publication.
+Group alignment does not translate a selected pinned follower twice. Position keyframes use
+the native graphic design clock. Human pin authoring validates target indices, edge names,
+locks, identity ambiguity and cycles before one edit; fresh UID allocation preserves maximum
+IDs and dangling references. Poema's guarded layout adapter reads complete pin constraints
+and uses the same prepared pin service for pin/unpin and pinned layout. It requires exact
+persistent targets and a complete pin-basis hash. Responsive/rolling/shared-source design
+and ambiguous UID graphs remain outside this admitted workflow.
+
 - A graphic clip's project item is an `ItemKind::Graphic { width, height, rate }`: a transparent
   canvas the size of the sequence frame, with unlimited duration. These items are internal and do
   not appear in the Project panel.
@@ -113,6 +124,27 @@ Without `clip`, commands use the selected graphic clip, else the topmost graphic
 playhead. Without `layer`, they use the selected layer, else the front one. New graphic clips are
 placed at the playhead on the first video track above the clips there that is free for the
 duration (a track is added if needed).
+
+### Explicit targets and exact creation duration
+
+A supplied layer must be a valid unsigned integer index or an existing layer name.
+Malformed values cannot select layer zero or fall back to the current selection.
+New text/shape with an explicit missing or nongraphic clip returns an error;
+creating a separate text clip remains explicit through \`newClip: true\`.
+A locked explicitly requested placement track refuses creation. Failed gestures
+preserve the project, editor state, revision, Undo, Redo and merge ownership.
+Omitted targets retain the human selection/playhead defaults. The existing
+out-of-range placement-track fallback is retained for human compatibility;
+Poema's typed authoring path must validate its explicit destination before use.
+
+All new text/shape creation commands also accept exactly one duration format:
+\`seconds\` (the existing UI input and native rounding), \`durationFrames\`
+(a positive integer resolved by the native sequence rate), or \`durationTicks\`
+(positive native integer ticks exactly on a frame boundary). Omitting all three
+keeps the five-second default. Exact inputs reject malformed values, overflow,
+non-frame-aligned ticks and conflicting duration formats. Placement \`time\`,
+\`frame\` and \`timecode\` remain separate from duration. Adding a layer to an
+existing clip preserves that clip's duration.
 
 ## Program monitor
 
@@ -265,3 +297,129 @@ solid fill colour.
 
 Mask-with-text, per-layer blend modes, Bézier curves in the pen tool (paths are polygons), media
 layers inside graphics, and template controls grouped into folders.
+
+## Guarded graphics authoring
+
+The shared native layout service is prepared before publication. Align and
+distribute commands accept optional nonnegative integer `time` in native ticks;
+omission uses the playhead, and evaluation retains the human endpoint clamp.
+Neither path seeks. Explicit layer lists must be nonempty, bounded, unique and
+entirely valid. `graphics.align` accepts either a graphic `clip` plus `layers`,
+or ordinary-video `clips` (exclusive with `clip`) with frame/group/selection
+alignment. Every target is checked, including locks and finite geometry, before
+one native history step. Invalid supplied options never choose a default.
+Distribution remains a layer operation on one graphic. The internal prepared
+plan exposes its expected project for guarded collateral checks and rejects
+later native project/sequence changes; it is not a new raw model executor.
+Typed assistant layout routing and full resource/shared-source workflows remain
+separate work. These development changes have not been adopted in the live app.
+
+The geometry read extension accepts
+`target: {kind: "geometry", identity: observedClipIdentity, frame: sequenceFrame}`
+on the same unused scoped read ticket, with the existing offset/limit paging.
+It requires `graphicsGeometry` and echoes the exact evaluation target. Native
+layout uses the human `graphics.list` evaluator at that frame, clamped to the
+clip's endpoints, without moving the playhead. Results include persistent layer
+IDs, native quads/local bounds, positions, scale, paragraph boxes and native
+overflow flags in graphic-canvas coordinates before clip Motion/effects. They
+do not certify final sequence pixels, fonts, resource freshness or source
+perception, and do not replace authored reads required before editing. This
+extension is in development; exact application qualification/adoption and the
+remaining layout/resource workflows are separate acceptance.
+
+The native Poema boundary provides agent.readGraphics with a fresh token,
+explicit scope, target, offset and limit. For authored reads, target is either
+\`{kind:"clips"}\` or \`{kind:"layers",identity:<persistent clip identity>}\`.
+Pages contain at most 16 rows and 64 KiB; request smaller pages for full layer
+parameters. All pages share collectionSha256 covering the complete authored
+collection, including unpaged layers, processing, masks, keys, native clocks,
+canvas declarations and shared-source owner data. Headers include native canvas
+dimensions/rate, labels and lock/protection state. Names and authored text are
+data. projection:true validates current document identity without observing
+original files, and returns requiresSourceValidation:true.
+
+Private agent.editGraphics is accepted only inside one exact agent.apply with
+explicit scope, beforeGraphicsSha256 and one typed edit. It supports create,
+add_layer, set, delete_layer and reorder_layer. Text and shape content use the
+existing native constructors; create requires a native video track ID, absolute
+sequence frame and durationFrames. Existing targets require both current clip
+number and persistent identity; layers require persistent effect identities.
+Reordering names the persistent layer to place before, or explicit null for the
+front/end. Static property edits use canonical definition IDs at an explicit
+sequence frame and preserve existing animation through the human service.
+
+The boundary refuses unknown fields, wrong/stale identities, unavailable/locked
+tracks, protected clips, overlapping creation, clamped properties, unsafe clocks
+and no-op gestures. It preserves unrelated project content and one native history
+step. Document-state publication changes no source declarations or original
+admission evidence. Native readback is authored-state verification; Program output
+and perception remain separate evidence.
+
+Explicit agent.createSequence inherits effect tracking only from an already
+opted-in parent sequence. An untracked parent produces an untracked child;
+graphics inventory reads never enable tracking. Native regressions cover both
+states, unchanged parent content, graphics authoring, owned Undo/Redo and saved
+project decoding.
+
+The isolated Poema adapter now registers filmcraft_read_graphics and
+filmcraft_edit_graphics through the shared family lifecycle. Generated fixture
+transport admits the same bounded graphics queries and human comparison commands.
+Host/native tests cover registered readback, Program picture and sound, cold
+history recovery, navigation, lost/malformed replies, Stop and offline authored
+state. This is component evidence, not combined application qualification or
+adoption. Shared-source graphics, font/resource admission, templates, rich
+character styles, layout and explicit animation remain unfinished.
+
+Existing adopted films can have clip identities without effect identities.
+Private agent.editGraphics also accepts the explicit enable_tracking gesture,
+which calls the human poema.trackEffects service. It requires an already
+clip-tracked sequence and refuses repeated setup. Its full-project audit permits
+only the active sequence's effect-tracking flag and previously missing effect/mask
+identity carriers; authored parameters, clips, sources, other sequences and editor
+state remain unchanged. The common native batch owns publication and history.
+Reads never perform setup. The graphicsTracking capability advertises this
+complete contract; the collection digest includes the tracking state, and receipts
+bind before/after tracking independently from nullable graphic target references.
+The normal composer can prepare an untracked film, reread, then create/edit its
+title within the editor's ordinary Send. Identity preparation has one owned native
+Undo step and survives saved recovery; it does not represent a picture/sound edit.
+
+### Guarded native layout boundary
+
+The registered `agent.readGraphicsLayout` reads complete-digest clip headers or
+persistent graphic-layer indices on the same explicit workspace/ticket. It uses
+16-row pages and returns no rendered-pixel or source-perception certificate. Its
+digest includes the whole project, not just graphic layers or the current page.
+Ordinary video headers include source dimensions, rational pixel aspect and the
+single native Motion identity when unambiguous. Reading never prepares IDs.
+
+Private `agent.layoutGraphics` accepts one align-layers, distribute-layers or
+align-clips gesture inside exact `agent.apply`. Explicit persistent targets and
+native sequence frames feed the existing prepared human layout operation; its
+whole-project result must match before publication. The common transaction owns
+one Undo step, cancellation and durable receipts. No arbitrary registry execution
+or second geometry engine is added. All 4,096 native targets may be named within
+the bounded request; there is no hidden 64-layer limit.
+
+Target pins adds authored targets, edge flags/offsets and shared-native graph diagnostics.
+Its complete constraint hash is required by pin_layer/unpin_layer and pinned layout.
+Missing/cyclic constraints may be explicitly repaired, while layout needs a valid graph.
+Human pin preparation and explicit native frames are shared; no renderer or geometry
+implementation is added in JavaScript. Shared-source and responsive/rolling graphic
+design, typography/resources and full-family acceptance remain unfinished. The source
+component does not update a running editor.
+
+The production composer now exposes scoped layout read/edit through the shared
+registered family coordinator. Layout has a separate whole-project digest and
+readback domain; its indices do not authorize ordinary graphics property writes.
+Native `index:true` reads a complete compact reference group (up to 4,096, at most
+2 MiB) while ordinary header pages remain small. It avoids per-page model loops
+and the separate 64-row full-parameter cache. The graphicsLayoutIndex capability
+advertises this read-only extension. Public group selectors explicitly name all
+layers of one graphic or all non-graphic video clips; blocked members refuse
+rather than silently disappear. Native services still own every geometry/time
+calculation and one-step owned history. Saved reopen, later human work, Stop and
+uncertain replies retain the existing coordinator rules. Source and Program
+evidence remain separate from authored layout. Exact release/adoption, full
+responsive/rolling/shared-source design, resources and full graphics parity remain
+unfinished.

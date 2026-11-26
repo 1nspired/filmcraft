@@ -574,6 +574,23 @@ fn lock_is_stale(dir: &Path) -> bool {
     }
 }
 
+// A complete native companion is never an empty leftover, including a crash
+// between the two journal representations or a damaged legacy snapshot.
+fn native_companion_exists(directory: &Path) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        match fs::symlink_metadata(directory.join(crate::agent_bridge::NATIVE_JOURNAL_FILE)) {
+            Ok(_) => true,
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = directory;
+        false
+    }
+}
+
 /// Find snapshots of sessions that are no longer running. Stale session directories without a
 /// snapshot (nothing unsaved) are removed. `skip` is the caller's own session directory.
 pub fn scan_candidates(data_dir: &Path, skip: Option<&Path>) -> Vec<RecoveryCandidate> {
@@ -585,7 +602,7 @@ pub fn scan_candidates(data_dir: &Path, skip: Option<&Path>) -> Vec<RecoveryCand
             continue;
         }
         let snap = dir.join(SNAPSHOT);
-        if !snap.is_file() {
+        if !snap.is_file() && !native_companion_exists(&dir) {
             // Empty leftover dirs (clean exit, or a crash before the first snapshot).
             let _ = fs::remove_dir_all(&dir);
             continue;
@@ -639,6 +656,8 @@ struct Snapshot {
     project: Arc<Project>,
     revision: u64,
     path: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    native: Option<std::result::Result<Box<crate::agent_bridge::NativeJournalPending>, String>>,
 }
 
 enum Msg {
@@ -649,6 +668,8 @@ enum Msg {
     Prefs(AutoSavePrefs),
     AutoSaveNow(Sender<Result<PathBuf, String>>),
     Flush(Sender<()>),
+    WorkspacePause(Sender<()>),
+    WorkspaceResume,
     Stop,
 }
 
@@ -674,6 +695,7 @@ pub enum WorkerEvent {
     SavedProject {
         path: String,
         revision: u64,
+        sha256: String,
     },
     Error(String),
 }
@@ -742,6 +764,7 @@ impl Persistence {
             last_change: Instant::now(),
             next_autosave: Instant::now(),
             meta: JournalMeta { pid, started_unix: started, generator: filmcraft_format::generator(), ..Default::default() },
+            workspace_paused: false,
         };
         w.next_autosave = Instant::now() + w.autosave_interval();
         let thread = std::thread::Builder::new().name("filmcraft-autosave".into()).spawn(move || w.run(rx))?;
@@ -759,8 +782,31 @@ impl Persistence {
         })
     }
 
+    #[cfg(target_arch = "wasm32")]
     pub(crate) fn send_dirty(&self, project: Arc<Project>, revision: u64, path: Option<String>) {
-        let _ = self.tx.send(Msg::Dirty(Snapshot { project, revision, path }));
+        let _ = self.tx.send(Msg::Dirty(Snapshot {
+            project,
+            revision,
+            path,
+            #[cfg(not(target_arch = "wasm32"))]
+            native: None,
+        }));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn send_dirty_native(
+        &self,
+        project: Arc<Project>,
+        revision: u64,
+        path: Option<String>,
+        native: std::result::Result<Option<crate::agent_bridge::NativeJournalPending>, String>,
+    ) {
+        let native = match native {
+            Ok(Some(p)) => Some(Ok(Box::new(p))),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        };
+        let _ = self.tx.send(Msg::Dirty(Snapshot { project, revision, path, native }));
     }
 
     pub(crate) fn send_clean(&self) {
@@ -769,6 +815,37 @@ impl Persistence {
 
     pub fn set_prefs(&self, p: AutoSavePrefs) {
         let _ = self.tx.send(Msg::Prefs(p));
+    }
+
+    /// Acknowledge only after earlier I/O settles. Stop/deadline failure queues
+    /// Resume behind Pause, so a late acknowledgement cannot strand saving.
+    pub(crate) fn pause_workspace(&self, mut check: impl FnMut() -> Result<(), String>) -> Result<(), String> {
+        check()?;
+        let (tx, rx) = channel();
+        self.tx.send(Msg::WorkspacePause(tx)).map_err(|_| "auto-save worker stopped before update pause".to_string())?;
+        loop {
+            if let Err(error) = check() {
+                let _ = self.resume_workspace();
+                return Err(error);
+            }
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(()) => {
+                    if let Err(error) = check() {
+                        let _ = self.resume_workspace();
+                        return Err(error);
+                    }
+                    return Ok(());
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    let _ = self.resume_workspace();
+                    return Err("auto-save update pause was not acknowledged".into());
+                }
+            }
+        }
+    }
+    pub(crate) fn resume_workspace(&self) -> Result<(), String> {
+        self.tx.send(Msg::WorkspaceResume).map_err(|_| "auto-save worker stopped before update cancellation".into())
     }
 
     /// Write any pending journal now and wait for it.
@@ -822,7 +899,7 @@ impl Persistence {
         self.stop_worker();
         let snap = self.session_dir.join(SNAPSHOT);
         self.lock.take();
-        if snap.is_file() {
+        if snap.is_file() || native_companion_exists(&self.session_dir) {
             if let Some(mut m) = fs::read(self.session_dir.join(META)).ok().and_then(|b| serde_json::from_slice::<JournalMeta>(&b).ok()) {
                 m.clean_exit = true;
                 let _ = filmcraft_format::atomic_write(&self.session_dir.join(META), &serde_json::to_vec_pretty(&m).unwrap_or_default());
@@ -888,6 +965,7 @@ struct Worker {
     last_change: Instant,
     next_autosave: Instant,
     meta: JournalMeta,
+    workspace_paused: bool,
 }
 
 impl Worker {
@@ -906,7 +984,8 @@ impl Worker {
 
     fn run(mut self, rx: Receiver<Msg>) {
         loop {
-            let due = [self.journal_due(), self.prefs.enabled.then_some(self.next_autosave)].into_iter().flatten().min();
+            let due =
+                if self.workspace_paused { None } else { [self.journal_due(), self.prefs.enabled.then_some(self.next_autosave)].into_iter().flatten().min() };
             let msg = match due {
                 Some(d) => match rx.recv_timeout(d.saturating_duration_since(Instant::now())) {
                     Ok(m) => Some(m),
@@ -942,7 +1021,13 @@ impl Worker {
                     }
                 }
                 Some(Msg::AutoSaveNow(reply)) => {
-                    let r = if self.latest.is_some() { self.auto_save() } else { Err(String::new()) };
+                    let r = if self.workspace_paused {
+                        Err("workspace update has paused automatic saving".into())
+                    } else if self.latest.is_some() {
+                        self.auto_save()
+                    } else {
+                        Err(String::new())
+                    };
                     let _ = reply.send(r);
                 }
                 Some(Msg::Flush(ack)) => {
@@ -952,7 +1037,20 @@ impl Worker {
                     let _ = ack.send(());
                 }
                 Some(Msg::Stop) => return,
+                Some(Msg::WorkspacePause(ack)) => {
+                    self.workspace_paused = true;
+                    // Preserve private crash recovery while canonical project
+                    // and auto-save ring writes are fenced for handoff.
+                    if self.journal_due().is_some() {
+                        self.write_journal();
+                    }
+                    let _ = ack.send(());
+                }
+                Some(Msg::WorkspaceResume) => self.workspace_paused = false,
                 None => {}
+            }
+            if self.workspace_paused {
+                continue;
             }
             let now = Instant::now();
             if self.journal_due().is_some_and(|d| d <= now) {
@@ -988,6 +1086,12 @@ impl Worker {
         // Snapshot first, then the meta that makes it a candidate.
         let r = filmcraft_format::atomic_write(&self.session_dir.join(SNAPSHOT), &bytes)
             .and_then(|_| filmcraft_format::atomic_write(&self.session_dir.join(META), &serde_json::to_vec_pretty(&meta).unwrap_or_default()));
+        #[cfg(not(target_arch = "wasm32"))]
+        let r = r.and_then(|_| match &s.native {
+            Some(Ok(native)) => native.write(&self.session_dir, &bytes).map_err(|e| io::Error::other(format!("complete native journal: {e}"))),
+            Some(Err(error)) => Err(io::Error::other(format!("complete native journal capture: {error}"))),
+            None => Ok(()),
+        });
         let write_ms = t1.elapsed().as_secs_f64() * 1000.0;
         match r {
             Ok(()) => {
@@ -1007,6 +1111,8 @@ impl Worker {
     fn clear_journal(&mut self) {
         let _ = fs::remove_file(self.session_dir.join(META));
         let _ = fs::remove_file(self.session_dir.join(SNAPSHOT));
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = fs::remove_file(self.session_dir.join(crate::agent_bridge::NATIVE_JOURNAL_FILE));
         self.journaled = 0;
     }
 
@@ -1041,7 +1147,11 @@ impl Worker {
                 {
                     match filmcraft_format::atomic_write(Path::new(p), &bytes) {
                         Ok(()) => {
-                            let _ = self.events.send(WorkerEvent::SavedProject { path: p.clone(), revision: s.revision });
+                            let _ = self.events.send(WorkerEvent::SavedProject {
+                                path: p.clone(),
+                                revision: s.revision,
+                                sha256: crate::saved_file::sha256(&bytes),
+                            });
                         }
                         Err(e) => self.error(format!("saving {p}: {e}")),
                     }

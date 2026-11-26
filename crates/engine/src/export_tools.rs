@@ -228,7 +228,7 @@ pub fn settings_from_params(s: &Session, p: &Value, cmd: &str) -> Result<(Option
     if let Some(v) = bool_p(p, "audio") {
         settings.include_audio = v;
     }
-    if let Some(v) = u64_p(p, "quality") {
+    if let Some(v) = u64_p(p, "quality")? {
         settings.quality = v.min(100) as u8;
     }
     if let Some(v) = crate::commands::checked_u32_p(p, "bitrateKbps", cmd)? {
@@ -289,7 +289,7 @@ pub fn settings_from_params(s: &Session, p: &Value, cmd: &str) -> Result<(Option
     if let Some(v) = str_p(p, "audioCodec") {
         settings.audio.codec = serde_json::from_value(json!(v)).map_err(|_| bad(cmd, "audioCodec: auto | aac | pcm | flac"))?;
     }
-    if let Some(v) = u64_p(p, "flacLevel") {
+    if let Some(v) = u64_p(p, "flacLevel")? {
         settings.audio.flac_level = v.min(8) as u8;
     }
     if let Some(v) = str_p(p, "mxfVideoCodec") {
@@ -325,7 +325,7 @@ pub fn settings_from_params(s: &Session, p: &Value, cmd: &str) -> Result<(Option
 
 /// The sequence an export command targets (`sequence` param, else the active one).
 pub fn sequence_param(s: &Session, p: &Value, cmd: &str) -> Result<ItemId> {
-    match u64_p(p, "sequence") {
+    match u64_p(p, "sequence")? {
         Some(id) => {
             let id = ItemId(id);
             s.project.sequence(id).map(|_| id).ok_or_else(|| bad(cmd, "no such sequence"))
@@ -715,7 +715,7 @@ pub fn pump_queue(s: &mut Session, wait: bool) {
 }
 
 fn queue_item_p(s: &Session, p: &Value, cmd: &str) -> Result<usize> {
-    let id = u64_p(p, "id").ok_or_else(|| bad(cmd, "need `id` (see export.queue.list)"))?;
+    let id = u64_p(p, "id")?.ok_or_else(|| bad(cmd, "need `id` (see export.queue.list)"))?;
     s.export_queue.items.iter().position(|i| i.id == id).ok_or_else(|| bad(cmd, format!("no queued export {id}")))
 }
 
@@ -927,14 +927,21 @@ fn resolve(s: &mut Session, p: &Value) -> Result<Value> {
     let project = s.project.clone();
     settings.range = range_param(s, &project, seq, p.get("range"), p, cmd)?;
     settings.path = output_path(s, p, seq, &settings, None);
+    describe_export(s, seq, &settings, preset.as_ref().map(|p| p.name.as_str()))
+}
+
+/// One settings/range description for the human export panel and typed native hosts.
+/// This does not create directories, files or an encoder job.
+pub(crate) fn describe_export(s: &Session, seq: ItemId, settings: &ExportSettings, preset: Option<&str>) -> Result<Value> {
+    let project = &s.project;
     let q = project.sequence(seq).ok_or(EngineError::NoSequence)?;
-    let range = filmcraft_export::export_range(&project, seq, &settings).map_err(|e| EngineError::Other(e.to_string()))?;
+    let range = filmcraft_export::export_range(project, seq, settings).map_err(|e| EngineError::Other(e.to_string()))?;
     let (w, h, rate, sr) = (q.settings.width, q.settings.height, q.settings.frame_rate, q.settings.sample_rate);
     let r = settings.resolve(w, h, rate, sr);
     let (f0, f1) = filmcraft_export::frame_span(r.rate, range);
     let summary = settings.summary(w, h, rate, sr, range.duration);
     Ok(json!({
-        "preset": preset.map(|x| x.name),
+        "preset": preset,
         "settings": settings,
         "range": {"start": range.start.0, "duration": range.duration.0, "seconds": range.duration.seconds()},
         "frames": f1 - f0,

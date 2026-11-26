@@ -404,7 +404,7 @@ fn others(s: &Session, skip: ItemId, old: &str, new: &str, o: &MatchOptions) -> 
 
 /// `media.relink`: link `item` to `path` (checked unless `force`), then the others.
 pub fn relink(s: &mut Session, p: &Value) -> Result<Value> {
-    let item = u64_p(p, "item").map(ItemId).ok_or_else(|| bad("media.relink", "need `item`"))?;
+    let item = u64_p(p, "item")?.map(ItemId).ok_or_else(|| bad("media.relink", "need `item`"))?;
     let path = str_p(p, "path").ok_or_else(|| bad("media.relink", "need `path`"))?.to_string();
     let force = bool_p(p, "force").unwrap_or(false);
     let o = MatchOptions::from_params(p);
@@ -508,7 +508,7 @@ pub fn search(s: &Session, p: &Value) -> Result<Value> {
     let folder = str_p(p, "folder").ok_or_else(|| bad("media.search", "need `folder`"))?;
     let exact = bool_p(p, "exactName").unwrap_or(true);
     let o = MatchOptions::from_params(p);
-    let items: Vec<ItemId> = match u64_p(p, "item") {
+    let items: Vec<ItemId> = match u64_p(p, "item")? {
         Some(i) => vec![ItemId(i)],
         None => scan(&s.project, &s.media, &*s.services).into_iter().filter(|m| m.status == "missing").map(|m| ItemId(m.item)).collect(),
     };
@@ -538,9 +538,9 @@ pub fn search(s: &Session, p: &Value) -> Result<Value> {
 
 /// `media.makeOffline {items?, deleteFiles?}`.
 pub fn make_offline(s: &mut Session, p: &Value) -> Result<Value> {
-    let items: Vec<ItemId> = match p.get("items").and_then(Value::as_array) {
-        Some(a) => a.iter().filter_map(Value::as_u64).map(ItemId).collect(),
-        None => u64_p(p, "item").map(|i| vec![ItemId(i)]).unwrap_or_else(|| s.state.project_selection.clone()),
+    let items: Vec<ItemId> = match crate::commands::ids_p(p, "items")? {
+        Some(ids) => ids.into_iter().map(ItemId).collect(),
+        None => u64_p(p, "item")?.map(|i| vec![ItemId(i)]).unwrap_or_else(|| s.state.project_selection.clone()),
     };
     let files: Vec<(ItemId, String)> = items
         .iter()
@@ -626,7 +626,7 @@ pub fn commands() -> Vec<CommandSpec> {
             params: r#"{"item":id?}"#,
             enabled: always,
             run: |s, p| {
-                let ids: Vec<ItemId> = match u64_p(p, "item") {
+                let ids: Vec<ItemId> = match u64_p(p, "item")? {
                     Some(i) => vec![ItemId(i)],
                     None => s.project.items.values().filter(|i| i.as_media().is_some()).map(|i| i.id).collect(),
                 };

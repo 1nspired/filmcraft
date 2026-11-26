@@ -18,6 +18,13 @@ Options:
   --no-recover       start without asking about unsaved changes
   --data-dir <dir>   folder for auto-save, crash recovery and logs
                      (also: FILMCRAFT_DATA_DIR)
+  --poema-composer <json>  embed the bound shared Poema composer (macOS)
+  --workspace-update <json>  managed native update startup, initially paused
+                     (requires --control and an explicit --data-dir; no files)
+  --project-create <json>  create a new empty Root project, initially paused\n                     (requires --control and explicit new --data-dir; no files)\n  --project-recovery <json>  restore an exact complete Root snapshot, paused
+                     (requires --control and explicit --data-dir; no files)
+  --identity-recovery <json>  restore an exact native identity decision, paused
+                     (requires --control and an explicit --data-dir; no files)
   --graphics <mode>  start with this graphics mode and keep it: default,
                      dx12 (Windows), software (Windows, Linux);
                      `--graphics default` undoes an automatic fallback
@@ -28,7 +35,7 @@ Options:
 /// What the command line asks for.
 #[derive(Debug, PartialEq)]
 pub enum Cli {
-    Run(Launch),
+    Run(Box<Launch>),
     Help,
     Version,
 }
@@ -47,6 +54,12 @@ pub struct Launch {
     pub data_dir: Option<std::path::PathBuf>,
     /// `--graphics <mode>`: start with this graphics mode and keep it (see `graphics.rs`).
     pub graphics: Option<crate::graphics::Mode>,
+    /// Private managed startup descriptor, never an automatic project fallback.
+    pub workspace_update: Option<String>,
+    pub identity_recovery: Option<String>,
+    pub project_recovery: Option<String>,
+    pub project_create: Option<String>,
+    pub poema_composer: Option<filmcraft_ui_egui::composer_panel::Binding>,
 }
 
 /// Parse the arguments after the program name. `env_control_port` is the value of
@@ -70,6 +83,11 @@ pub fn parse(env_control_port: Option<String>, args: impl IntoIterator<Item = Os
         recover: None,
         data_dir: None,
         graphics: None,
+        workspace_update: None,
+        identity_recovery: None,
+        project_recovery: None,
+        project_create: None,
+        poema_composer: None,
     };
     let (mut help, mut version) = (false, false);
     let mut args = args.into_iter();
@@ -89,6 +107,46 @@ pub fn parse(env_control_port: Option<String>, args: impl IntoIterator<Item = Os
             "--recover" => l.recover = Some(true),
             "--no-recover" => l.recover = Some(false),
             "--data-dir" => l.data_dir = Some(args.next().map(PathBuf::from).ok_or("--data-dir needs a folder")?),
+            "--poema-composer" => {
+                if l.poema_composer.is_some() {
+                    return Err("repeated --poema-composer".into());
+                }
+                let raw = args.next().ok_or("--poema-composer needs a workspace binding")?;
+                let text = raw.to_str().ok_or("Poema composer binding must be UTF-8")?;
+                l.poema_composer = Some(filmcraft_ui_egui::composer_panel::Binding::parse(text)?);
+            }
+            "--project-create" => {
+                if l.project_create.is_some() {
+                    return Err("repeated --project-create".into());
+                }
+                let raw = args.next().ok_or("--project-create needs a new project descriptor")?;
+                let text = raw.to_str().filter(|v| !v.is_empty() && v.len() <= 16384).ok_or("invalid bounded project creation descriptor")?;
+                l.project_create = Some(text.into());
+            }
+            "--project-recovery" => {
+                if l.project_recovery.is_some() {
+                    return Err("repeated --project-recovery".into());
+                }
+                let raw = args.next().ok_or("--project-recovery needs a complete native snapshot descriptor")?;
+                let text = raw.to_str().filter(|v| !v.is_empty() && v.len() <= 16384).ok_or("invalid bounded project recovery descriptor")?;
+                l.project_recovery = Some(text.into());
+            }
+            "--identity-recovery" => {
+                if l.identity_recovery.is_some() {
+                    return Err("repeated --identity-recovery".into());
+                }
+                let raw = args.next().ok_or("--identity-recovery needs a native descriptor")?;
+                let text = raw.to_str().filter(|v| !v.is_empty() && v.len() <= 16384).ok_or("invalid bounded native identity descriptor")?;
+                l.identity_recovery = Some(text.into());
+            }
+            "--workspace-update" => {
+                if l.workspace_update.is_some() {
+                    return Err("repeated --workspace-update".into());
+                }
+                let raw = args.next().ok_or("--workspace-update needs a native descriptor")?;
+                let text = raw.to_str().filter(|v| !v.is_empty() && v.len() <= 16384).ok_or("invalid bounded native update descriptor")?;
+                l.workspace_update = Some(text.into());
+            }
             "--graphics" => {
                 let name = args.next().ok_or("--graphics needs a mode: default, dx12 or software")?;
                 l.graphics = Some(graphics_mode(&name.to_string_lossy())?);
@@ -115,7 +173,41 @@ pub fn parse(env_control_port: Option<String>, args: impl IntoIterator<Item = Os
     if l.control_input_only && l.control_port.is_none() {
         return Err("--control-input-only requires --control or FILMCRAFT_CONTROL_PORT".into());
     }
-    Ok(Cli::Run(l))
+    if [l.workspace_update.is_some(), l.identity_recovery.is_some(), l.project_recovery.is_some(), l.project_create.is_some()]
+        .into_iter()
+        .filter(|v| *v)
+        .count()
+        > 1
+    {
+        return Err("choose one explicit native startup descriptor".into());
+    }
+    if l.workspace_update.is_some() || l.identity_recovery.is_some() || l.project_recovery.is_some() || l.project_create.is_some() {
+        if l.control_port.is_none()
+            || l.control_input_only
+            || l.data_dir.as_ref().is_none_or(|p| !p.is_absolute())
+            || !l.files.is_empty()
+            || l.startup_flag
+            || l.recover == Some(true)
+        {
+            return Err("managed update requires --control and an absolute --data-dir, with no project/demo/empty/recover fallback".into());
+        }
+        l.demo = false;
+        l.startup_flag = true;
+        l.recover = Some(false);
+    }
+    if let Some(binding) = &l.poema_composer
+        && (l.control_port.is_none()
+            || l.control_input_only
+            || l.recover == Some(true)
+            || l.workspace_update.is_none()
+                && l.identity_recovery.is_none()
+                && l.project_recovery.is_none()
+                && l.project_create.is_none()
+                && (l.files.len() != 1 || l.files.first() != Some(&binding.project_path) || l.startup_flag))
+    {
+        return Err("embedded composer requires its exact explicit project and control port; no recovery/demo or control-input-only fallback".into());
+    }
+    Ok(Cli::Run(Box::new(l)))
 }
 
 /// Whether a launch file is a FilmCraft project. The extension's case does not matter: Windows file
@@ -165,7 +257,7 @@ mod tests {
 
     fn launch(args: &[&str]) -> Launch {
         match parse_args(args) {
-            Ok(Cli::Run(l)) => l,
+            Ok(Cli::Run(l)) => *l,
             other => panic!("{args:?} should start the app, got {other:?}"),
         }
     }
@@ -214,10 +306,10 @@ mod tests {
         }
         // unset or empty: no control server
         assert_eq!(launch(&[]).control_port, None);
-        assert_eq!(parse_env(Some(""), &[]), Ok(Cli::Run(launch(&[]))));
-        assert_eq!(parse_env(Some("  "), &[]), Ok(Cli::Run(launch(&[]))));
+        assert_eq!(parse_env(Some(""), &[]), Ok(Cli::Run(Box::new(launch(&[])))));
+        assert_eq!(parse_env(Some("  "), &[]), Ok(Cli::Run(Box::new(launch(&[])))));
         // a good one is the default
-        assert_eq!(parse_env(Some("1234"), &[]), Ok(Cli::Run(Launch { control_port: Some(1234), ..launch(&[]) })));
+        assert_eq!(parse_env(Some("1234"), &[]), Ok(Cli::Run(Box::new(Launch { control_port: Some(1234), ..launch(&[]) }))));
         assert_eq!(parse_env(Some("1234"), &["--control", "9"]).map(|c| matches!(c, Cli::Run(l) if l.control_port == Some(9))), Ok(true));
     }
 
@@ -234,7 +326,12 @@ mod tests {
                 startup_flag: false,
                 recover: None,
                 data_dir: None,
-                graphics: None
+                graphics: None,
+                workspace_update: None,
+                identity_recovery: None,
+                project_recovery: None,
+                project_create: None,
+                poema_composer: None,
             }
         );
         let l = launch(&["--control", "9876", "--empty", "--no-recover", "--data-dir", "/tmp/fc", "cut.fcproj", "a.mp4"]);
@@ -246,6 +343,30 @@ mod tests {
         // `--` ends the options; a lone `-` and macOS' process serial number are not options
         assert_eq!(launch(&["--", "--odd name.mov", "-h"]).files, ["--odd name.mov", "-h"]);
         assert_eq!(launch(&["-", "-psn_0_12345"]).files, ["-"]);
+    }
+
+    #[test]
+    fn managed_update_startup_has_no_project_demo_or_recovery_fallback() {
+        let descriptor = r#"{"workspace":"native-only-descriptor"}"#;
+        let directory = std::env::temp_dir().join("generated-native-update").to_string_lossy().into_owned();
+        let l = launch(&["--control", "9876", "--data-dir", &directory, "--workspace-update", descriptor]);
+        assert_eq!(l.workspace_update.as_deref(), Some(descriptor));
+        assert!(!l.demo);
+        assert!(l.startup_flag);
+        assert_eq!(l.recover, Some(false));
+        assert!(l.files.is_empty());
+        for args in [
+            vec!["--workspace-update", descriptor],
+            vec!["--control", "9876", "--workspace-update", descriptor],
+            vec!["--control", "9876", "--data-dir", "relative", "--workspace-update", descriptor],
+            vec!["--control", "9876", "--data-dir", "/tmp/generated", "--workspace-update", descriptor, "cut.fcproj"],
+            vec!["--control", "9876", "--data-dir", "/tmp/generated", "--workspace-update", descriptor, "--demo"],
+            vec!["--control", "9876", "--data-dir", "/tmp/generated", "--workspace-update", descriptor, "--empty"],
+            vec!["--control", "9876", "--data-dir", "/tmp/generated", "--workspace-update", descriptor, "--recover"],
+            vec!["--control", "9876", "--data-dir", "/tmp/generated", "--workspace-update", descriptor, "--workspace-update", descriptor],
+        ] {
+            assert!(parse_env(None, &args).is_err(), "{args:?}");
+        }
     }
 
     /// `std::env::args` panics on an argument that is not Unicode, so such a file name (Latin-1 on
@@ -299,7 +420,7 @@ mod tests {
         assert!(!launch(&["--control", "9876"]).control_input_only);
         assert!(parse_args(&["--control-input-only"]).is_err());
         assert!(launch(&["--control-input-only", "--control", "9876"]).control_input_only);
-        assert!(matches!(parse_env(Some("9876"), &["--control-input-only"]), Ok(Cli::Run(Launch { control_input_only: true, control_port: Some(9876), .. }))));
+        assert!(matches!(parse_env(Some("9876"), &["--control-input-only"]), Ok(Cli::Run(l)) if l.control_input_only && l.control_port == Some(9876)));
         assert_eq!(parse_args(&["--control-input-only", "--help"]), Ok(Cli::Help));
         assert!(USAGE.contains("--control-input-only"));
     }
@@ -321,5 +442,114 @@ mod tests {
         assert!(parse_args(&["--graphics", "DEFAULT"]).is_err());
         assert!(parse_args(&["--graphics", &"x".repeat(1 << 16)]).is_err());
         assert!(USAGE.contains("--graphics"));
+    }
+    #[test]
+    fn embedded_composer_requires_one_exact_saved_project_and_control_port() {
+        let binding = serde_json::json!({"version":1,"httpPort":55117,"workspaceId":"b2113e8d-8fe4-42e2-9561-a8f39d427d61",
+            "projectId":"p_test","projectPath":"/generated/Film.fcproj","applicationRelease":"a".repeat(64)})
+        .to_string();
+        let parsed = launch(&["--control", "9876", "--no-recover", "--poema-composer", &binding, "/generated/Film.fcproj"]);
+        assert_eq!(parsed.poema_composer.unwrap().project_id, "p_test");
+        for arguments in [
+            vec!["--poema-composer", &binding, "/generated/Film.fcproj"],
+            vec!["--control", "9876", "--poema-composer", &binding, "/other.fcproj"],
+            vec!["--control", "9876", "--poema-composer", &binding, "/generated/Film.fcproj", "more.mov"],
+            vec!["--control", "9876", "--recover", "--poema-composer", &binding, "/generated/Film.fcproj"],
+            vec!["--control", "9876", "--control-input-only", "--poema-composer", &binding, "/generated/Film.fcproj"],
+            vec!["--control", "9876", "--poema-composer", &binding, "--poema-composer", &binding, "/generated/Film.fcproj"],
+        ] {
+            assert!(parse_args(&arguments).is_err());
+        }
+        assert!(parse_args(&["--poema-composer"]).is_err());
+        assert!(parse_args(&["--control", "9876", "--poema-composer", "{bad", "/generated/Film.fcproj"]).is_err());
+    }
+    #[test]
+    fn identity_recovery_startup_is_bounded_exclusive_and_has_no_file_or_demo_fallback() {
+        let descriptor = r#"{"workspace":"native-identity-descriptor"}"#;
+        let directory = std::env::temp_dir().join("generated-identity-recovery").to_string_lossy().into_owned();
+        let parsed = launch(&["--control", "9876", "--data-dir", &directory, "--identity-recovery", descriptor]);
+        assert_eq!(parsed.identity_recovery.as_deref(), Some(descriptor));
+        assert!(!parsed.demo);
+        assert!(parsed.startup_flag);
+        assert_eq!(parsed.recover, Some(false));
+        assert!(parsed.files.is_empty());
+        for args in [
+            vec!["--identity-recovery", descriptor],
+            vec!["--control", "9876", "--identity-recovery", descriptor],
+            vec!["--control", "9876", "--data-dir", "relative", "--identity-recovery", descriptor],
+            vec!["--control", "9876", "--data-dir", &directory, "--identity-recovery", descriptor, "cut.fcproj"],
+            vec!["--control", "9876", "--data-dir", &directory, "--identity-recovery", descriptor, "--empty"],
+            vec!["--control", "9876", "--data-dir", &directory, "--identity-recovery", descriptor, "--demo"],
+            vec!["--control", "9876", "--data-dir", &directory, "--identity-recovery", descriptor, "--recover"],
+            vec!["--control", "9876", "--data-dir", &directory, "--identity-recovery", descriptor, "--workspace-update", descriptor],
+            vec!["--control", "9876", "--data-dir", &directory, "--identity-recovery", descriptor, "--identity-recovery", descriptor],
+            vec!["--control", "9876", "--data-dir", &directory, "--identity-recovery", descriptor, "--control-input-only"],
+        ] {
+            assert!(parse(None, args.into_iter().map(Into::into)).is_err());
+        }
+        for text in ["".into(), "x".repeat(16385)] {
+            assert!(parse(None, ["--control", "9876", "--data-dir", &directory, "--identity-recovery", &text].into_iter().map(Into::into)).is_err());
+        }
+    }
+    #[test]
+    fn complete_project_recovery_cli_requires_explicit_exclusive_managed_startup_without_file_or_sequence_fallback() {
+        let directory = std::env::temp_dir().join("generated-project-recovery").to_string_lossy().into_owned();
+        let args = ["--control", "9876", "--data-dir", &directory, "--project-recovery", "{}"];
+        let l = launch(&args);
+        assert_eq!(l.project_recovery.as_deref(), Some("{}"));
+        assert!(!l.demo);
+        assert!(l.startup_flag);
+        assert_eq!(l.recover, Some(false));
+        assert!(l.files.is_empty());
+        for extra in [
+            vec!["--identity-recovery", "{}"],
+            vec!["--workspace-update", "{}"],
+            vec!["--project-recovery", "{}"],
+            vec!["--empty"],
+            vec!["--demo"],
+            vec!["--recover"],
+            vec!["film.fcproj"],
+            vec!["--control-input-only"],
+        ] {
+            let mut bad = args.to_vec();
+            bad.extend(extra);
+            assert!(parse_args(&bad).is_err());
+        }
+        assert!(parse_args(&["--project-recovery", "{}"]).is_err());
+        assert!(parse_args(&["--control", "9876", "--data-dir", "relative", "--project-recovery", "{}"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod project_creation_tests {
+    use super::*;
+    #[test]
+    fn creation_cli_has_no_project_recovery_demo_or_existing_file_fallback() {
+        let base = ["--control", "9876", "--data-dir", "/generated/new-state", "--project-create", "{}"];
+        let Cli::Run(l) = parse(None, base.into_iter().map(Into::into)).unwrap() else { panic!("run expected") };
+        assert_eq!(l.project_create.as_deref(), Some("{}"));
+        assert!(!l.demo);
+        assert!(l.startup_flag);
+        assert_eq!(l.recover, Some(false));
+        assert!(l.files.is_empty());
+        for extra in [
+            vec!["--project-create", "{}"],
+            vec!["--project-recovery", "{}"],
+            vec!["--identity-recovery", "{}"],
+            vec!["--workspace-update", "{}"],
+            vec!["old.fcproj"],
+            vec!["--recover"],
+            vec!["--demo"],
+            vec!["--empty"],
+            vec!["--control-input-only"],
+        ] {
+            let args = base.into_iter().chain(extra);
+            assert!(parse(None, args.map(Into::into)).is_err());
+        }
+        assert!(parse(None, ["--project-create", "{}"].into_iter().map(Into::into)).is_err());
+        assert!(parse(None, ["--control", "9876", "--data-dir", "relative", "--project-create", "{}"].into_iter().map(Into::into)).is_err());
+        for raw in [String::new(), "x".repeat(16385)] {
+            assert!(parse(None, ["--control", "9876", "--data-dir", "/generated/new", "--project-create", &raw].into_iter().map(Into::into)).is_err());
+        }
     }
 }

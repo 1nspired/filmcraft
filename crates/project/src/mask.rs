@@ -376,6 +376,9 @@ impl TrackMethod {
 /// A mask on an effect instance.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Mask {
+    /// Optional identity scoped by the owning clip and effect (schema v17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     pub name: String,
     /// `ParamValue::Path`.
     pub path: Param,
@@ -399,6 +402,7 @@ pub const MASK_PARAMS: [&str; 4] = ["path", "feather", "opacity", "expansion"];
 impl Mask {
     pub fn new(name: impl Into<String>, path: MaskPath) -> Self {
         Self {
+            instance_id: None,
             name: name.into(),
             path: Param::new(ParamValue::Path(path)),
             feather: Param::new(ParamValue::Float(10.0)),

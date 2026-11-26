@@ -70,8 +70,8 @@ fn scopes_read(s: &mut Session, p: &Value) -> Result<Value> {
             .collect::<Result<_>>()?,
         None => ScopeKind::ALL.to_vec(),
     };
-    let columns = u64_p(p, "columns").unwrap_or(8).clamp(1, 512) as usize;
-    let npeaks = u64_p(p, "peaks").unwrap_or(8).clamp(1, 64) as usize;
+    let columns = u64_p(p, "columns")?.unwrap_or(8).clamp(1, 512) as usize;
+    let npeaks = u64_p(p, "peaks")?.unwrap_or(8).clamp(1, 64) as usize;
     let bins = bool_p(p, "bins").unwrap_or(true);
     let sig = scope_signal(s, t, scale, hdr).ok_or(crate::EngineError::NoSequence)?;
     let mut out = json!({

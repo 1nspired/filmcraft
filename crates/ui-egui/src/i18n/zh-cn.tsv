@@ -1,4 +1,5 @@
 # Chinese (zh-CN) catalog. Columns, separated by a TAB:  context <TAB> source <TAB> translation
+	Poema notes & protection…	Poema 注释与保护…
 #
 #   context  空          普通界面字符串；`source` 是代码中的英文文本（`tl!("…")`、`i18n::t` 翻译的
 #                         菜单标签或名称）。译文为简体中文。
@@ -9,7 +10,7 @@
 # 净室实现：每条译文均由英文含义直接译出，使用通用的中文视频剪辑术语（剪辑、时间轴、序列、
 #   轨道、关键帧……）。未参考或复制任何专有本地化资源、字符串表或产品界面。产品与技术名称
 #   （FilmCraft、ArtCraft、Lumetri、ProRes、LUFS……）保留原文拼写。
-	About FilmCraft	关于 FilmCraft
+	About Poema NLE	关于 Poema NLE
 	Add Audio Submix Track	添加音频子混音轨道
 	Add Caption at Playhead	在播放头处添加字幕
 	Add Chapter Marker…	添加章节标记…
@@ -35,7 +36,7 @@
 	Apply Default Transitions to Selection	对所选对象应用默认过渡
 	Apply Video Transition	应用视频过渡
 	Arrange	排列
-	ArtCraft Website	ArtCraft 官网
+	FilmCraft engine website	FilmCraft 引擎网站
 	Assembly	组装
 	Attach Proxies…	附加代理文件…
 	Audio Channels…	音频声道…
@@ -128,9 +129,9 @@
 	File	文件
 	File…	文件…
 	Fill frame	填满帧
-	FilmCraft Help…	FilmCraft 帮助…
-	FilmCraft on GitHub	GitHub 上的 FilmCraft
-	FilmCraft on getartcraft.com	getartcraft.com 上的 FilmCraft
+	Native editor reference…	原生编辑器参考资料…
+	Poema source code	Poema 源代码
+	About the FilmCraft engine	关于 FilmCraft 引擎
 	Find Next	查找下一个
 	Find…	查找…
 	Fit	适配
@@ -174,7 +175,7 @@
 	Insert Frame Hold Segment	插入帧定格片段
 	Install Motion Graphics Template…	安装动态图形模板…
 	Interpret Footage…	解释素材…
-	Join the ArtCraft Discord…	加入 ArtCraft Discord…
+	FilmCraft upstream community…	FilmCraft 上游社区…
 	Keyboard Shortcuts…	键盘快捷键…
 	Label	标签
 	Labels…	标签…
@@ -268,7 +269,7 @@
 	Render Selection	渲染所选对象
 	Replace Fonts in Projects…	替换项目中的字体…
 	Replace With Clip	替换为剪辑
-	Report an Issue…	报告问题…
+	Report a Poema issue…	报告 Poema 问题…
 	Reset All Parameters	重置所有参数
 	Reset Duration	重置持续时间
 	Reset to Saved Layout	重置为已保存的布局
@@ -3219,7 +3220,7 @@
 	QuickTime, ProRes 4444 (4:4:4) with alpha channel, 24-bit 48 kHz PCM	QuickTime，ProRes 4444 (4:4:4)，带 Alpha 通道，24 位 48 kHz PCM
 	QuickTime, ProRes 4444 XQ (4:4:4), 24-bit 48 kHz PCM	QuickTime，ProRes 4444 XQ (4:4:4)，24 位 48 kHz PCM
 	QuickTime, ProRes 422, 24-bit 48 kHz PCM	QuickTime，ProRes 422，24 位 48 kHz PCM
-	Quit FilmCraft	退出 FilmCraft
+	Quit Poema NLE	退出 Poema NLE
 	Rate Stretch Tool	速率伸缩工具
 	Razor Tool	剃刀工具
 	Rectangle Tool	矩形工具
@@ -3592,3 +3593,15 @@
 	Open a sequence to search its graphics	打开序列以搜索其中的图形
 	No text graphics in this sequence. Add text with the Type tool.	此序列中没有文本图形。请用文字工具添加文本。
 	No matching text.	没有匹配的文本。
+	Hide Poema NLE	隐藏 Poema NLE
+	Agent-led film editing. Native editor based on FilmCraft.	智能体主导的影片剪辑。原生编辑器基于 FilmCraft。
+	Project and upstream links	项目与上游链接
+	FilmCraft upstream community (discord.gg/artcraft)	FilmCraft 上游社区（discord.gg/artcraft）
+	Shows the Poema version, upstream links and native-editor credits.	显示 Poema 版本、上游链接和原生编辑器贡献者信息。
+	Poema NLE hit an error	Poema NLE 遇到错误
+	Native editor: MIT OR Apache-2.0. Fonts: Inter, Noto Serif and JetBrains Mono (SIL OFL 1.1).	原生编辑器：MIT 或 Apache-2.0。字体：Inter、Noto Serif 和 JetBrains Mono（SIL OFL 1.1）。
+	Poema	Poema
+
+	Move Up	上移
+
+	Move Down	下移

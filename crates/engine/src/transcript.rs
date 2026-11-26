@@ -80,14 +80,17 @@ fn media_item(s: &Session, item: ItemId) -> Option<ItemId> {
     s.project.resolve_media(item).map(|(root, _, _)| root)
 }
 
-fn ids_p(p: &Value, k: &str) -> Option<Vec<ItemId>> {
-    p.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(ItemId).collect())
+fn ids_p(p: &Value, k: &str) -> Result<Option<Vec<ItemId>>> {
+    Ok(crate::commands::ids_p(p, k)?.map(|ids| ids.into_iter().map(ItemId).collect()))
 }
 
 /// Items to transcribe: `items` / `item`, else the Project panel selection, else the media of the
 /// active sequence's enabled audio clips. Subclips resolve to their media; duplicates are removed.
-fn targets(s: &Session, p: &Value) -> Vec<ItemId> {
-    let mut raw = ids_p(p, "items").or_else(|| u64_p(p, "item").map(|i| vec![ItemId(i)])).unwrap_or_default();
+fn targets(s: &Session, p: &Value) -> Result<Vec<ItemId>> {
+    let mut raw = match ids_p(p, "items")? {
+        Some(ids) => ids,
+        None => u64_p(p, "item")?.map(|i| vec![ItemId(i)]).unwrap_or_default(),
+    };
     if raw.is_empty() {
         raw = s.state.project_selection.clone();
     }
@@ -104,7 +107,7 @@ fn targets(s: &Session, p: &Value) -> Vec<ItemId> {
             out.push(m);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Mono 16 kHz audio of a media item (None: no audio).
@@ -145,7 +148,7 @@ fn transcriber(s: &Session, p: &Value) -> Result<Arc<dyn Transcriber>> {
 }
 
 fn generate(s: &mut Session, p: &Value) -> Result<Value> {
-    let items = targets(s, p);
+    let items = targets(s, p)?;
     if items.is_empty() {
         return Err(bad("transcript.generate", "nothing to transcribe (pass `items`, select clips, or open a sequence with audio)"));
     }
@@ -159,7 +162,7 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
             None => default_language,
         },
         diarize: bool_p(p, "diarize").unwrap_or(ma.speaker_labeling != "off"),
-        max_speakers: u64_p(p, "maxSpeakers").map(|n| n.clamp(1, 32) as usize).unwrap_or(Options::default().max_speakers),
+        max_speakers: u64_p(p, "maxSpeakers")?.map(|n| n.clamp(1, 32) as usize).unwrap_or(Options::default().max_speakers),
     };
     let mut done: Vec<(ItemId, Transcript)> = Vec::new();
     let mut skipped = Vec::new();
@@ -189,7 +192,7 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
-    let item = u64_p(p, "item").map(ItemId).ok_or_else(|| bad("transcript.set", "`item` is required"))?;
+    let item = u64_p(p, "item")?.map(ItemId).ok_or_else(|| bad("transcript.set", "`item` is required"))?;
     let item = media_item(s, item).ok_or_else(|| bad("transcript.set", "no such media item"))?;
     let v = p.get("transcript").cloned().ok_or_else(|| bad("transcript.set", "`transcript` is required"))?;
     let mut t: Transcript = serde_json::from_value(v).map_err(|e| bad("transcript.set", e.to_string()))?;
@@ -207,7 +210,11 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn delete(s: &mut Session, p: &Value) -> Result<Value> {
-    let items: Vec<ItemId> = match ids_p(p, "items").or_else(|| u64_p(p, "item").map(|i| vec![ItemId(i)])) {
+    let explicit = match ids_p(p, "items")? {
+        Some(ids) => Some(ids),
+        None => u64_p(p, "item")?.map(|i| vec![ItemId(i)]),
+    };
+    let items: Vec<ItemId> = match explicit {
         Some(v) => v.into_iter().filter_map(|i| media_item(s, i)).collect(),
         None => s.project.transcripts.keys().copied().collect(),
     };
@@ -272,8 +279,8 @@ fn search(s: &mut Session, p: &Value) -> Result<Value> {
 /// Timeline range of the words `from..=to` (frame-snapped outward).
 fn range_p(s: &Session, p: &Value, cmd: &str) -> Result<TimeRange> {
     let words = sequence_words(s);
-    let from = u64_p(p, "from").ok_or_else(|| bad(cmd, "`from` (word index) is required"))? as usize;
-    let to = u64_p(p, "to").map(|n| n as usize).unwrap_or(from);
+    let from = u64_p(p, "from")?.ok_or_else(|| bad(cmd, "`from` (word index) is required"))? as usize;
+    let to = u64_p(p, "to")?.map(|n| n as usize).unwrap_or(from);
     tx::word_range(&words, from, to, s.sequence_rate()).ok_or_else(|| bad(cmd, format!("word index out of range (the transcript has {} words)", words.len())))
 }
 
@@ -313,7 +320,7 @@ fn extract_or_lift(s: &mut Session, p: &Value, extract: bool) -> Result<Value> {
 
 fn rename_speaker(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad("transcript.renameSpeaker", "`name` is required"))?.to_string();
-    let item = u64_p(p, "item").map(ItemId).and_then(|i| media_item(s, i));
+    let item = u64_p(p, "item")?.map(ItemId).and_then(|i| media_item(s, i));
     // `speaker`: the current name (every transcript), or an index (needs `item`)
     let (old_name, index) = match p.get("speaker") {
         Some(Value::String(n)) => (Some(n.clone()), None),
@@ -379,8 +386,8 @@ fn create_captions(s: &mut Session, p: &Value) -> Result<Value> {
     let words = sequence_words(s);
     let d = CaptionRules::default();
     let rules = CaptionRules {
-        max_chars: u64_p(p, "maxChars").map(|n| n as usize).unwrap_or(d.max_chars),
-        lines: u64_p(p, "lines").map(|n| n as usize).unwrap_or(d.lines),
+        max_chars: u64_p(p, "maxChars")?.map(|n| n as usize).unwrap_or(d.max_chars),
+        lines: u64_p(p, "lines")?.map(|n| n as usize).unwrap_or(d.lines),
         min_duration: f64_p(p, "minSeconds").map(Tick::from_seconds_f64).unwrap_or(d.min_duration),
         max_duration: f64_p(p, "maxSeconds").map(Tick::from_seconds_f64).unwrap_or(d.max_duration),
         gap_frames: p.get("gapFrames").and_then(Value::as_i64).unwrap_or(d.gap_frames),

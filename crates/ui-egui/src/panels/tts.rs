@@ -162,7 +162,7 @@ fn poll(app: &mut FilmcraftApp) {
 
 /// The selected narration clip and its item, if any.
 fn selected_narration(app: &FilmcraftApp) -> Option<(ClipId, u64)> {
-    let clip = filmcraft_engine::narration::target_clip(&app.session, &serde_json::Value::Null)?;
+    let clip = filmcraft_engine::narration::target_clip(&app.session, &serde_json::Value::Null).ok().flatten()?;
     let item = app.session.active_sequence()?.find_item(clip)?.1.item;
     Some((clip, item.0))
 }

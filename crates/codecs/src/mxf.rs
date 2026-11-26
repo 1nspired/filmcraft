@@ -1,6 +1,6 @@
 //! MXF media source (`filmcraft-mxf` demux, GOP-aware video via [`crate::gop`]).
 //!
-//! - Video: H.264 / AVC-Intra (Annex B byte stream, our decoder), MPEG-2 (D-10 / IMX, XDCAM HD /
+//! - Video: H.264 / AVC-Intra (Annex B adapted to the registered decoder factories), MPEG-2 (D-10 / IMX, XDCAM HD /
 //!   HD422; our decoder), VC-3 (DNxHD/DNxHR) and ProRes through the decoder factories. Other
 //!   codings (JPEG 2000, DV, MPEG-4 visual…) are identified and reported as unsupported; the file
 //!   still opens so its audio can be used.
@@ -21,6 +21,10 @@ use filmcraft_time::{FrameRate, Tick};
 use crate::gop::{GopCache, VideoSamples};
 use crate::video::VideoDecoder;
 use crate::{CodecError, make_video_decoder};
+
+// Match the MXF PCM reader's channel bound, including the combined source that
+// allocates its planes before asking that reader for any individual track.
+const MAX_COMBINED_AUDIO_CHANNELS: u32 = 256;
 
 impl filmcraft_mxf::ByteSource for crate::Src {
     fn len(&self) -> u64 {
@@ -330,19 +334,28 @@ impl MxfSource {
         if let Some(&a0) = atracks.first() {
             let si0 = file.tracks[a0].sound.clone().unwrap_or_default();
             let rate = si0.sample_rate;
-            let mut channels = 0;
+            let mut channels = 0u32;
             for &ai in &atracks {
                 let t = &file.tracks[ai];
                 let Some(si) = t.sound.as_ref() else { continue };
+                if !(1..=MAX_COMBINED_AUDIO_CHANNELS).contains(&si.channels) {
+                    return Err(CodecError::Container(format!(
+                        "MXF: invalid sound track channel count {} (expected 1..={MAX_COMBINED_AUDIO_CHANNELS})",
+                        si.channels
+                    )));
+                }
                 if si.sample_rate != rate {
                     continue;
                 }
+                channels = channels
+                    .checked_add(si.channels)
+                    .filter(|&n| n <= MAX_COMBINED_AUDIO_CHANNELS)
+                    .ok_or_else(|| CodecError::Unsupported(format!("MXF: combined sound channel count exceeds {MAX_COMBINED_AUDIO_CHANNELS}")))?;
                 let (n, d) = t.samples_per_edit_unit();
                 let first = (t.first_edit_unit() as i128 * n as i128 / d.max(1) as i128) as u64;
                 let stored = t.stored_sample_frames().saturating_sub(first);
                 let presented = t.duration.map_or(stored, |du| ((du as i128 * n as i128 / d.max(1) as i128) as u64).min(stored));
                 aframes = aframes.min(presented);
-                channels += si.channels.max(1);
                 combined.push((ai, first));
             }
             let sr = if rate.is_valid() { (rate.num as f64 / rate.den as f64).round() as u32 } else { 48_000 };
@@ -417,6 +430,7 @@ impl VideoSamples for MxfVideo<'_> {
         usize::try_from(t).ok().and_then(|t| self.src.vorder.get(t).copied())
     }
     fn read(&self, i: usize) -> crate::Result<Vec<u8>> {
+        self.check_avc_sample(i)?;
         self.src.file.read_sample(&self.src.bytes, self.track, i).map_err(|e| CodecError::Container(e.to_string()))
     }
     fn make_decoder(&self) -> crate::Result<Box<dyn VideoDecoder>> {
@@ -427,7 +441,7 @@ impl VideoSamples for MxfVideo<'_> {
         let v = self.src.info.video.as_ref().ok_or_else(|| CodecError::Unsupported("no video track".into()))?;
         let (w, h) = (v.width.min(u16::MAX as u32) as u16, v.height.min(u16::MAX as u32) as u16);
         match t.codec {
-            Codec::Avc { .. } => Ok(Box::new(crate::video::H264Decoder::annexb())),
+            Codec::Avc { .. } => crate::annexb_avc::decoder(&self.read(0)?, w, h),
             Codec::Mpeg2 => Ok(Box::new(crate::video::Mpeg2Decoder::new(self.src.mpeg2_header.clone()))),
             Codec::Vc3 => make_video_decoder(&SampleEntry::dnx(FourCc(*b"AVdh"), w, h)),
             Codec::ProRes { profile } => make_video_decoder(&SampleEntry::prores(prores_fourcc(profile), w, h)),
@@ -436,7 +450,69 @@ impl VideoSamples for MxfVideo<'_> {
     }
 }
 
+impl MxfVideo<'_> {
+    fn check_avc_sample(&self, i: usize) -> crate::Result<()> {
+        let track = self.src.file.tracks.get(self.track).ok_or_else(|| CodecError::Container("no MXF video track".into()))?;
+        if matches!(track.codec, Codec::Avc { .. }) && track.samples.get(i).is_some_and(|s| s.size as usize > crate::annexb_avc::MAX_ACCESS_UNIT_BYTES) {
+            return Err(CodecError::Unsupported("MXF AVC access unit exceeds 64 MiB".into()));
+        }
+        Ok(())
+    }
+}
+
 impl MediaSource for MxfSource {
+    fn audio_channel_layout(&self) -> Result<Option<filmcraft_media::SourceAudioLayout>, MediaError> {
+        let Some(audio) = self.info.audio() else { return Ok(None) };
+        let mut tracks = Vec::new();
+        let mut channel = 0u32;
+        for &(index, first) in &self.atracks {
+            let track = self.file.tracks.get(index).ok_or_else(|| MediaError::Decode("MXF audio track disappeared".into()))?;
+            let sound = track.sound.as_ref().ok_or_else(|| MediaError::Decode("MXF sound descriptor is missing".into()))?;
+            let chunk = track.chunks.first().ok_or_else(|| MediaError::Decode("MXF audio essence is missing".into()))?;
+            if !sound.sample_rate.is_valid()
+                || sound.sample_rate.num % sound.sample_rate.den != 0
+                || sound.sample_rate.num / sound.sample_rate.den != audio.sample_rate as i32
+            {
+                return Err(MediaError::Unsupported("MXF channel layout requires an exact integral sample rate".into()));
+            }
+            tracks.push(filmcraft_media::SourceAudioTrack {
+                track_id: track.track_id,
+                track_number: format!("{:08x}", track.track_number),
+                first_channel: channel,
+                channels: sound.channels,
+                bits: sound.bits,
+                format: match track.sound_format {
+                    filmcraft_mxf::SoundFormat::Pcm => "pcm",
+                    filmcraft_mxf::SoundFormat::Aes3Element => "aes3-element",
+                    _ => return Err(MediaError::Unsupported("MXF sound format has no channel layout".into())),
+                }
+                .into(),
+                wrapping: match track.wrapping {
+                    filmcraft_mxf::Wrapping::Frame => "frame",
+                    filmcraft_mxf::Wrapping::Clip => "clip",
+                }
+                .into(),
+                first_sample: first.to_string(),
+                first_chunk_offset: chunk.offset.to_string(),
+                first_chunk_bytes: chunk.size.to_string(),
+            });
+            channel = channel
+                .checked_add(sound.channels)
+                .filter(|n| *n <= MAX_COMBINED_AUDIO_CHANNELS)
+                .ok_or_else(|| MediaError::Decode("MXF channel layout exceeds its source bound".into()))?;
+        }
+        if channel != audio.channels || tracks.is_empty() {
+            return Err(MediaError::Decode("MXF channel layout disagrees with its combined stream".into()));
+        }
+        Ok(Some(filmcraft_media::SourceAudioLayout {
+            kind: "mxf-pcm-v1".into(),
+            sample_rate: audio.sample_rate,
+            channels: channel,
+            sample_frames: self.aframes.to_string(),
+            tracks,
+        }))
+    }
+
     fn info(&self) -> &MediaInfo {
         &self.info
     }

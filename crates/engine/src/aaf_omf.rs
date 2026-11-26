@@ -70,15 +70,15 @@ fn plan_from(s: &Session, p: &Value, seq: ItemId, cmd: &str, omf: bool) -> Resul
         "mxf" | "opatom" if !omf => (false, true),
         other => return Err(bad(cmd, format!("unknown audio format {other:?} (wav, aiff{})", if omf { "" } else { " or mxf" }))),
     };
-    let sample_rate = u64_p(p, "sampleRate").map(|r| r as u32).unwrap_or(q.settings.sample_rate.max(1));
+    let sample_rate = u64_p(p, "sampleRate")?.map(|r| r as u32).unwrap_or(q.settings.sample_rate.max(1));
     if !(8_000..=192_000).contains(&sample_rate) {
         return Err(bad(cmd, "sampleRate must be 8000–192000"));
     }
-    let bits = u64_p(p, "bitDepth").unwrap_or(16) as u16;
+    let bits = u64_p(p, "bitDepth")?.unwrap_or(16) as u16;
     if bits != 16 && bits != 24 {
         return Err(bad(cmd, "bitDepth must be 16 or 24"));
     }
-    let frames = u64_p(p, "handles").unwrap_or(if omf { 30 } else { 0 }) as i64;
+    let frames = u64_p(p, "handles")?.unwrap_or(if omf { 30 } else { 0 }) as i64;
     Ok(AudioPlan {
         mode,
         aiff,

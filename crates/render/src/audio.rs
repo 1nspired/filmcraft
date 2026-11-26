@@ -223,13 +223,13 @@ fn mix_item(
         // The nested sequence is the clip's source: speed, reverse and clip effects apply to its
         // mix exactly as they do to a media clip's sound.
         let read = |m0: i64, len: usize| Some(nested_mix(project, &q, m0, len, sr, sources, w, live.depth));
-        effected(item, &read, a0, n, sr, w)
+        effected(item, &read, a0, n, sr, w, sources.reuse_audio_state())
     } else {
         let Some(src) = sources.source(item.item) else { return };
         if !src.info().has_audio() {
             return;
         }
-        effected(item, &|m0, len| src.audio_stream(item.audio_stream, m0, len, sr).ok(), a0, n, sr, w)
+        effected(item, &|m0, len| src.audio_stream(item.audio_stream, m0, len, sr).ok(), a0, n, sr, w, sources.reuse_audio_state())
     };
     // gains: clip gain × Volume (keyframed, per 64-sample block) × channel volume × panner
     let clip_gain = db_to_gain(item.gain_db);
@@ -328,9 +328,9 @@ type SourceAudio<'a> = &'a dyn Fn(i64, usize) -> Option<AudioBuffer>;
 
 /// The clip's audio after speed/reverse and clip effects (before clip gain, Volume and Panner) for
 /// timeline samples `[a0, a0 + n)`, `w` channels.
-fn effected(item: &TrackItem, src: SourceAudio, a0: i64, n: usize, sr: u32, w: usize) -> Vec<Vec<f32>> {
+fn effected(item: &TrackItem, src: SourceAudio, a0: i64, n: usize, sr: u32, w: usize, reuse: bool) -> Vec<Vec<f32>> {
     let read = |x0: i64, len: usize| raw_channels(item, src, x0, len, sr, w);
-    if crate::audio_fx::has_effects(item) { crate::audio_fx::process(item, a0, n, sr, &read) } else { read(a0, n) }
+    if crate::audio_fx::has_effects(item) { crate::audio_fx::process_with_cache(item, a0, n, sr, &read, reuse) } else { read(a0, n) }
 }
 
 /// One clip's own signal for timeline samples `[start, start + frames)` (sequence rate): clip gain
@@ -349,7 +349,7 @@ pub fn clip_signal(item: &TrackItem, start: i64, frames: usize, sr: u32, sources
         let n = (a1 - a0) as usize;
         let off = (a0 - start) as usize;
         let g = db_to_gain(item.gain_db);
-        let buf = effected(item, &|m0, len| src.audio_stream(item.audio_stream, m0, len, sr).ok(), a0, n, sr, 2);
+        let buf = effected(item, &|m0, len| src.audio_stream(item.audio_stream, m0, len, sr).ok(), a0, n, sr, 2, sources.reuse_audio_state());
         for (dst, b) in out.iter_mut().zip(&buf) {
             for (d, x) in dst[off..off + n].iter_mut().zip(b) {
                 *d = x * g;
@@ -415,11 +415,15 @@ fn raw_channels(item: &TrackItem, src: SourceAudio, x0: i64, len: usize, sr: u32
     if buf.channels.is_empty() {
         return out;
     }
+    let selected = source_input_channels(item, buf.channel_count(), w);
+    if selected.is_empty() {
+        return out;
+    }
     if w == 2 {
         // a 5.1 source (or a six-channel pick) folds down with ITU-R BS.775, as the Mix and the
         // Source Monitor do: picking its first two channels would drop C (dialogue) and surrounds
-        if let Some(six) = source_51_fold(item, buf.channel_count()) {
-            let picked: Vec<&[f32]> = six.iter().filter_map(|&c| buf.channels.get(c).map(Vec::as_slice)).collect();
+        if selected.len() == 6 {
+            let picked: Vec<&[f32]> = selected.iter().filter_map(|&c| buf.channels.get(c).map(Vec::as_slice)).collect();
             let conv = chans::convert(&picked, Layout::Surround51, Layout::Stereo, Mixdown::FrontRear);
             for (dst, ch) in out.iter_mut().zip(&conv) {
                 let m = n.min(ch.len());
@@ -427,7 +431,7 @@ fn raw_channels(item: &TrackItem, src: SourceAudio, x0: i64, len: usize, sr: u32
             }
             return out;
         }
-        let (left, right) = source_pair(item, buf.channel_count());
+        let (Some(&left), Some(&right)) = (selected.first(), selected.get(1)) else { return out };
         for (c, dst) in out.iter_mut().enumerate() {
             let ch = &buf.channels[if c == 0 { left } else { right }];
             let m = n.min(ch.len());
@@ -436,7 +440,7 @@ fn raw_channels(item: &TrackItem, src: SourceAudio, x0: i64, len: usize, sr: u32
         return out;
     }
     // 5.1 track: pick or upmix the source channels
-    let picked: Vec<&[f32]> = source_51(item, buf.channel_count()).iter().map(|&c| buf.channels[c].as_slice()).collect();
+    let picked: Vec<&[f32]> = selected.iter().map(|&c| buf.channels[c].as_slice()).collect();
     let layout = Layout::from_channels(picked.len());
     let conv =
         if picked.len() == 6 { picked.iter().map(|c| c.to_vec()).collect() } else { chans::convert(&picked, layout, Layout::Surround51, Mixdown::FrontRear) };
@@ -472,6 +476,24 @@ fn source_51_fold(item: &TrackItem, available: usize) -> Option<Vec<usize>> {
         0 if available == 6 => Some((0..6).collect()),
         6.. => Some(source_51(item, available)),
         _ => None,
+    }
+}
+
+/// Original source inputs consumed before clip effects and bus conversion. Shared
+/// by rendering and scoped native inspection: ordered duplicates matter for mono,
+/// and stereo 5.1 fold-down must retain C/LFE/surround inputs, not just L/R.
+/// This is not a mixed/processed signal or a waveform-boundary qualification.
+pub fn source_input_channels(item: &TrackItem, available: usize, width: usize) -> Vec<usize> {
+    if available == 0 || !matches!(width, 2 | 6) {
+        return Vec::new();
+    }
+    if width == 6 {
+        source_51(item, available)
+    } else {
+        source_51_fold(item, available).unwrap_or_else(|| {
+            let (left, right) = source_pair(item, available);
+            vec![left, right]
+        })
     }
 }
 

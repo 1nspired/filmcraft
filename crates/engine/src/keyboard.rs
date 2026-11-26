@@ -432,7 +432,7 @@ pub fn adjust_clip_volume(s: &mut Session, db: f64) -> Result<Value> {
 // ------------------------------------------------------------------ graphics
 
 fn text_layer_targets(s: &Session) -> Result<(ClipId, Vec<usize>)> {
-    let clip = crate::graphics::target_clip(s, &Value::Null).ok_or_else(|| EngineError::Other("select a graphic clip".into()))?;
+    let clip = crate::graphics::target_clip(s, &Value::Null)?.ok_or_else(|| EngineError::Other("select a graphic clip".into()))?;
     let seq = s.active_sequence().ok_or(EngineError::NoSequence)?;
     let (_, it) = seq.find_item(clip).ok_or_else(|| EngineError::Other("no such clip".into()))?;
     let idx = filmcraft_project::graphic::layer_indices(&it.effects);
@@ -499,7 +499,7 @@ fn nudge_object(s: &mut Session, dx: f64, dy: f64) -> Result<Value> {
         ParamValue::Vec2(p) => Some(ParamValue::Vec2(Vec2::new(p.x + dx, p.y + dy))),
         _ => None,
     };
-    if crate::graphics::target_clip(s, &Value::Null).is_some()
+    if crate::graphics::target_clip(s, &Value::Null)?.is_some()
         && s.state.selection.iter().all(|c| s.active_sequence().is_some_and(|q| crate::graphics::is_graphic(s, q, *c)))
     {
         return edit_layers(s, "Nudge", "position", false, shift);
@@ -528,11 +528,15 @@ fn nudge_object(s: &mut Session, dx: f64, dy: f64) -> Result<Value> {
 
 fn has_graphic_or_selection(s: &Session) -> std::result::Result<(), String> {
     has_seq(s)?;
-    if crate::graphics::target_clip(s, &Value::Null).is_some() || !s.state.selection.is_empty() { Ok(()) } else { Err("select a clip or a graphic".into()) }
+    if crate::graphics::target_clip(s, &Value::Null).map_err(|e| e.to_string())?.is_some() || !s.state.selection.is_empty() {
+        Ok(())
+    } else {
+        Err("select a clip or a graphic".into())
+    }
 }
 fn has_graphic(s: &Session) -> std::result::Result<(), String> {
     has_seq(s)?;
-    crate::graphics::target_clip(s, &Value::Null).map(|_| ()).ok_or_else(|| "select a graphic clip".into())
+    crate::graphics::target_clip(s, &Value::Null).map_err(|e| e.to_string())?.map(|_| ()).ok_or_else(|| "select a graphic clip".into())
 }
 
 // ------------------------------------------------------------------ export frame, poster frame
@@ -669,21 +673,21 @@ fn export_frame(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// The item Set / Clear Poster Frame acts on, and the frame: `item` + time, else the Source
 /// monitor clip at its playhead, else the first Project panel selection (its current poster).
-fn poster_target(s: &Session, p: &Value) -> Option<(filmcraft_project::ItemId, Tick)> {
-    if let Some(i) = item_p(p, "item") {
-        return Some((i, time_p(s, p, "").unwrap_or_default()));
+fn poster_target(s: &Session, p: &Value) -> Result<Option<(filmcraft_project::ItemId, Tick)>> {
+    if let Some(i) = item_p(p, "item")? {
+        return Ok(Some((i, time_p(s, p, "").unwrap_or_default())));
     }
     let sel = s.state.project_selection.first().copied();
-    match (s.state.source_item, sel) {
+    Ok(match (s.state.source_item, sel) {
         (Some(src), None) => Some((src, s.state.source_playhead)),
         (Some(src), Some(sel)) if src == sel => Some((src, s.state.source_playhead)),
         (_, Some(sel)) => Some((sel, time_p(s, p, "").unwrap_or_default())),
         (None, None) => None,
-    }
+    })
 }
 
 fn set_poster(s: &mut Session, p: &Value, clear: bool) -> Result<Value> {
-    let (item, t) = poster_target(s, p).ok_or_else(|| EngineError::Other("open a clip in the Source monitor or select one in the Project panel".into()))?;
+    let (item, t) = poster_target(s, p)?.ok_or_else(|| EngineError::Other("open a clip in the Source monitor or select one in the Project panel".into()))?;
     let it = s.project.item(item).ok_or_else(|| bad("clip.setPosterFrame", "no such item"))?;
     if matches!(it.kind, ItemKind::AdjustmentLayer { .. }) {
         return Err(EngineError::Other("adjustment layers have no poster frame".into()));

@@ -102,7 +102,7 @@ fn detect(s: &mut Session, p: &Value) -> Result<Value> {
     let fd = q.settings.frame_rate.frame_duration();
     let opts = SceneOptions {
         sensitivity: f64_p(p, "sensitivity").unwrap_or(50.0).clamp(0.0, 100.0) as f32,
-        min_shot_frames: u64_p(p, "minShotFrames").unwrap_or(6).clamp(1, 10_000) as usize,
+        min_shot_frames: u64_p(p, "minShotFrames")?.unwrap_or(6).clamp(1, 10_000) as usize,
     };
     let apply = SceneApply {
         cuts: bool_p(p, "applyCuts").unwrap_or(true),
@@ -116,7 +116,7 @@ fn detect(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Other("Scene Edit Detection is already running on this sequence".into()));
     }
     let mut work = Vec::new();
-    for c in clips_p(s, p) {
+    for c in clips_p(s, p)? {
         let Some((tid, it)) = q.find_item(c) else { continue };
         if q.track(tid).is_none_or(|t| t.kind != TrackKind::Video) {
             continue;

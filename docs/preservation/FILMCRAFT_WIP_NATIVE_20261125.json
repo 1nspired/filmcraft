@@ -1,0 +1,43 @@
+{
+  "purpose": "Unqualified as-is WIP preservation; not an integrated or tested release.",
+  "branch": "codex/filmcraft-wip-native-20261125",
+  "originalRepository": "/Volumes/Poema NLE/Poema/workspaces/native",
+  "base": "fb4cbda47a134eedabd89fe02cd59ebc69462737",
+  "frozenSource": "/Volumes/Poema NLE/Poema/reports/default-cold-runtime-20261108-stage118.incomplete/original-data-source-advance-v1.incomplete/next-original-save-application-v1.incomplete/native-source-v185-resource-preflight-ui-observers.incomplete",
+  "frozenDestination": "preserved-candidates/native-source-v185-resource-preflight-ui-observers.incomplete/",
+  "layout": "First commit captures original workspace modifications, additions and deletions. Second commit adds frozen candidate as a separate source directory without replacing first-commit sources.",
+  "originalWorkspacePreserved": true,
+  "ignoredRootsNotCopied": [
+    "target/"
+  ],
+  "exclusionPolicy": [
+    "Secrets, credential files, .env* and grants are not copied; no credentials exported or activated.",
+    "Runtime data/media/models, build outputs, dependency caches and generated run/report directories are omitted.",
+    "Files over20MiB and unknown binary outputs are omitted; source patches and licensed source assets are retained.",
+    "Known synthetic credential literals in four existing tests were reviewed and retained; no real credential matches found.",
+    "Existing ancestor history is retained, not rewritten. Existing source-controlled assets and fixtures in that ancestor remain there."
+  ],
+  "scopes": [
+    {
+      "scope": "workspace first commit",
+      "includedEntries": 349,
+      "includedBytes": 8809801,
+      "excluded": []
+    },
+    {
+      "scope": "frozen second commit",
+      "includedEntries": 1801,
+      "includedBytes": 43084342,
+      "excluded": [
+        {
+          "path": "target/",
+          "reason": "ignored runtime/media/build/generated-output directory"
+        },
+        {
+          "path": "crates/h264enc/target/",
+          "reason": "ignored runtime/media/build/generated-output directory"
+        }
+      ]
+    }
+  ]
+}

@@ -97,12 +97,17 @@ impl EffectDef {
             post_fader: false,
             essential: false,
             layer: None,
+            instance_id: None,
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EffectInstance {
+    /// Optional local Poema identity, scoped by the owning persistent clip.
+    /// Never assigned during deserialization or rendering. Schema v17.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     pub effect: String,
     pub enabled: bool,
     pub params: BTreeMap<String, Param>,
@@ -121,6 +126,13 @@ pub struct EffectInstance {
 }
 
 impl EffectInstance {
+    /// A copied effect is a new instance, unlike a moved or edited effect.
+    pub fn clear_instance_ids(&mut self) {
+        self.instance_id = None;
+        for m in &mut self.masks {
+            m.instance_id = None;
+        }
+    }
     pub fn def(&self) -> Option<&'static EffectDef> {
         find_effect(&self.effect)
     }

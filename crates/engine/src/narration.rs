@@ -46,18 +46,19 @@ pub fn narration_of(s: &Session, item: ItemId) -> Option<&Narration> {
 
 /// The narration clip a command works on: `clip`, else the first selected clip whose item is a
 /// narration.
-pub fn target_clip(s: &Session, p: &Value) -> Option<ClipId> {
-    let seq = s.active_sequence()?;
+pub fn target_clip(s: &Session, p: &Value) -> Result<Option<ClipId>> {
+    let explicit = u64_p(p, "clip")?;
+    let Some(seq) = s.active_sequence() else { return Ok(None) };
     let is_narration = |c: ClipId| seq.find_item(c).is_some_and(|(_, it)| s.project.narrations.contains_key(&it.item));
-    match u64_p(p, "clip") {
+    Ok(match explicit {
         Some(c) => Some(ClipId(c)).filter(|c| is_narration(*c)),
         None => s.state.selection.iter().copied().find(|c| is_narration(*c)),
-    }
+    })
 }
 
 fn has_narration_clip(s: &Session) -> std::result::Result<(), String> {
     has_seq(s)?;
-    target_clip(s, &Value::Null).map(|_| ()).ok_or_else(|| "select a narration clip".into())
+    target_clip(s, &Value::Null).map_err(|e| e.to_string())?.map(|_| ()).ok_or_else(|| "select a narration clip".into())
 }
 
 /// Script and settings from params, on top of `base`.
@@ -158,7 +159,7 @@ fn voices(_s: &mut Session, _p: &Value) -> Result<Value> {
 
 fn preview(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "tts.preview";
-    let base = target_clip(s, p).and_then(|c| s.active_sequence()?.find_item(c).map(|(_, it)| it.item)).and_then(|i| s.project.narrations.get(&i).cloned());
+    let base = target_clip(s, p)?.and_then(|c| s.active_sequence()?.find_item(c).map(|(_, it)| it.item)).and_then(|i| s.project.narrations.get(&i).cloned());
     let mut q = p.clone();
     if q.get("sample").and_then(Value::as_bool).unwrap_or(false) {
         q["text"] = json!(tts::SAMPLE_SENTENCE);
@@ -307,7 +308,7 @@ fn needed_samples(duration: Tick, speed: f64, rate: u32) -> usize {
 fn edit(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "tts.edit";
     let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
-    let clip = target_clip(s, p).ok_or_else(|| bad(cmd, "select a narration clip (or pass `clip`)"))?;
+    let clip = target_clip(s, p)?.ok_or_else(|| bad(cmd, "select a narration clip (or pass `clip`)"))?;
     let seq = s.active_sequence().ok_or(EngineError::NoSequence)?;
     let (track, it) = seq.find_item(clip).ok_or_else(|| bad(cmd, "no such clip"))?;
     if seq.audio_tracks.iter().any(|t| t.id == track && t.locked) {
@@ -364,10 +365,10 @@ fn edit(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn inspect(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "tts.inspect";
-    let (item, clip) = match u64_p(p, "item") {
+    let (item, clip) = match u64_p(p, "item")? {
         Some(i) => (ItemId(i), None),
         None => {
-            let c = target_clip(s, p).ok_or_else(|| bad(cmd, "pass `item` or `clip`, or select a narration clip"))?;
+            let c = target_clip(s, p)?.ok_or_else(|| bad(cmd, "pass `item` or `clip`, or select a narration clip"))?;
             let seq = s.active_sequence().ok_or(EngineError::NoSequence)?;
             (seq.find_item(c).map(|(_, it)| it.item).ok_or_else(|| bad(cmd, "no such clip"))?, Some(c.0))
         }
@@ -417,7 +418,7 @@ fn finish(prog: &filmcraft_export::Progress, res: &JobResult, r: std::result::Re
 /// the same settings return at once.
 fn render_job(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "tts.render";
-    let base = target_clip(s, p).and_then(|c| s.active_sequence()?.find_item(c).map(|(_, it)| it.item)).and_then(|i| s.project.narrations.get(&i).cloned());
+    let base = target_clip(s, p)?.and_then(|c| s.active_sequence()?.find_item(c).map(|(_, it)| it.item)).and_then(|i| s.project.narrations.get(&i).cloned());
     let mut q = p.clone();
     if q.get("sample").and_then(Value::as_bool).unwrap_or(false) {
         q["text"] = json!(tts::SAMPLE_SENTENCE);

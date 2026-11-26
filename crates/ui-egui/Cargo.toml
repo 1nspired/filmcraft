@@ -30,17 +30,19 @@ egui = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "=0.10.9"
 log = { workspace = true }
 rayon = { workspace = true }
 web-time = "1"
 # Unicode Bidirectional Algorithm for Arabic and Hebrew captions in reading order (MIT OR Apache-2.0).
 unicode-bidi = "0.3.18"
-# ArtCraft wordmark (PNG) for the About dialog and Home screen.
+# Screenshot and image decoding; Poema identity uses original code-drawn geometry.
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Thread/process CPU clocks for frame-job profiling (safe wrappers; see frames.rs).
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["std", "time"] }
+libc = "=0.2.189"
 # the same clocks on Windows (GetThreadTimes / GetProcessTimes behind a safe API; MIT OR Apache-2.0)
 [target.'cfg(windows)'.dependencies]
 cpu-time = "1"

@@ -1,6 +1,6 @@
 # Hardware parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** major (new file: hardware decode / encode per platform and codec, GPU effects, devices; re-measured after NVDEC #549 and GPU export #421) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-19 · **Change:** minor (local MXF AVC decoder-registry routing measured; no parity increase) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
 
 Each hardware feature Premiere uses, per platform, against ours. Implementation detail lives in
 [`crates/platform/README.md`](../crates/platform/README.md) (decode / encode backends, the one
@@ -29,6 +29,17 @@ Measured (`cargo xtask bench --hw off|auto`): M4 Pro, CPU per 2160p frame H.264 
 HEVC 86 → 3.7 ms, 4K plays with no dropped frames at Full; Intel Iris Xe VA-API H.264 2160p
 417 → 11.4 ms, HEVC Main 10 2160p 212 → 18.4 ms. Every decoded picture is read back to the CPU
 and re-uploaded to wgpu (**no zero-copy** yet), which Premiere avoids.
+
+### MXF AVC routing — local integration check, 2026-10-19
+
+AVC in MXF now uses the decoder registry through a bounded Annex B framing
+adapter. It previously instantiated the software H.264 decoder directly,
+even when VideoToolbox was registered. Generated 10-bit 4:2:2 MXF and three
+Canon camera samples pass native-resolution pixel checks on the tested Mac;
+a short UHD ProRes export from an original also passes. Details and explicit
+opt-in test commands are in `crates/platform/README.md`.
+Software H.264 profile support and the platform table's decline rules are
+unchanged; this is not a sustained performance measurement or a parity increase.
 
 ## Hardware encode
 
@@ -85,3 +96,4 @@ one encoder ~4–8 h ([target-app-parity.md](target-app-parity.md#calibration)).
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-10 | major | Created from ROADMAP.md's performance-and-hardware row and `crates/platform/README.md`; added Linux NVDEC (#549), GPU export and Lumetri on the GPU (#421), Premiere's per-platform hardware list, devices and I/O |
+| 2026-10-19 | minor | Local MXF AVC hardware-routing fix tested on generated and real Canon 10-bit 4:2:2 material; short UHD export checked, no sustained-performance or parity claim |

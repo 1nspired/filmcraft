@@ -35,10 +35,10 @@ use serde_json::{Value, json};
 use filmcraft_project::mixer::{
     self as pm, FADER_MAX_DB, FADER_MIN_DB, LANE_MUTE, LANE_PAN, LANE_VOLUME, MASTER_STRIP, lane_info, parse_fx_lane, parse_send_lane, thin_points, write_lane,
 };
-use filmcraft_project::{AudioChannels, AutomationMode, InputMap, ItemId, Param, ParamValue, Sequence, Track, TrackId, TrackKind, TrackSend, find_effect};
+use filmcraft_project::{AudioChannels, AutomationMode, InputMap, ItemId, Param, ParamValue, Sequence, Track, TrackId, TrackSend, find_effect};
 use filmcraft_time::{TICKS_PER_SECOND, Tick};
 
-use crate::commands::{CommandSpec, always, bad, bool_p, f64_p, has_seq, str_p, time_p, u64_p};
+use crate::commands::{CommandSpec, always, bad, bool_p, f64_p, has_seq, set_effect_params, str_p, time_p, u64_p};
 use crate::{EngineError, Result, Session};
 use filmcraft_project::mixer::{LANE_PAN51_X, LANE_PAN51_Y, PAN51_LANES};
 use filmcraft_render::audio::{CLIP_LANE_PAN, CLIP_LANE_VOLUME};
@@ -697,47 +697,28 @@ fn set_strip(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn add_submix(s: &mut Session, p: &Value) -> Result<Value> {
-    let name = str_p(p, "name").map(str::to_string);
-    let channels = str_p(p, "channels").and_then(channels_from).unwrap_or(AudioChannels::Stereo);
-    let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
-    let id = s.edit("Add Submix Track", |pr, _| {
-        let id = TrackId(pr.alloc_id());
-        let seq = pr.sequence_mut(seq_id).ok_or(EngineError::NoSequence)?;
-        let n = seq.submix_tracks.len() + 1;
-        let mut t = Track::new(id, TrackKind::Audio, name.unwrap_or_else(|| format!("Submix {n}")));
-        t.channels = channels;
-        seq.submix_tracks.push(t);
-        Ok(id)
-    })?;
-    let seq = active_seq(s)?;
-    Ok(json!({"id": id.0, "ref": strip_label(seq, id)}))
+    crate::track_ops::add_submix(s, p)
 }
 
 fn delete_submix(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = strip_p(s, p, "mixer.deleteSubmix")?;
+    const CMD: &str = "mixer.deleteSubmix";
+    crate::track_ops::fields(p, &["strip"], CMD)?;
+    let id = strip_p(s, p, CMD)?;
     if !active_seq(s)?.submix_tracks.iter().any(|t| t.id == id) {
-        return Err(bad("mixer.deleteSubmix", "not a submix"));
+        return Err(bad(CMD, "not a submix"));
     }
-    s.edit_sequence("Delete Submix Track", move |q, _, _| {
-        q.submix_tracks.retain(|t| t.id != id);
-        // re-route everything that fed it to the Mix and drop sends to it
-        for sid in q.strip_ids() {
-            q.with_strip_mut(sid, |t| {
-                if t.mixer.output == Some(id) {
-                    t.mixer.output = None;
-                }
-                while let Some(i) = t.mixer.sends.iter().position(|sd| sd.target == id) {
-                    t.remove_send(i);
-                }
-            });
-        }
-        Ok(())
-    })?;
+    crate::track_ops::remove(s, &[id], "Delete Submix Track", CMD)?;
     Ok(Value::Null)
 }
 
 fn slot_p(p: &Value, cmd: &str) -> Result<usize> {
-    u64_p(p, "slot").map(|v| v as usize).ok_or_else(|| bad(cmd, "need `slot` (0-based)"))
+    let slot = u64_p(p, "slot")?.ok_or_else(|| bad(cmd, "need `slot` (0-based)"))?;
+    usize::try_from(slot).map_err(|_| bad(cmd, "`slot` exceeds the native index range"))
+}
+
+/// Omission preserves the human default; malformed explicit flags never act as omission.
+fn insert_flag(p: &Value, key: &str, cmd: &str) -> Result<Option<bool>> {
+    p.get(key).map(|v| v.as_bool().ok_or_else(|| bad(cmd, format!("`{key}` must be a boolean")))).transpose()
 }
 
 /// An insert's scalar parameter values (numbers; toggles as booleans) for `mixer.inspect`.
@@ -760,8 +741,8 @@ fn add_insert(s: &mut Session, p: &Value) -> Result<Value> {
         .filter(|d| d.kind == filmcraft_project::EffectKind::Audio && !d.intrinsic)
         .ok_or_else(|| bad("mixer.addInsert", format!("`{eid}` is not an audio effect")))?;
     let mut inst = def.instance();
-    inst.post_fader = bool_p(p, "postFader").unwrap_or(false);
-    let slot = u64_p(p, "slot").map(|v| v as usize);
+    inst.post_fader = insert_flag(p, "postFader", "mixer.addInsert")?.unwrap_or(false);
+    let slot = u64_p(p, "slot")?.map(|v| usize::try_from(v).map_err(|_| bad("mixer.addInsert", "`slot` exceeds the native index range"))).transpose()?;
     let n = active_seq(s)?.strip(id).map(|t| t.effects.len()).unwrap_or(0);
     if n >= pm::MAX_INSERTS {
         return Err(bad("mixer.addInsert", format!("all {} effect slots are in use", pm::MAX_INSERTS)));
@@ -776,41 +757,32 @@ fn add_insert(s: &mut Session, p: &Value) -> Result<Value> {
 fn remove_insert(s: &mut Session, p: &Value) -> Result<Value> {
     let id = strip_p(s, p, "mixer.removeInsert")?;
     let slot = slot_p(p, "mixer.removeInsert")?;
-    let ok = s.edit_sequence("Remove Track Effect", move |q, _, _| Ok(q.with_strip_mut(id, |t| t.remove_insert(slot)).unwrap_or(false)))?;
-    if !ok {
-        return Err(bad("mixer.removeInsert", "no effect in that slot"));
-    }
+    s.edit_sequence("Remove Track Effect", move |q, _, _| {
+        if !q.with_strip_mut(id, |t| t.remove_insert(slot)).unwrap_or(false) {
+            return Err(bad("mixer.removeInsert", "no effect in that slot"));
+        }
+        Ok(())
+    })?;
     Ok(Value::Null)
 }
 
 fn set_insert(s: &mut Session, p: &Value) -> Result<Value> {
     let id = strip_p(s, p, "mixer.setInsert")?;
     let slot = slot_p(p, "mixer.setInsert")?;
-    let p = p.clone();
+    let enabled = insert_flag(p, "enabled", "mixer.setInsert")?;
+    let post_fader = insert_flag(p, "postFader", "mixer.setInsert")?;
+    let params = p.get("params").cloned();
     s.edit_sequence("Track Effect Settings", move |q, _, _| {
         q.with_strip_mut(id, |t| -> Result<()> {
             let e = t.effects.get_mut(slot).ok_or_else(|| bad("mixer.setInsert", "no effect in that slot"))?;
-            if let Some(v) = bool_p(&p, "enabled") {
+            if let Some(v) = enabled {
                 e.enabled = v;
             }
-            if let Some(v) = bool_p(&p, "postFader") {
+            if let Some(v) = post_fader {
                 e.post_fader = v;
             }
-            if let Some(obj) = p.get("params").and_then(Value::as_object) {
-                for (k, v) in obj {
-                    // instances saved before a parameter existed get it from the definition
-                    if e.param(k).is_none()
-                        && let Some(d) = e.def().and_then(|d| d.param(k))
-                    {
-                        e.params.insert(k.clone(), filmcraft_project::Param::new(d.default.clone()));
-                    }
-                    let par = e.param_mut(k).ok_or_else(|| bad("mixer.setInsert", format!("no parameter `{k}`")))?;
-                    par.value = match (&par.value, v) {
-                        (ParamValue::Bool(_), Value::Bool(b)) => ParamValue::Bool(*b),
-                        (ParamValue::Choice(_), v) => ParamValue::Choice(v.as_u64().unwrap_or(0) as u32),
-                        (_, v) => ParamValue::Float(v.as_f64().ok_or_else(|| bad("mixer.setInsert", format!("`{k}` needs a number")))?),
-                    };
-                }
+            if let Some(params) = &params {
+                set_effect_params(e, params, "mixer.setInsert")?;
             }
             Ok(())
         })
@@ -855,7 +827,7 @@ fn add_send(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn set_send(s: &mut Session, p: &Value) -> Result<Value> {
     let id = strip_p(s, p, "mixer.setSend")?;
-    let i = u64_p(p, "send").ok_or_else(|| bad("mixer.setSend", "need `send` (0-based)"))? as usize;
+    let i = u64_p(p, "send")?.ok_or_else(|| bad("mixer.setSend", "need `send` (0-based)"))? as usize;
     let target = if p.get("target").is_some() { Some(send_target(s, p, id, "mixer.setSend")?) } else { None };
     let p = p.clone();
     s.edit_sequence("Send Settings", move |q, _, _| {
@@ -885,11 +857,14 @@ fn set_send(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn remove_send(s: &mut Session, p: &Value) -> Result<Value> {
     let id = strip_p(s, p, "mixer.removeSend")?;
-    let i = u64_p(p, "send").ok_or_else(|| bad("mixer.removeSend", "need `send` (0-based)"))? as usize;
-    let ok = s.edit_sequence("Remove Send", move |q, _, _| Ok(q.with_strip_mut(id, |t| t.remove_send(i)).unwrap_or(false)))?;
-    if !ok {
-        return Err(bad("mixer.removeSend", "no such send"));
-    }
+    let i = u64_p(p, "send")?.ok_or_else(|| bad("mixer.removeSend", "need `send` (0-based)"))?;
+    let i = usize::try_from(i).map_err(|_| bad("mixer.removeSend", "`send` exceeds the native index range"))?;
+    s.edit_sequence("Remove Send", move |q, _, _| {
+        if !q.with_strip_mut(id, |t| t.remove_send(i)).unwrap_or(false) {
+            return Err(bad("mixer.removeSend", "no such send"));
+        }
+        Ok(())
+    })?;
     Ok(Value::Null)
 }
 
@@ -919,12 +894,12 @@ fn delete_kf(s: &mut Session, p: &Value) -> Result<Value> {
     let id = strip_p(s, p, "mixer.deleteKeyframe")?;
     let lane = lane_p(s, p, id, "mixer.deleteKeyframe")?;
     let t = time_p(s, p, "").ok_or_else(|| bad("mixer.deleteKeyframe", "need `time`"))?;
-    let ok = s.edit_sequence("Delete Track Keyframe", move |q, _, _| {
-        Ok(q.with_strip_mut(id, |tr| tr.lane_mut(&lane).is_some_and(|par| par.remove_keyframe_at(t))).unwrap_or(false))
+    s.edit_sequence("Delete Track Keyframe", move |q, _, _| {
+        if !q.with_strip_mut(id, |tr| tr.lane_mut(&lane).is_some_and(|par| par.remove_keyframe_at(t))).unwrap_or(false) {
+            return Err(bad("mixer.deleteKeyframe", "no keyframe at that time"));
+        }
+        Ok(())
     })?;
-    if !ok {
-        return Err(bad("mixer.deleteKeyframe", "no keyframe at that time"));
-    }
     Ok(Value::Null)
 }
 
@@ -1017,7 +992,7 @@ fn write_automation(s: &mut Session, p: &Value) -> Result<Value> {
 /// parameter) at the playhead. With `keyframe` (or when already animated) it writes a keyframe at the
 /// playhead; a drag (same clip and parameter, no other edit between) is one undo step.
 fn clip_set(s: &mut Session, p: &Value) -> Result<Value> {
-    let clip = filmcraft_project::ClipId(u64_p(p, "clip").ok_or_else(|| bad("clipMixer.set", "need `clip`"))?);
+    let clip = filmcraft_project::ClipId(u64_p(p, "clip")?.ok_or_else(|| bad("clipMixer.set", "need `clip`"))?);
     let effect = str_p(p, "effect").unwrap_or("volume").to_string();
     let param = str_p(p, "param").unwrap_or("level").to_string();
     let v = f64_p(p, "value").ok_or_else(|| bad("clipMixer.set", "need `value`"))?;
@@ -1048,49 +1023,112 @@ fn clip_set(s: &mut Session, p: &Value) -> Result<Value> {
 // ------------------------------------------------------------------------------------- audio gain
 
 /// Peak (dBFS, before clip gain) of each selected audio clip's source range.
-pub(crate) fn clip_peaks(s: &Session, clips: &[filmcraft_project::ClipId]) -> Vec<(filmcraft_project::ClipId, f64)> {
-    let Some(seq) = s.active_sequence() else { return Vec::new() };
-    let sr = seq.settings.sample_rate.max(1);
-    let provider = s.media.provider(s.project.clone(), s.services.clone());
+pub(crate) fn clip_peaks(s: &Session, clips: &[filmcraft_project::ClipId]) -> Result<Vec<(filmcraft_project::ClipId, f64)>> {
+    let seq = active_seq(s)?;
+    let sr = seq.settings.sample_rate;
+    if !(1..=384_000).contains(&sr) {
+        return Err(bad("clip.audioPeak", "invalid sequence sample rate"));
+    }
+    let provider = s.media.full_res_provider(s.project.clone(), s.services.clone());
     let mut out = Vec::new();
     for t in &seq.audio_tracks {
         for it in t.items.iter().filter(|i| clips.contains(&i.id)) {
-            let Some(src) = filmcraft_render::SourceProvider::source(&provider, it.item) else { continue };
-            if !src.info().has_audio() {
-                continue;
+            if s.project.resolve_media(it.item).is_none_or(|(_, media, _)| media.offline) {
+                return Err(bad("clip.audioPeak", "a selected audio original is offline or missing"));
+            }
+            let src = filmcraft_render::SourceProvider::source(&provider, it.item).ok_or_else(|| bad("clip.audioPeak", "an audio source is unavailable"))?;
+            let original = s.project.resolve_media(it.item).map(|(id, _, _)| id).ok_or_else(|| bad("clip.audioPeak", "missing audio original"))?;
+            if s.media.offline_status(original).is_some() || filmcraft_media::pending::is_set() {
+                return Err(bad("clip.audioPeak", "audio peak measurement cannot use an offline playback slate"));
+            }
+            let stream = src.info().audio_streams.get(it.audio_stream).ok_or_else(|| bad("clip.audioPeak", "a selected audio stream is unavailable"))?;
+            let count = stream.channels as usize;
+            if count == 0 || count > 64 || it.source_channels.iter().any(|c| *c as usize >= count) {
+                return Err(bad("clip.audioPeak", "invalid source audio channel map"));
+            }
+            let channels = filmcraft_render::audio::source_input_channels(it, count, filmcraft_render::mixer::width_of(t.channels));
+            if channels.is_empty() {
+                return Err(bad("clip.audioPeak", "no routed source audio channels"));
+            }
+            if it.source_in < Tick::ZERO || src.info().duration <= Tick::ZERO || it.duration <= Tick::ZERO || !it.speed.is_finite() || it.speed <= 0.0 {
+                return Err(bad("clip.audioPeak", "invalid audio source clock"));
             }
             let s0 = it.source_in.to_units_floor(sr as i64);
-            let len = ((it.duration.to_units_floor(sr as i64) as f64) * it.speed.abs().max(1e-6)).ceil() as i64;
+            let length = ((it.duration.0 as f64 / TICKS_PER_SECOND as f64) * sr as f64 * it.speed).ceil();
+            // Decode the complete range in bounded chunks. Refuse malformed clocks
+            // before a float-to-integer cast or input-sized loop/allocation.
+            if !length.is_finite() || length < 1.0 || length > sr as f64 * 43_200.0 {
+                return Err(bad("clip.audioPeak", "audio peak range exceeds twelve hours or has an invalid duration"));
+            }
+            let len = length as i64;
+            let end = s0.checked_add(len).ok_or_else(|| bad("clip.audioPeak", "audio peak sample range overflow"))?;
+            let source_samples = (src.info().duration.0 as i128 * sr as i128 + TICKS_PER_SECOND as i128 - 1) / TICKS_PER_SECOND as i128;
+            if s0 as i128 >= source_samples {
+                return Err(bad("clip.audioPeak", "audio peak range starts beyond the original source"));
+            }
+            // Native placement can round the final camera frame outward on a
+            // different sequence grid. Its audio tail is padding; measure the
+            // available original samples, never invented samples past the end.
+            let end = (end as i128).min(source_samples) as i64;
             let mut peak = 0f32;
             let mut pos = s0;
-            while pos < s0 + len {
-                let n = (s0 + len - pos).min(sr as i64) as usize;
-                if let Ok(b) = src.audio_stream(it.audio_stream, pos, n, sr) {
-                    peak = b.peaks().into_iter().fold(peak, f32::max);
+            while pos < end {
+                let n = (end - pos).min(sr as i64) as usize;
+                let b = src.audio_stream(it.audio_stream, pos, n, sr).map_err(|e| bad("clip.audioPeak", format!("audio peak decode failed: {e}")))?;
+                if b.sample_rate != sr || b.channels.len() != count || b.channels.iter().any(|ch| ch.len() != n || ch.iter().any(|v| !v.is_finite())) {
+                    return Err(bad("clip.audioPeak", "audio peak decode returned incomplete or nonfinite samples"));
+                }
+                for channel in &channels {
+                    let samples = b.channels.get(*channel).ok_or_else(|| bad("clip.audioPeak", "missing routed audio channel"))?;
+                    peak = samples.iter().fold(peak, |peak, sample| peak.max(sample.abs()));
                 }
                 pos += n as i64;
             }
             out.push((it.id, 20.0 * (peak.max(1e-9) as f64).log10()));
         }
     }
-    out
+    Ok(out)
 }
 
-fn gain_targets(s: &Session, p: &Value) -> Vec<filmcraft_project::ClipId> {
-    let sel: Vec<filmcraft_project::ClipId> = match p.get("clips").and_then(Value::as_array) {
-        Some(a) => a.iter().filter_map(|v| v.as_u64().map(filmcraft_project::ClipId)).collect(),
-        None => s.state.selection.clone(),
+fn gain_targets(s: &Session, p: &Value, command: &str) -> Result<Vec<filmcraft_project::ClipId>> {
+    let seq = active_seq(s)?;
+    let sel = match p.get("clips") {
+        Some(v) => {
+            let a = v.as_array().filter(|a| !a.is_empty() && a.len() <= 4096).ok_or_else(|| bad(command, "`clips` needs 1–4096 explicit clip IDs"))?;
+            let mut ids = Vec::with_capacity(a.len());
+            for value in a {
+                let id = value.as_u64().filter(|n| *n > 0).map(filmcraft_project::ClipId).ok_or_else(|| bad(command, "invalid explicit clip ID"))?;
+                if ids.contains(&id) || seq.find_item(id).is_none() {
+                    return Err(bad(command, "duplicate or missing explicit clip ID"));
+                }
+                ids.push(id);
+            }
+            ids
+        }
+        None => {
+            if s.state.selection.len() > 4096 || s.state.selection.iter().any(|c| seq.find_item(*c).is_none()) {
+                return Err(bad(command, "invalid or oversized clip selection"));
+            }
+            s.state.selection.clone()
+        }
     };
-    crate::commands::with_links(s, &sel)
+    let linked = crate::commands::with_links(s, &sel);
+    if linked.len() > 4096 {
+        return Err(bad(command, "linked clip selection exceeds 4096 targets"));
+    }
+    Ok(linked)
 }
 
 /// `clip.audioPeak`: the peak amplitude of the selection (with its current clip gain), as the Audio
 /// Gain dialog shows it.
 pub fn audio_peak(s: &mut Session, p: &Value) -> Result<Value> {
-    let clips = gain_targets(s, p);
+    if p.as_object().is_none_or(|o| o.keys().any(|k| k != "clips")) {
+        return Err(bad("clip.audioPeak", "unknown audio peak arguments"));
+    }
+    let clips = gain_targets(s, p, "clip.audioPeak")?;
     let seq = active_seq(s)?;
     let gain = |c: filmcraft_project::ClipId| seq.find_item(c).map(|(_, i)| i.gain_db).unwrap_or(0.0);
-    let peaks = clip_peaks(s, &clips);
+    let peaks = clip_peaks(s, &clips)?;
     let max = peaks.iter().map(|(c, pk)| pk + gain(*c)).fold(f64::NEG_INFINITY, f64::max);
     Ok(json!({
         "peakDb": if max.is_finite() { json!(max) } else { Value::Null },
@@ -1100,22 +1138,63 @@ pub fn audio_peak(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// `clip.audioGain`: Set Gain to / Adjust Gain by / Normalize Max Peak to / Normalize All Peaks to.
 pub fn audio_gain(s: &mut Session, p: &Value) -> Result<Value> {
-    let db = f64_p(p, "db").unwrap_or(0.0);
-    let mode = match str_p(p, "mode") {
-        Some(m) => m.to_string(),
-        None => if bool_p(p, "relative").unwrap_or(true) { "adjust" } else { "set" }.to_string(),
+    let command = "clip.audioGain";
+    if p.as_object().is_none_or(|o| o.keys().any(|k| !["clips", "mode", "db", "relative"].contains(&k.as_str()))) {
+        return Err(bad(command, "unknown audio gain arguments"));
+    }
+    let db = p
+        .get("db")
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite() && (-96.0..=96.0).contains(n))
+        .ok_or_else(|| bad(command, "`db` must be a finite number from -96 to 96"))?;
+    if p.get("relative").is_some_and(|v| !v.is_boolean()) || p.get("mode").is_some() && p.get("relative").is_some() {
+        return Err(bad(command, "choose `mode` or a boolean legacy `relative`, not both"));
+    }
+    let mode = match p.get("mode") {
+        Some(v) => v
+            .as_str()
+            .filter(|m| ["set", "adjust", "normalizeMax", "normalizeAll"].contains(m))
+            .ok_or_else(|| bad(command, "unknown gain mode (set, adjust, normalizeMax, normalizeAll)"))?,
+        None => {
+            if bool_p(p, "relative").unwrap_or(true) {
+                "adjust"
+            } else {
+                "set"
+            }
+        }
     };
-    let clips = gain_targets(s, p);
-    let new_gain: Vec<(filmcraft_project::ClipId, f64)> = match mode.as_str() {
+    let targets = gain_targets(s, p, command)?;
+    let seq = active_seq(s)?;
+    let mut clips = Vec::new();
+    for track in &seq.audio_tracks {
+        for clip in &track.items {
+            if targets.contains(&clip.id) {
+                if track.locked || !clip.gain_db.is_finite() || !(-96.0..=96.0).contains(&clip.gain_db) {
+                    return Err(bad(command, "an audio target is locked or has invalid existing gain"));
+                }
+                clips.push(clip.id);
+            }
+        }
+    }
+    if clips.is_empty() {
+        return Err(bad(command, "no audio clips in the explicit or linked selection"));
+    }
+    let new_gain: Vec<(filmcraft_project::ClipId, f64)> = match mode {
         "set" => clips.iter().map(|c| (*c, db)).collect(),
         "adjust" => {
             let seq = active_seq(s)?;
-            clips.iter().filter_map(|c| seq.find_item(*c).map(|(_, i)| (*c, i.gain_db + db))).collect()
+            clips
+                .iter()
+                .map(|c| seq.find_item(*c).map(|(_, i)| (*c, i.gain_db + db)).ok_or_else(|| bad(command, "missing audio target")))
+                .collect::<Result<_>>()?
         }
         "normalizeMax" | "normalizeAll" => {
-            let peaks = clip_peaks(s, &clips);
-            if peaks.is_empty() {
-                return Err(bad("clip.audioGain", "no audio clips with audio in the selection"));
+            let peaks = clip_peaks(s, &clips)?;
+            if peaks.len() != clips.len() {
+                return Err(bad(command, "every selected audio target requires a complete peak measurement"));
+            }
+            if peaks.iter().any(|(_, pk)| *pk <= -180.0) {
+                return Err(bad(command, "silent or below-floor audio cannot be normalized to a target peak"));
             }
             let seq = active_seq(s)?;
             let gain = |c: filmcraft_project::ClipId| seq.find_item(c).map(|(_, i)| i.gain_db).unwrap_or(0.0);
@@ -1127,21 +1206,32 @@ pub fn audio_gain(s: &mut Session, p: &Value) -> Result<Value> {
                 peaks.iter().map(|(c, _)| (*c, gain(*c) + delta)).collect()
             }
         }
-        m => return Err(bad("clip.audioGain", format!("unknown mode `{m}` (set, adjust, normalizeMax, normalizeAll)"))),
+        _ => return Err(bad(command, "unknown audio gain mode")),
     };
+    if new_gain.iter().any(|(_, g)| !g.is_finite() || !(-96.0..=96.0).contains(g)) {
+        return Err(bad(command, "requested gain would exceed -96 to 96 dB; no target changed"));
+    }
+    let changed = new_gain.iter().any(|(id, g)| seq.find_item(*id).is_some_and(|(_, c)| c.gain_db != *g));
+    if !changed {
+        return Ok(
+            json!({"mode": mode, "clips": new_gain.len(), "gainDb": new_gain.iter().map(|(c, g)| json!({"clip": c.0, "gainDb": g})).collect::<Vec<_>>(), "changed":false}),
+        );
+    }
     let applied = s.edit_sequence("Audio Gain", move |q, _, _| {
         let mut applied = Vec::new();
         for t in q.audio_tracks.iter_mut() {
             for i in t.items.iter_mut() {
                 if let Some((_, g)) = new_gain.iter().find(|(c, _)| *c == i.id) {
-                    i.gain_db = g.clamp(-96.0, 96.0);
+                    i.gain_db = *g;
                     applied.push((i.id, i.gain_db));
                 }
             }
         }
         Ok(applied)
     })?;
-    Ok(json!({"mode": mode, "clips": applied.len(), "gainDb": applied.iter().map(|(c, g)| json!({"clip": c.0, "gainDb": g})).collect::<Vec<_>>()}))
+    Ok(
+        json!({"mode": mode, "clips": applied.len(), "gainDb": applied.iter().map(|(c, g)| json!({"clip": c.0, "gainDb": g})).collect::<Vec<_>>(), "changed":true}),
+    )
 }
 
 /// Effects panel ▸ Set Selected as Default Transition (video or audio, from the effect's kind).

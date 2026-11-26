@@ -11,6 +11,120 @@ fn demo() -> Session {
 }
 
 #[test]
+fn audit_first_caption_rejects_wrong_tracks_without_leaving_a_track_or_history() {
+    for track in [json!("C999"), json!("C0"), json!(999999), json!(-1), json!(0.5), json!(null), json!(true), json!([]), json!({})] {
+        let mut s = demo();
+        let seq = s.state.active_sequence.unwrap();
+        std::sync::Arc::make_mut(&mut s.project).sequence_mut(seq).unwrap().caption_tracks.clear();
+        s.history.merge_key = Some("existing human gesture".into());
+        let before = s.project.clone();
+        let state = serde_json::to_value(&s.state).unwrap();
+        let revision = s.revision;
+        let undo = s.history.undo.len();
+        let redo = s.history.redo.len();
+        let journal = s.journal.clone();
+        assert!(s.execute("captions.add", json!({"track":track,"text":"Must not create a track"})).is_err(), "accepted {track}");
+        assert!(std::sync::Arc::ptr_eq(&before, &s.project), "published a project for {track}");
+        assert_eq!(s.active_sequence().unwrap().caption_tracks.len(), 0);
+        assert_eq!(s.revision, revision);
+        assert_eq!(s.history.undo.len(), undo);
+        assert_eq!(s.history.redo.len(), redo);
+        assert_eq!(s.history.merge_key.as_deref(), Some("existing human gesture"));
+        assert_eq!(s.journal, journal);
+        assert_eq!(serde_json::to_value(&s.state).unwrap(), state);
+    }
+}
+
+#[test]
+fn audit_first_caption_and_implicit_track_are_one_native_undo_redo_step() {
+    for explicit in [false, true] {
+        let mut s = demo();
+        let seq = s.state.active_sequence.unwrap();
+        std::sync::Arc::make_mut(&mut s.project).sequence_mut(seq).unwrap().caption_tracks.clear();
+        let before = s.project.clone();
+        let revision = s.revision;
+        let undo = s.history.undo.len();
+        let journal = s.journal.len();
+        let mut args = json!({"text":"First caption — שלום 日本語","seconds":1.0,"durationSeconds":2.0});
+        if explicit {
+            args["track"] = json!("C1");
+        }
+        let id = ClipId(s.execute("captions.add", args).unwrap()["caption"].as_u64().unwrap());
+        assert_eq!(s.revision, revision + 1);
+        assert_eq!(s.history.undo.len(), undo + 1);
+        assert_eq!(s.journal.len(), journal + 1, "no separately journaled implicit newTrack");
+        assert_eq!(s.active_sequence().unwrap().caption_tracks.len(), 1);
+        let added = s.active_sequence().unwrap().find_caption(id).unwrap().1;
+        assert_eq!(added.text, "First caption — שלום 日本語");
+        assert_eq!(s.state.caption_selection, vec![id]);
+        s.active_sequence().unwrap().check().unwrap();
+        let after = s.project.clone();
+        s.undo().unwrap();
+        assert_eq!(serde_json::to_value(&*s.project).unwrap(), serde_json::to_value(&*before).unwrap());
+        s.redo().unwrap();
+        assert_eq!(serde_json::to_value(&*s.project).unwrap(), serde_json::to_value(&*after).unwrap());
+        let restored: filmcraft_project::Project = serde_json::from_slice(&serde_json::to_vec(&*s.project).unwrap()).unwrap();
+        assert_eq!(restored.sequence(seq).unwrap().find_caption(id).unwrap().1.text, "First caption — שלום 日本語");
+    }
+}
+
+#[test]
+fn audit_caption_creation_at_exhausted_ids_refuses_without_publishing() {
+    for next in [u64::MAX, u64::MAX - 1] {
+        let mut s = demo();
+        let seq = s.state.active_sequence.unwrap();
+        std::sync::Arc::make_mut(&mut s.project).sequence_mut(seq).unwrap().caption_tracks.clear();
+        std::sync::Arc::make_mut(&mut s.project).next_id = next;
+        let project = s.project.clone();
+        let revision = s.revision;
+        let undo = s.history.undo.len();
+        assert!(s.execute("captions.add", json!({"text":"No ID space"})).is_err());
+        assert!(std::sync::Arc::ptr_eq(&project, &s.project));
+        assert_eq!(s.revision, revision);
+        assert_eq!(s.history.undo.len(), undo);
+    }
+}
+
+#[test]
+fn audit_caption_existing_track_locks_overlap_and_saved_reopen() {
+    let mut s = demo();
+    let seq = s.state.active_sequence.unwrap();
+    std::sync::Arc::make_mut(&mut s.project).sequence_mut(seq).unwrap().caption_tracks.clear();
+    let first =
+        ClipId(s.execute("captions.add", json!({"text":"Preserve this first cue","seconds":1,"durationSeconds":2})).unwrap()["caption"].as_u64().unwrap());
+    let track = s.active_sequence().unwrap().caption_tracks[0].id;
+    for selector in [json!("C1"), json!(track.0)] {
+        let project = s.project.clone();
+        let revision = s.revision;
+        let undo = s.history.undo.len();
+        assert!(s.execute("captions.add", json!({"track":selector,"text":"Overlapping cue","seconds":1.5})).is_err());
+        assert!(std::sync::Arc::ptr_eq(&project, &s.project));
+        assert_eq!(s.revision, revision);
+        assert_eq!(s.history.undo.len(), undo);
+    }
+    std::sync::Arc::make_mut(&mut s.project).sequence_mut(seq).unwrap().caption_tracks[0].locked = true;
+    let locked = s.project.clone();
+    assert!(s.execute("captions.add", json!({"track":track.0,"text":"Locked cue","seconds":5})).is_err());
+    assert!(std::sync::Arc::ptr_eq(&locked, &s.project));
+    std::sync::Arc::make_mut(&mut s.project).sequence_mut(seq).unwrap().caption_tracks[0].locked = false;
+    let second = ClipId(
+        s.execute("captions.add", json!({"track":track.0,"text":"Second cue — 日本語","seconds":5,"durationSeconds":1})).unwrap()["caption"].as_u64().unwrap(),
+    );
+    assert_eq!(s.active_sequence().unwrap().caption_tracks.len(), 1);
+    let dir = crate::media_test_util::tmp_dir("audit-caption-atomic-reopen");
+    let file = dir.join("captions.fcproj");
+    s.execute("file.saveAs", json!({"path":file})).unwrap();
+    let mut reopened = Session::default();
+    reopened.execute("file.open", json!({"path":file})).unwrap();
+    let q = reopened.active_sequence().unwrap();
+    assert_eq!(q.caption_tracks.len(), 1);
+    assert_eq!(q.find_caption(first).unwrap().1.text, "Preserve this first cue");
+    assert_eq!(q.find_caption(second).unwrap().1.text, "Second cue — 日本語");
+    assert_eq!(q.caption_tracks[0].id, track);
+    q.check().unwrap();
+}
+
+#[test]
 fn captions_import_edit_export_and_burn_in() {
     let dir = std::env::temp_dir().join(format!("fc-cap-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

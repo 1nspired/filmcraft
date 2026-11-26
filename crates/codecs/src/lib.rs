@@ -21,6 +21,7 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+mod annexb_avc;
 pub mod apv;
 pub mod audio;
 pub mod avi;

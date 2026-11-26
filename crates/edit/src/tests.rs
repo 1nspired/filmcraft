@@ -5,6 +5,422 @@ use proptest::prelude::*;
 
 const R: FrameRate = FrameRate::FPS_24;
 
+#[test]
+fn roll_rejects_same_item_cross_track_and_mixed_kind_below_all_command_callers() {
+    for audio in [false, true] {
+        let mut fx = Fx::new();
+        let left = fx.put(fx.v(0), 0, 24, 24);
+        let right = fx.put(if audio { fx.a(0) } else { fx.v(1) }, 24, 24, 24);
+        let before = fx.seq.clone();
+        let next = fx.next;
+        for (l, r) in [(left, right), (left, left)] {
+            let mut local = fx.next;
+            let error = roll(&mut fx.seq, l, r, f(1), &mut Fx::ctx(&mut local)).unwrap_err();
+            assert!(error.to_string().contains("track"), "{error}");
+            assert_eq!(fx.seq, before);
+            assert_eq!(local, next);
+        }
+    }
+}
+
+fn ripple_caption_track(id: u64, locked: bool, sync_lock: bool, start: Tick, duration: Tick) -> filmcraft_project::CaptionTrack {
+    let mut track = filmcraft_project::CaptionTrack::new(TrackId(id), "Ripple captions".into(), filmcraft_project::CaptionFormat::Subtitle);
+    track.locked = locked;
+    track.sync_lock = sync_lock;
+    track.captions.push(filmcraft_project::Caption {
+        id: ClipId(id + 1),
+        start,
+        duration,
+        text: "Keep exact words".into(),
+        speaker: Some("Speaker".into()),
+        cue_id: Some("original-cue".into()),
+        settings: "align:start".into(),
+    });
+    track.vtt_blocks.push("NOTE preserved source annotation".into());
+    track
+}
+
+#[test]
+fn caption_speed_ripple_uses_native_out_edge_timing_with_exact_metadata_and_held_tracks() {
+    for grouped in [false, true] {
+        for (speed, delta) in [(0.4, f(30)), (2.0, -f(10)), (1.0, Tick::ZERO), (1.25, -f(4))] {
+            let mut fx = Fx::new();
+            let (video, audio) = (fx.v(0), fx.a(0));
+            let pic = fx.put(video, 20, 20, 100);
+            fx.put(video, 40, 20, 120);
+            let sound = if grouped { fx.put(audio, 20, 20, 100) } else { fx.put(audio, 40, 20, 120) };
+            if grouped {
+                fx.put(audio, 40, 20, 120);
+            }
+            let cut = f(40);
+            for (id, locked, sync) in [(90000, false, true), (90010, true, true), (90020, false, false)] {
+                fx.seq.caption_tracks.push(ripple_caption_track(id, locked, sync, cut - Tick(7), Tick(30)));
+            }
+            fx.seq.caption_tracks.push(ripple_caption_track(90030, false, true, cut + Tick(100), Tick(23)));
+            let before = fx.seq.caption_tracks.clone();
+            let mut next = fx.next;
+            if grouped {
+                set_speed_group(&mut fx.seq, &[pic, sound], speed, true, true, &mut Fx::ctx(&mut next)).unwrap();
+            } else {
+                set_speed(&mut fx.seq, pic, speed, true, true, &mut Fx::ctx(&mut next)).unwrap();
+            }
+            assert_eq!(fx.seq.caption_tracks[1..3], before[1..3], "locked/non-sync-locked tracks stay exact");
+            let mut later = before[3].clone();
+            later.captions[0].start += delta;
+            assert_eq!(fx.seq.caption_tracks[3], later, "{speed} grouped={grouped}");
+            let original = &before[0].captions[0];
+            let mut expected = before[0].clone();
+            if delta > Tick::ZERO {
+                expected.captions[0].duration = Tick(7);
+                let mut right = original.clone();
+                right.id = ClipId(fx.next);
+                right.start = cut + delta;
+                right.duration = Tick(23);
+                right.cue_id = None;
+                expected.captions.push(right);
+                assert_eq!(next, fx.next + 1, "one linked ripple, not one per member");
+            } else if delta < Tick::ZERO {
+                expected.captions[0].start = cut + delta;
+                expected.captions[0].duration = Tick(23);
+                assert_eq!(next, fx.next);
+            } else {
+                assert_eq!(next, fx.next);
+            }
+            assert_eq!(fx.seq.caption_tracks[0], expected);
+            fx.seq.check().unwrap();
+        }
+    }
+}
+
+#[test]
+fn caption_speed_split_edit_uses_the_first_native_origin_and_largest_linked_delta_once() {
+    for audio_first in [false, true] {
+        let mut fx = Fx::new();
+        let (video, audio) = (fx.v(0), fx.a(0));
+        let pic = fx.put(video, 20, 20, 100);
+        fx.put(video, 40, 20, 120);
+        let sound = fx.put(audio, 20, 24, 100);
+        fx.put(audio, 44, 20, 124);
+        let cut = if audio_first { f(44) } else { f(40) };
+        fx.seq.caption_tracks.push(ripple_caption_track(90000, false, true, cut + Tick(17), Tick(23)));
+        let mut expected = fx.seq.caption_tracks.clone();
+        expected[0].captions[0].start += f(24);
+        let mut next = fx.next;
+        let group = if audio_first { vec![sound, pic] } else { vec![pic, sound] };
+        set_speed_group(&mut fx.seq, &group, 0.5, false, true, &mut Fx::ctx(&mut next)).unwrap();
+        assert_eq!(fx.seq.caption_tracks, expected);
+        assert_eq!(fx.spans(video), vec![(20, 40), (64, 20)]);
+        assert_eq!(fx.spans(audio), vec![(20, 48), (68, 20)]);
+        assert_eq!(next, fx.next);
+    }
+}
+
+#[test]
+fn caption_speed_non_ripple_and_zero_delta_hold_cues_and_failed_allocation_is_atomic() {
+    for (ripple, speed) in [(false, 2.0), (true, 1.0), (true, 0.5)] {
+        let mut fx = Fx::new();
+        let v = fx.v(0);
+        let clip = fx.put(v, 20, 20, 100);
+        fx.put(v, 40, 20, 120);
+        fx.seq.caption_tracks.push(ripple_caption_track(90000, false, true, f(40) - Tick(7), Tick(30)));
+        let before = fx.seq.clone();
+        let mut next = u64::MAX;
+        let result = set_speed_group(&mut fx.seq, &[clip], speed, true, ripple, &mut Fx::ctx(&mut next));
+        if ripple && speed == 0.5 {
+            assert!(result.is_err(), "a required caption split cannot overflow native identity allocation");
+            assert_eq!(fx.seq, before);
+        } else {
+            result.unwrap();
+            assert_eq!(fx.seq.caption_tracks, before.caption_tracks);
+        }
+        assert_eq!(next, u64::MAX);
+    }
+}
+
+#[test]
+fn ripple_delete_moves_exact_short_captions_and_respects_track_locks() {
+    let mut fx = Fx::new();
+    let v = fx.v(0);
+    let first = fx.put(v, 0, 12, 0);
+    fx.put(v, 12, 12, 12);
+    for (id, locked, sync_lock) in [(90000, false, true), (90010, true, true), (90020, false, false)] {
+        fx.seq.caption_tracks.push(ripple_caption_track(id, locked, sync_lock, f(12) + Tick(17), Tick(23)));
+    }
+    let before = fx.seq.caption_tracks.clone();
+    assert_eq!(ripple_delete_items(&mut fx.seq, &[first]).unwrap(), vec![TimeRange::new(f(0), f(12))]);
+    assert_eq!(fx.spans(v), vec![(0, 12)]);
+    let mut expected = before;
+    expected[0].captions[0].start = Tick(17);
+    assert_eq!(fx.seq.caption_tracks, expected, "metadata, styles, tiny durations and held tracks must survive exactly");
+    assert!(fx.seq.check().is_ok());
+}
+
+#[test]
+fn caption_trim_follows_both_edges_and_directions_in_single_and_linked_services() {
+    for group in [false, true] {
+        for (edge, frames) in [(Edge::In, 3), (Edge::In, -3), (Edge::Out, 3), (Edge::Out, -3)] {
+            let mut fx = Fx::new();
+            let v = fx.v(0);
+            let target = fx.put(v, 20, 20, 100);
+            fx.put(v, 40, 20, 120);
+            for (id, locked, sync) in [(90000, false, true), (90010, true, true), (90020, false, false)] {
+                fx.seq.caption_tracks.push(ripple_caption_track(id, locked, sync, f(40) + Tick(17), Tick(23)));
+            }
+            let mut expected = fx.seq.caption_tracks.clone();
+            let shift = if edge == Edge::In { -f(frames) } else { f(frames) };
+            expected[0].captions[0].start += shift;
+            let mut next = fx.next;
+            let applied = if group {
+                ripple_trim_group(&mut fx.seq, &[target], edge, f(frames), &mut Fx::ctx(&mut next))
+            } else {
+                trim(&mut fx.seq, target, edge, TrimMode::Ripple, f(frames), &mut Fx::ctx(&mut next))
+            }
+            .unwrap();
+            assert_eq!(applied, f(frames));
+            assert_eq!(fx.seq.caption_tracks, expected, "group={group} edge={edge:?} frames={frames}");
+            assert_eq!(next, fx.next, "a later tiny caption requires no new identity");
+            fx.seq.check().unwrap();
+        }
+    }
+}
+
+#[test]
+fn caption_trim_shortening_extracts_and_extension_splits_exact_cue_metadata() {
+    for group in [false, true] {
+        for edge in [Edge::In, Edge::Out] {
+            for extend in [false, true] {
+                let mut fx = Fx::new();
+                let v = fx.v(0);
+                let target = fx.put(v, 20, 20, 100);
+                fx.put(v, 40, 20, 120);
+                let cut = if edge == Edge::In { f(20) } else { f(40) };
+                let track = ripple_caption_track(90000, false, true, cut - Tick(7), Tick(30));
+                let original = track.captions[0].clone();
+                fx.seq.caption_tracks.push(track);
+                // Native edits permit exact sub-frame deltas; no imported cue rounding.
+                let magnitude = Tick(11);
+                let delta = if (edge == Edge::Out) == extend { magnitude } else { -magnitude };
+                let mut next = fx.next;
+                if group {
+                    ripple_trim_group(&mut fx.seq, &[target], edge, delta, &mut Fx::ctx(&mut next)).unwrap();
+                } else {
+                    trim(&mut fx.seq, target, edge, TrimMode::Ripple, delta, &mut Fx::ctx(&mut next)).unwrap();
+                }
+                let cues = &fx.seq.caption_tracks[0].captions;
+                if extend {
+                    assert_eq!(cues.len(), 2);
+                    let mut left = original.clone();
+                    left.duration = Tick(7);
+                    let mut right = original.clone();
+                    right.id = ClipId(fx.next);
+                    right.start = cut + magnitude;
+                    right.duration = Tick(23);
+                    right.cue_id = None;
+                    assert_eq!(cues, &[left, right]);
+                    assert_eq!(next, fx.next + 1);
+                } else {
+                    let mut expected = original.clone();
+                    expected.duration -= if edge == Edge::In { magnitude } else { Tick(7) };
+                    if edge == Edge::Out {
+                        expected.start = cut - magnitude;
+                    }
+                    assert_eq!(cues, &[expected]);
+                    assert_eq!(next, fx.next);
+                }
+                fx.seq.check().unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn caption_trim_linked_head_uses_latest_member_cut_without_double_ripple() {
+    let mut fx = Fx::new();
+    let (v, a) = (fx.v(0), fx.a(0));
+    let picture = fx.put(v, 20, 20, 100);
+    let sound = fx.put(a, 18, 22, 98);
+    for id in [picture, sound] {
+        fx.seq.find_item_mut(id).unwrap().1.link = Some(7);
+    }
+    fx.put(v, 40, 10, 120);
+    let mut early = ripple_caption_track(90000, false, true, f(18) + Tick(17), Tick(23));
+    let mut later = early.captions[0].clone();
+    later.id = ClipId(90002);
+    later.start = f(40) + Tick(17);
+    early.captions.push(later);
+    fx.seq.caption_tracks.push(early);
+    let mut expected = fx.seq.caption_tracks.clone();
+    expected[0].captions[1].start -= f(3);
+    let mut next = fx.next;
+    ripple_trim_group(&mut fx.seq, &[sound, picture], Edge::In, f(3), &mut Fx::ctx(&mut next)).unwrap();
+    assert_eq!(fx.seq.caption_tracks, expected);
+    fx.seq.check().unwrap();
+}
+
+#[test]
+fn caption_trim_media_failure_and_regular_trim_preserve_captions_and_ids() {
+    for group in [false, true] {
+        let mut fx = Fx::new();
+        let (v, a) = (fx.v(0), fx.a(0));
+        let target = fx.put(v, 20, 20, 100);
+        fx.put(v, 40, 10, 120);
+        fx.put(a, 35, 10, 0);
+        fx.seq.track_mut(a).unwrap().sync_lock = true;
+        fx.seq.caption_tracks.push(ripple_caption_track(90000, false, true, f(40) + Tick(17), Tick(23)));
+        let before = fx.seq.clone();
+        let mut next = fx.next;
+        let result = if group {
+            ripple_trim_group(&mut fx.seq, &[target], Edge::Out, -f(3), &mut Fx::ctx(&mut next))
+        } else {
+            trim(&mut fx.seq, target, Edge::Out, TrimMode::Ripple, -f(3), &mut Fx::ctx(&mut next))
+        };
+        assert!(matches!(result, Err(EditError::SyncLockConflict(_))));
+        assert_eq!(fx.seq, before);
+        assert_eq!(next, fx.next);
+        trim(&mut fx.seq, target, Edge::Out, TrimMode::Regular, -f(3), &mut Fx::ctx(&mut next)).unwrap();
+        assert_eq!(fx.seq.caption_tracks, before.caption_tracks);
+        assert_eq!(next, fx.next);
+    }
+}
+
+#[test]
+fn caption_trim_rejects_time_and_identity_overflow_without_partial_changes() {
+    for case in 0..4 {
+        let mut tracks = vec![ripple_caption_track(90000, false, true, Tick(10), Tick(20))];
+        let (cut, delta) = match case {
+            0 => (Tick(15), Tick(i64::MIN)),
+            1 => (Tick(15), Tick(i64::MAX)),
+            2 => (Tick(15), Tick(5)),
+            _ => {
+                tracks[0].captions[0].start = Tick(i64::MAX - 5);
+                (Tick(15), Tick(-5))
+            }
+        };
+        let before = tracks.clone();
+        let mut next = if case == 2 { u64::MAX } else { 100000 };
+        let old_next = next;
+        assert!(captions::ripple_trim(&mut tracks, Edge::Out, cut, delta, &mut Fx::ctx(&mut next)).is_err());
+        assert_eq!(tracks, before);
+        assert_eq!(next, old_next);
+    }
+}
+
+proptest! {
+    #[test]
+    fn caption_trim_matches_independent_cut_time_mapping(start in 0i64..80, duration in 1i64..30, magnitude in 1i64..15, extension in any::<bool>(), tail in any::<bool>()) {
+        let cut=40;let edge=if tail {Edge::Out} else {Edge::In};let mut tracks=vec![ripple_caption_track(90000,false,true,Tick(start),Tick(duration))];
+        let delta=if tail==extension {magnitude} else {-magnitude};let mut next=100000;
+        captions::ripple_trim(&mut tracks,edge,Tick(cut),Tick(delta),&mut Fx::ctx(&mut next)).unwrap();
+        let end=start+duration;
+        let expected=if extension {
+            if end<=cut {vec![(start,end)]}
+            else if start>=cut {vec![(start+magnitude,end+magnitude)]}
+            else {vec![(start,cut),(cut+magnitude,end+magnitude)]}
+        } else {
+            let left=if tail {cut-magnitude} else {cut};
+            let map=|t:i64|t-(t-left).max(0).min(magnitude);
+            let (a,b)=(map(start),map(end));if a==b {vec![]} else {vec![(a,b)]}
+        };
+        let actual:Vec<_>=tracks[0].captions.iter().map(|c|(c.start.0,c.end().0)).collect();prop_assert_eq!(actual,expected);
+        for c in &tracks[0].captions {prop_assert_eq!(&c.text,"Keep exact words");prop_assert_eq!(&c.settings,"align:start");}
+    }
+}
+
+#[test]
+fn ripple_delete_caption_overlaps_use_exact_extract_policy() {
+    for (start, end, expected) in [
+        (2, 10, Some((2, 10))),
+        (8, 12, Some((8, 10))),
+        (10, 20, None),
+        (11, 13, None),
+        (18, 23, Some((10, 13))),
+        (8, 23, Some((8, 13))),
+        (20, 25, Some((10, 15))),
+    ] {
+        let mut fx = Fx::new();
+        let v = fx.v(0);
+        fx.put(v, 0, 10, 0);
+        let target = fx.put(v, 10, 10, 10);
+        fx.put(v, 20, 10, 20);
+        let track = ripple_caption_track(90000, false, true, f(start), f(end - start));
+        let original = track.captions[0].clone();
+        fx.seq.caption_tracks.push(track);
+        ripple_delete_items(&mut fx.seq, &[target]).unwrap();
+        let cues = &fx.seq.caption_tracks[0].captions;
+        if let Some((a, b)) = expected {
+            let mut cue = original;
+            cue.start = f(a);
+            cue.duration = f(b - a);
+            assert_eq!(cues, &[cue], "original range {start}..{end}");
+        } else {
+            assert!(cues.is_empty(), "original range {start}..{end}");
+        }
+        assert!(fx.seq.check().is_ok());
+    }
+}
+
+#[test]
+fn ripple_delete_multiple_spans_and_gap_closing_keep_caption_clocks() {
+    let mut fx = Fx::new();
+    let v = fx.v(0);
+    let a = fx.put(v, 5, 5, 0);
+    let b = fx.put(v, 20, 5, 0);
+    fx.put(v, 30, 10, 0);
+    fx.seq.caption_tracks.push(ripple_caption_track(90000, false, true, f(30) + Tick(17), Tick(23)));
+    let spans = ripple_delete_items(&mut fx.seq, &[a, b]).unwrap();
+    assert_eq!(spans, vec![TimeRange::new(f(5), f(5)), TimeRange::new(f(20), f(5))]);
+    assert_eq!(fx.seq.caption_tracks[0].captions[0].start, f(20) + Tick(17));
+    assert_eq!(fx.spans(v), vec![(20, 10)]);
+    close_gap(&mut fx.seq, v, f(10)).unwrap();
+    assert_eq!(fx.seq.caption_tracks[0].captions[0].start, Tick(17));
+    assert_eq!(fx.spans(v), vec![(0, 10)]);
+}
+
+#[test]
+fn failed_ripple_or_gap_close_does_not_publish_caption_changes() {
+    for gap in [false, true] {
+        let mut fx = Fx::new();
+        let (v, a) = (fx.v(0), fx.a(0));
+        fx.put(v, 0, 10, 0);
+        let target = fx.put(v, if gap { 20 } else { 10 }, 10, 0);
+        fx.put(v, 30, 10, 0);
+        fx.put(a, 10, 10, 0);
+        fx.seq.track_mut(a).unwrap().sync_lock = true;
+        fx.seq.caption_tracks.push(ripple_caption_track(90000, false, true, f(30), f(2)));
+        let before = fx.seq.clone();
+        let result = if gap { close_gap(&mut fx.seq, v, f(15)) } else { ripple_delete_items(&mut fx.seq, &[target]).map(|_| ()) };
+        assert!(matches!(result, Err(EditError::SyncLockConflict(_))));
+        assert_eq!(fx.seq, before);
+    }
+}
+
+proptest! {
+    #[test]
+    fn ripple_caption_mapping_matches_collapsed_time(start in 0i64..40, duration in 1i64..25, offset in 0i64..1000) {
+        let mut fx = Fx::new();
+        let v = fx.v(0);
+        fx.put(v, 0, 10, 0);
+        let target = fx.put(v, 10, 10, 10);
+        fx.put(v, 20, 60, 20);
+        let a = f(start) + Tick(offset);
+        let b = a + f(duration);
+        fx.seq.caption_tracks.push(ripple_caption_track(90000, false, true, a, b - a));
+        ripple_delete_items(&mut fx.seq, &[target]).unwrap();
+        let project = |t: Tick| t - (t - f(10)).max(Tick::ZERO).min(f(10));
+        let expected = (project(a), project(b));
+        let cues = &fx.seq.caption_tracks[0].captions;
+        if expected.0 == expected.1 {
+            prop_assert!(cues.is_empty());
+        } else {
+            prop_assert_eq!(cues.len(), 1);
+            prop_assert_eq!((cues[0].start, cues[0].end()), expected);
+            prop_assert_eq!(&cues[0].text, "Keep exact words");
+            prop_assert_eq!(&cues[0].cue_id, &Some("original-cue".into()));
+        }
+        prop_assert!(fx.seq.check().is_ok());
+    }
+}
+
 fn f(n: i64) -> Tick {
     R.tick_of(n)
 }
@@ -62,6 +478,7 @@ impl Fx {
             source_channels: Vec::new(),
             audio_stream: 0,
             graphic: None,
+            identity: None,
         }
     }
     fn put(&mut self, track: TrackId, start: i64, dur: i64, src_in: i64) -> ClipId {
@@ -87,6 +504,53 @@ fn overwrite_splits_underlying() {
     let right = &fx.seq.track(v1).unwrap().items[2];
     assert_eq!(right.source_in, f(60), "right remainder keeps media continuity");
     fx.seq.check().unwrap();
+}
+
+#[test]
+fn multicam_flatten_copies_outer_effect_settings_without_aliasing_local_identities() {
+    use filmcraft_project::{
+        Mask, MaskPath, ParamValue,
+        effect::{find_effect, intrinsic_video},
+    };
+    let mut fx = Fx::new();
+    let mut outer = fx.item(100, 24, 0);
+    let mut inner = fx.item(0, 24, 0);
+    let standard = find_effect("gaussian_blur").unwrap().instance();
+    inner.effects = intrinsic_video();
+    inner.effects.push(standard.clone());
+    for (i, e) in inner.effects.iter_mut().enumerate() {
+        e.instance_id = Some(format!("{i:032x}"));
+    }
+    outer.effects = intrinsic_video();
+    outer.effects.push(standard);
+    for (i, e) in outer.effects.iter_mut().enumerate() {
+        // Valid local IDs may coincide in different owning clips.
+        e.instance_id = Some(format!("{i:032x}"));
+    }
+    outer.effects[0].param_mut("scale").unwrap().value = ParamValue::Float(50.0);
+    let mut mask = Mask::new("Outer mask", MaskPath::default());
+    mask.instance_id = Some("a".repeat(32));
+    outer.effects.last_mut().unwrap().masks.push(mask);
+    let inner_effects = inner.effects.clone();
+    let mut track = fx.seq.video_tracks[0].clone();
+    track.items = vec![inner];
+    // Automatic Motion points contain NaN; compare their serialized authored
+    // representation rather than IEEE equality (NaN != NaN).
+    let before = serde_json::to_value((&outer, &track)).unwrap();
+    let mut next = fx.next;
+    let pieces = multicam::flatten_items(&outer, &track, &mut Fx::ctx(&mut next), &mut std::collections::HashMap::new()).unwrap();
+    assert_eq!(pieces.len(), 1);
+    let piece = &pieces[0];
+    assert_eq!(piece.effects[0].instance_id, inner_effects[0].instance_id);
+    assert_eq!(piece.effects[0].f64_at("scale", Tick::ZERO), 50.0);
+    assert_eq!(piece.effects[inner_effects.len() - 1], *inner_effects.last().unwrap());
+    let copied = piece.effects.last().unwrap();
+    assert_eq!(copied.instance_id, None);
+    assert_eq!(copied.masks[0].instance_id, None);
+    let mut expected = outer.effects.last().unwrap().clone();
+    expected.clear_instance_ids();
+    assert_eq!(copied, &expected);
+    assert_eq!(serde_json::to_value((&outer, &track)).unwrap(), before);
 }
 
 #[test]
@@ -147,6 +611,38 @@ fn ripple_delete_and_conflict() {
     fx.put(a1, 22, 3, 0);
     assert_eq!(ripple_delete_items(&mut fx.seq, &[b]), Err(EditError::SyncLockConflict("A1".into())), "names the track in the way");
     assert_eq!(fx.spans(v1), vec![(0, 10), (20, 10)], "unchanged on failure");
+}
+
+#[test]
+fn extract_and_lift_preserve_surviving_jl_links_at_a_shared_right_splice() {
+    for extract_time in [false, true] {
+        for (video_start, audio_start, cut_start) in [(10, 0, 10), (0, 10, 10), (12, 0, 10), (0, 12, 10), (15, 0, 10), (0, 15, 10), (16, 0, 10), (0, 0, 10)] {
+            let mut fx = Fx::new();
+            let (v, a) = (fx.v(0), fx.a(0));
+            let video = fx.put(v, video_start, 40 - video_start, 100 + video_start);
+            let audio = fx.put(a, audio_start, 40 - audio_start, 200 + audio_start);
+            for id in [video, audio] {
+                fx.seq.find_item_mut(id).unwrap().1.link = Some(9000);
+            }
+            let mut n = fx.next;
+            let range = TimeRange::new(f(cut_start), f(5));
+            if extract_time {
+                extract(&mut fx.seq, &[v, a], range, &mut Fx::ctx(&mut n));
+            } else {
+                lift(&mut fx.seq, &[v, a], range, &mut Fx::ctx(&mut n));
+            }
+            let right_start = if extract_time { cut_start } else { cut_start + 5 };
+            let vr = fx.seq.track(v).unwrap().items.iter().find(|c| c.start >= f(right_start)).unwrap();
+            let ar = fx.seq.track(a).unwrap().items.iter().find(|c| c.start >= f(right_start)).unwrap();
+            assert_eq!(vr.link, ar.link, "surviving J/L right sides must stay linked: {extract_time} {video_start} {audio_start}");
+            assert_ne!(vr.link, Some(9000), "right side must not follow the retained lead on the left");
+            assert_eq!(vr.source_in, f(100 + video_start.max(15)));
+            assert_eq!(ar.source_in, f(200 + audio_start.max(15)));
+            assert_eq!(vr.duration, f(40 - video_start.max(15)));
+            assert_eq!(ar.duration, f(40 - audio_start.max(15)));
+            fx.seq.check().unwrap();
+        }
+    }
 }
 
 #[test]

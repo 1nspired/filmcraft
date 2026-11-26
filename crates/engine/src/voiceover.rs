@@ -302,7 +302,7 @@ fn settings(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(v) = str_p(p, "source") {
         vo.source = v.to_string();
     }
-    if let Some(v) = u64_p(p, "inputChannel") {
+    if let Some(v) = u64_p(p, "inputChannel")? {
         vo.input_channel = v.min(63) as u32;
     }
     if let Some(v) = str_p(p, "name") {

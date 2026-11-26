@@ -83,6 +83,9 @@ pub struct VideoStreamInfo {
 /// Most audio streams a source reports (the count comes from the file: never trusted).
 pub const MAX_AUDIO_STREAMS: usize = 64;
 
+mod audio_layout;
+pub use audio_layout::{SourceAudioLayout, SourceAudioTrack};
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AudioStreamInfo {
     pub sample_rate: u32,
@@ -157,6 +160,11 @@ impl FrameRequest {
 
 pub trait MediaSource: Send + Sync {
     fn info(&self) -> &MediaInfo;
+    /// Actual combined-stream channel order, when this source can describe it.
+    /// This must not open another source or alter the source/project.
+    fn audio_channel_layout(&self) -> Result<Option<SourceAudioLayout>> {
+        Ok(None)
+    }
     /// The frame displayed at media time `req.time`.
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>>;
     /// `frames` audio frames starting at sample index `start` (at `sample_rate`, media time).

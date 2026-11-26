@@ -12,7 +12,7 @@ use filmcraft_project::{BinId, ClipId, ItemId, TrackId, TrackKind};
 use filmcraft_time::Tick;
 use serde_json::{Value, json};
 
-use crate::commands::{CommandSpec, always, bad, bool_p, u64_p};
+use crate::commands::{CommandSpec, always, bad, bool_p};
 use crate::{EngineError, Result, Session};
 
 /// Write a pasted image (PNG bytes) to a new `Pasted Image <n>.png`; returns its path.
@@ -46,7 +46,7 @@ fn paste_media(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let insert = bool_p(p, "insert").unwrap_or(false);
     let n0 = s.history.undo.len();
-    let r = import_and_place(s, &paths, u64_p(p, "bin").map(BinId), place, insert);
+    let r = import_and_place(s, &paths, crate::commands::nullable_u64_p(p, "bin")?.map(BinId), place, insert);
     crate::clip_ops::collapse_history(s, n0, if insert { "Paste Insert" } else { "Paste" });
     r
 }

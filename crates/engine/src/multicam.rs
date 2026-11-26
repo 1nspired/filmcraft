@@ -363,7 +363,7 @@ fn synchronize(s: &mut Session, p: &Value) -> Result<Value> {
     let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
     let q = s.active_sequence().ok_or(EngineError::NoSequence)?.clone();
     let rate = q.settings.frame_rate;
-    let sel = with_links(s, &clips_p(s, p));
+    let sel = with_links(s, &clips_p(s, p)?);
     // group into link units
     let mut units: Vec<Unit> = Vec::new();
     let mut seen: Vec<ClipId> = Vec::new();
@@ -398,7 +398,7 @@ fn synchronize(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, "select clips from at least two different sources"));
     }
     // reference unit
-    let reference = if let Some(c) = u64_p(p, "reference").map(ClipId) {
+    let reference = if let Some(c) = u64_p(p, "reference")?.map(ClipId) {
         units.iter().position(|u| u.members.contains(&c)).ok_or_else(|| bad(cmd, "`reference` is not among the clips"))?
     } else if let Some(t) = track_p(s, p, "track", cmd)? {
         units
@@ -609,7 +609,7 @@ fn create_multicam(s: &mut Session, p: &Value) -> Result<Value> {
         v.sort_by_key(|a| (a.0, a.1.is_none(), a.1.clone()));
         clips = v.into_iter().map(|x| x.2).collect();
     }
-    let reference = match item_p(p, "reference") {
+    let reference = match item_p(p, "reference")? {
         Some(r) => clips.iter().position(|c| c.item == r).ok_or_else(|| bad(cmd, "`reference` is not among the items"))?,
         None => 0,
     };
@@ -713,13 +713,13 @@ pub fn multicam_clip_at(s: &Session, t: Tick) -> Option<(TrackId, TrackItem)> {
 fn angle_p(s: &Session, p: &Value, source: ItemId, cmd: &str) -> Result<u32> {
     let q = s.project.sequence(source).ok_or_else(|| bad(cmd, "not a multi-camera clip"))?;
     let cams = q.cameras();
-    if let Some(a) = u64_p(p, "angle") {
+    if let Some(a) = u64_p(p, "angle")? {
         if (a as usize) < cams.cameras.len() {
             return Ok(a as u32);
         }
         return Err(bad(cmd, format!("angle {a} out of range (0–{})", cams.cameras.len().saturating_sub(1))));
     }
-    let mut n = u64_p(p, "camera").ok_or_else(|| bad(cmd, "need `camera` (1-based) or `angle`"))? as usize;
+    let mut n = u64_p(p, "camera")?.ok_or_else(|| bad(cmd, "need `camera` (1-based) or `angle`"))? as usize;
     let shown = cams.shown_angles();
     if bool_p(p, "pageRelative").unwrap_or(false) {
         n += s.state.multicam_view.page_layout(shown.len()).first;
@@ -741,7 +741,7 @@ fn switch_angle(s: &mut Session, p: &Value) -> Result<Value> {
     let audio_only = bool_p(p, "audioOnly").unwrap_or(false);
     let follows = s.state.multicam_audio_follows_video;
     let videos: Vec<TrackItem> = if p.get("clips").is_some() || p.get("clip").is_some() {
-        clips_p(s, p).iter().filter_map(|c| q.find_item(*c).map(|x| x.1.clone())).filter(|i| i.multicam.is_some()).collect()
+        clips_p(s, p)?.iter().filter_map(|c| q.find_item(*c).map(|x| x.1.clone())).filter(|i| i.multicam.is_some()).collect()
     } else {
         multicam_clip_at(s, t).map(|x| vec![x.1]).unwrap_or_default()
     };
@@ -787,7 +787,7 @@ fn has_multicam_selection(s: &Session) -> std::result::Result<(), String> {
 
 fn enable(s: &mut Session, p: &Value) -> Result<Value> {
     let q = s.active_sequence().ok_or(EngineError::NoSequence)?.clone();
-    let clips = with_links(s, &clips_p(s, p));
+    let clips = with_links(s, &clips_p(s, p)?);
     let nested: Vec<TrackItem> = clips.iter().filter_map(|c| q.find_item(*c).map(|x| x.1.clone())).filter(|i| s.project.sequence(i.item).is_some()).collect();
     if nested.is_empty() {
         return Err(EngineError::Other("select nested sequence or multi-camera clips".into()));
@@ -815,7 +815,7 @@ fn enable(s: &mut Session, p: &Value) -> Result<Value> {
 fn flatten(s: &mut Session, p: &Value) -> Result<Value> {
     let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
     let q = s.active_sequence().ok_or(EngineError::NoSequence)?.clone();
-    let clips = with_links(s, &clips_p(s, p));
+    let clips = with_links(s, &clips_p(s, p)?);
     let mut targets: Vec<(TrackKind, usize, TrackItem)> = Vec::new();
     for (k, ts) in [(TrackKind::Video, &q.video_tracks), (TrackKind::Audio, &q.audio_tracks)] {
         for (ti, t) in ts.iter().enumerate() {
@@ -1036,7 +1036,7 @@ fn audio_follows(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn edit_cameras(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "multicam.editCameras";
-    let id = match item_p(p, "sequence") {
+    let id = match item_p(p, "sequence")? {
         Some(i) => i,
         None => multicam_clip_at(s, s.playhead()).map(|c| c.1.item).ok_or_else(|| bad(cmd, "need `sequence` (or a multi-camera clip at the playhead)"))?,
     };

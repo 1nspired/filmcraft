@@ -1,4 +1,8 @@
 # Spanish (es) catalog. Columns, separated by a TAB:  context <TAB> source <TAB> translation
+	Poema notes & protection…	Notas y protección de Poema…
+	Poema	Poema
+	Track Poema Instances	Registrar instancias de Poema
+	Track Poema Effect Instances	Registrar instancias de efectos de Poema
 #
 #   context  empty          a plain UI string; `source` is the English text in the code (`tl!("…")`,
 #                           a menu label, or a name the UI translates with `i18n::t`)
@@ -14,7 +18,7 @@
 # way. Product and technology names (FilmCraft, ArtCraft, Lumetri, ProRes, LUFS…) keep their
 # spelling. "video" is written without an accent, as in the rest of this catalog.
 
-	About FilmCraft	Acerca de FilmCraft
+	About Poema NLE	Acerca de Poema NLE
 	Add Audio Submix Track	Añadir pista de submezcla de audio
 	Add Caption at Playhead	Añadir subtítulo en el cabezal
 	Add Chapter Marker…	Añadir marcador de capítulo…
@@ -40,7 +44,7 @@
 	Apply Default Transitions to Selection	Aplicar transiciones predeterminadas a la selección
 	Apply Video Transition	Aplicar transición de video
 	Arrange	Organizar
-	ArtCraft Website	Sitio web de ArtCraft
+	FilmCraft engine website	Sitio web del motor FilmCraft
 	Assembly	Ensamblaje
 	Attach Proxies…	Adjuntar proxies…
 	Audio Channels…	Canales de audio…
@@ -133,9 +137,9 @@
 	File	Archivo
 	File…	Archivo…
 	Fill frame	Rellenar fotograma
-	FilmCraft Help…	Ayuda de FilmCraft…
-	FilmCraft on GitHub	FilmCraft en GitHub
-	FilmCraft on getartcraft.com	FilmCraft en getartcraft.com
+	Native editor reference…	Referencia del editor nativo…
+	Poema source code	Código fuente de Poema
+	About the FilmCraft engine	Acerca del motor FilmCraft
 	Find Next	Buscar siguiente
 	Find…	Buscar…
 	Fit	Ajustar
@@ -179,7 +183,7 @@
 	Insert Frame Hold Segment	Insertar segmento de fotograma congelado
 	Install Motion Graphics Template…	Instalar plantilla de animación…
 	Interpret Footage…	Interpretar material…
-	Join the ArtCraft Discord…	Únete al Discord de ArtCraft…
+	FilmCraft upstream community…	Comunidad original de FilmCraft…
 	Keyboard Shortcuts…	Atajos de teclado…
 	Label	Etiqueta
 	Labels…	Etiquetas…
@@ -273,7 +277,7 @@
 	Render Selection	Procesar selección
 	Replace Fonts in Projects…	Reemplazar fuentes en proyectos…
 	Replace With Clip	Reemplazar con clip
-	Report an Issue…	Informar de un problema…
+	Report a Poema issue…	Informar de un problema de Poema…
 	Reset All Parameters	Restablecer todos los parámetros
 	Reset Duration	Restablecer duración
 	Reset to Saved Layout	Restablecer al diseño guardado
@@ -1837,7 +1841,7 @@
 	Height	Altura
 	Hexagon	Hexágono
 	Hide Back Face	Ocultar la cara posterior
-	Hide FilmCraft	Ocultar FilmCraft
+	Hide Poema NLE	Ocultar Poema NLE
 	Hide Others	Ocultar otras
 	High	Alta
 	High Cutoff	Corte de agudos
@@ -3240,7 +3244,7 @@
 	QuickTime, ProRes 4444 (4:4:4) with alpha channel, 24-bit 48 kHz PCM	QuickTime, ProRes 4444 (4:4:4) con canal alfa, PCM de 24 bits y 48 kHz
 	QuickTime, ProRes 4444 XQ (4:4:4), 24-bit 48 kHz PCM	QuickTime, ProRes 4444 XQ (4:4:4), PCM de 24 bits y 48 kHz
 	QuickTime, ProRes 422, 24-bit 48 kHz PCM	QuickTime, ProRes 422, PCM de 24 bits y 48 kHz
-	Quit FilmCraft	Salir de FilmCraft
+	Quit Poema NLE	Salir de Poema NLE
 	Rate Stretch Tool	Herramienta Ajuste de velocidad
 	Razor Tool	Herramienta Cuchilla
 	Rectangle Tool	Herramienta Rectángulo
@@ -3617,3 +3621,13 @@
 	Open a sequence to search its graphics	Abre una secuencia para buscar en sus gráficos
 	No text graphics in this sequence. Add text with the Type tool.	Esta secuencia no tiene gráficos con texto. Añade texto con la herramienta Texto.
 	No matching text.	Ningún texto coincide.
+	Agent-led film editing. Native editor based on FilmCraft.	Edición de películas dirigida por un agente. Editor nativo basado en FilmCraft.
+	Project and upstream links	Enlaces del proyecto y del motor original
+	FilmCraft upstream community (discord.gg/artcraft)	Comunidad original de FilmCraft (discord.gg/artcraft)
+	Shows the Poema version, upstream links and native-editor credits.	Muestra la versión de Poema, enlaces del proyecto original y créditos del editor nativo.
+	Poema NLE hit an error	Poema NLE encontró un error
+	Native editor: MIT OR Apache-2.0. Fonts: Inter, Noto Serif and JetBrains Mono (SIL OFL 1.1).	Editor nativo: MIT O Apache-2.0. Fuentes: Inter, Noto Serif y JetBrains Mono (SIL OFL 1.1).
+
+	Move Up	Subir
+
+	Move Down	Bajar

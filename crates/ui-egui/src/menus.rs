@@ -22,6 +22,7 @@ macro_rules! uic {
 }
 
 pub const UI_COMMANDS: &[UiCommand] = &[
+    uic!("clip.poemaNotes", "Poema notes & protection…", ["Clip"], None),
     uic!("window.dockAction", "Docking Action", [], None),
     uic!("window.dockPanel", "Dock Panel", [], None),
     uic!("window.floatPanel", "Undock Panel", [], None),
@@ -137,14 +138,14 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("mode.import", "Import", [], None),
     uic!("mode.edit", "Edit", [], None),
     uic!("mode.export", "Export", ["File", "Export"], Some("Cmd+M")),
-    uic!("help.discord", "Join the ArtCraft Discord…", ["Help"], None),
-    uic!("help.website", "ArtCraft Website", ["Help"], None),
-    uic!("help.appPage", "FilmCraft on getartcraft.com", ["Help"], None),
-    uic!("help.github", "FilmCraft on GitHub", ["Help"], None),
-    uic!("help.reportIssue", "Report an Issue…", ["Help"], None),
+    uic!("help.discord", "FilmCraft upstream community…", ["Help"], None),
+    uic!("help.website", "FilmCraft engine website", ["Help"], None),
+    uic!("help.appPage", "About the FilmCraft engine", ["Help"], None),
+    uic!("help.github", "Poema source code", ["Help"], None),
+    uic!("help.reportIssue", "Report a Poema issue…", ["Help"], None),
     uic!("help.revealLogFiles", "Reveal Log Files…", ["Help"], None),
     uic!("help.systemCompatibilityReport", "System Compatibility Report…", ["Help"], None),
-    uic!("app.about", "About FilmCraft", ["Help"], None),
+    uic!("app.about", "About Poema NLE", ["Help"], None),
     uic!("app.keyboardShortcuts", "Keyboard Shortcuts…", ["Edit"], Some("Cmd+Alt+K")),
     uic!("app.settings.general", "General…", ["Edit", "Preferences"], Some("Cmd+,")),
     uic!("app.settings.appearance", "Appearance…", ["Edit", "Preferences"], None),
@@ -179,6 +180,28 @@ pub fn targets_source(app: &FilmcraftApp, params: &Value) -> bool {
 
 /// Execute a UI or engine command by id.
 pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut params: Value) -> Result<Value, String> {
+    if id == "file.newProject" && app.composer_panel.is_some() {
+        if params.as_object().is_none_or(|v| !v.is_empty()) {
+            return Err("managed New Project expects empty parameters; the current edit is kept".into());
+        }
+        if app.session.is_display_only()
+            || app.session.workspace_update_status().is_some()
+            || crate::native_writer::application_held(app)
+            || app.native_writer.pending.is_some()
+        {
+            return Err("finish the current native setup or writer before New Project".into());
+        }
+        let panel = app.composer_panel.as_mut().ok_or("managed composer is unavailable")?;
+        if !panel.document_matches(&app.session)? {
+            return Err("New Project requires this composer's exact native document".into());
+        }
+        panel.request_new_project()?;
+        ctx.request_repaint();
+        return Ok(json!({"status":"opening","currentProjectKept":true}));
+    }
+    if id == "clip.poemaNotes" {
+        return crate::panels::poema::open(app, &params);
+    }
     if id == "edit.selectAll" && (crate::panels::graphics::select_all_edited_text(app) || crate::panels::effect_controls::select_all_keyframes(app)) {
         return Ok(Value::Null);
     }
@@ -685,7 +708,7 @@ pub const MENUS: [&str; 9] = ["File", "Edit", "Clip", "Sequence", "Markers", "Gr
 /// Labels only the native macOS app menu shows, with no command in the menu tree behind them: the
 /// Settings submenu and the predefined Hide, Hide Others and Quit items. They are translated through
 /// the catalogs like menu labels (`apps/filmcraft/src/native_menu.rs`).
-pub const NATIVE_APP_MENU: [&str; 4] = ["Settings", "Hide FilmCraft", "Hide Others", "Quit FilmCraft"];
+pub const NATIVE_APP_MENU: [&str; 4] = ["Settings", "Hide Poema NLE", "Hide Others", "Quit Poema NLE"];
 
 pub fn menu_items(app: &FilmcraftApp) -> Vec<MenuItem> {
     let mut v = menu_items_for(&app.session);

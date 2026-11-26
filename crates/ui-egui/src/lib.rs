@@ -33,12 +33,15 @@ pub mod automation;
 pub mod brand;
 pub mod calc;
 mod cjk;
+pub mod composer_panel;
 pub mod control;
 pub mod crash;
 pub mod credits;
 pub mod dock;
 mod dock_shared;
 mod dock_ui;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_writer;
 /// Thumbnail textures kept before the least recently used are freed (each is up to 320 px wide).
 const MAX_THUMB_TEXTURES: usize = 512;
 
@@ -48,6 +51,7 @@ pub mod header;
 pub mod i18n;
 pub mod icons;
 pub mod links;
+mod media_intake;
 pub mod menus;
 pub mod native_dialogs;
 pub mod panels;
@@ -275,6 +279,8 @@ pub(crate) const EXPORT_SAVE_DIALOGS: [(&str, &str, &str); 7] = [
 ];
 
 pub struct FilmcraftApp {
+    /// Shared web composer identity/layout; the desktop host owns its WebView.
+    pub composer_panel: Option<composer_panel::Panel>,
     pub session: Session,
     pub ui: UiState,
     pub tokens: Tokens,
@@ -287,8 +293,11 @@ pub struct FilmcraftApp {
     pub hooks: HostHooks,
     pub dialog: Option<Dialog>,
     pub file_dialogs: panels::file_dialogs::FileDialogState,
+    /// Ephemeral, project-pinned Poema clip draft; never restored from UI preferences.
+    pub poema: Option<panels::poema::Draft>,
     /// The native file dialog the host is showing ([`Self::pick`]).
     native_dialog: Option<native_dialogs::PendingDialog>,
+    media_intake: media_intake::State,
     pub auto: automation::Registry,
     /// Named textures (monitors, thumbnails) with the key they show.
     textures: HashMap<String, (FrameKey, TextureHandle)>,
@@ -296,6 +305,8 @@ pub struct FilmcraftApp {
     /// [`MAX_THUMB_TEXTURES`] are freed, least recently used first (#1682).
     thumb_used: HashMap<String, u64>,
     control_rx: Option<Receiver<ControlRequest>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    native_writer: native_writer::WriterState,
     /// One explicit panel reveal; consumed by the custom renderer, never repeated per frame.
     pub(crate) pending_panel_raise: Option<PanelKind>,
     /// Explicit automation mode: native widget input and native menu commands are excluded.
@@ -367,6 +378,7 @@ pub struct FilmcraftApp {
     bindings_rev: u64,
     /// The menu tree last sent to `hooks.menu_changed` (the native menu bar).
     menu_sent: Vec<menus::MenuItem>,
+    menu_sent_composer_focus: bool,
     /// Keyboard Shortcuts dialog state.
     pub shortcut_editor: panels::shortcuts_dialog::EditorState,
     pub toast: Option<(String, f64)>,
@@ -543,6 +555,7 @@ impl FilmcraftApp {
         let workspaces =
             session.prefs_path.as_ref().and_then(|p| p.parent()).map(|d| dock::WorkspacePrefs::load(&d.join(dock::WORKSPACES_FILE))).unwrap_or_default();
         let language = i18n::Language::parse(&session.prefs.general.interface_language).unwrap_or_default();
+        let media_intake = media_intake::State::new(session.prefs_path.as_ref().and_then(|p| p.parent()).map(std::path::Path::to_path_buf));
         Self {
             session,
             ui: UiState { language, ..UiState::default() },
@@ -556,11 +569,16 @@ impl FilmcraftApp {
             // Unsaved changes left by a session that died are offered first thing.
             dialog: recovery.then_some(Dialog::Recovery),
             file_dialogs: Default::default(),
+            poema: None,
             native_dialog: None,
+            media_intake,
             auto: Default::default(),
             textures: HashMap::new(),
             thumb_used: HashMap::new(),
             control_rx: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            native_writer: Default::default(),
+            composer_panel: None,
             pending_panel_raise: None,
             control_input_only: false,
             native_window_focused: None,
@@ -596,6 +614,7 @@ impl FilmcraftApp {
             bindings: Vec::new(),
             bindings_rev: 0,
             menu_sent: Vec::new(),
+            menu_sent_composer_focus: false,
             shortcut_editor: Default::default(),
             toast: None,
             graphics_notice: None,
@@ -616,6 +635,8 @@ impl FilmcraftApp {
 
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
         self.control_rx = Some(rx);
+        #[cfg(not(target_arch = "wasm32"))]
+        native_writer::install(&mut self);
         self
     }
 
@@ -1501,13 +1522,15 @@ impl FilmcraftApp {
             return;
         }
         let items = menus::menu_items(self);
-        if items == self.menu_sent {
+        let composer_focus = self.composer_panel.as_ref().is_some_and(|p| p.focused);
+        if items == self.menu_sent && composer_focus == self.menu_sent_composer_focus {
             return;
         }
         if let Some(hook) = self.hooks.menu_changed.as_mut() {
             hook(&items);
         }
         self.menu_sent = items;
+        self.menu_sent_composer_focus = composer_focus;
     }
 
     /// Whether keyboard focus is on a dock divider or a floating panel's resize grip, as drawn last pass.
@@ -1520,6 +1543,9 @@ impl FilmcraftApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.composer_panel.as_ref().is_some_and(|p| p.focused) {
+            return;
+        }
         let workspaces = (dock::names(&self.workspaces), self.ui.workspace.clone());
         if self.bindings_rev != self.session.shortcuts.revision || workspaces != self.menu_workspaces {
             self.menu_workspaces = workspaces;
@@ -1663,6 +1689,7 @@ impl FilmcraftApp {
                 control::Outcome::Done(v) => {
                     let _ = reply.send(v);
                 }
+                control::Outcome::Pending => {}
                 control::Outcome::Retry(msg) => {
                     if now < deadline {
                         self.deferred.push((req, deadline));
@@ -1821,7 +1848,7 @@ impl FilmcraftApp {
         self.handle_drops(&ctx);
         if let Some(rx) = self.command_inbox.take() {
             while let Ok(id) = rx.try_recv() {
-                if self.control_input_only {
+                if self.control_input_only || self.composer_panel.as_ref().is_some_and(|p| p.focused) && id.starts_with("edit.") {
                     continue;
                 }
                 if let Err(e) = menus::invoke(self, &ctx, &id, json!({})) {
@@ -2000,7 +2027,7 @@ impl FilmcraftApp {
     fn error_window(&mut self, ctx: &egui::Context) {
         let Some(msg) = self.ui_error.clone() else { return };
         let mut close = false;
-        egui::Window::new(tl!("FilmCraft hit an error"))
+        egui::Window::new(tl!("Poema NLE hit an error"))
             .id(egui::Id::new("FilmCraft hit an error"))
             .collapsible(false)
             .resizable(false)
@@ -2066,6 +2093,23 @@ fn synthesize_mac_ctrl_click(armed: &mut bool, raw_input: &mut egui::RawInput) {
 impl eframe::App for FilmcraftApp {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         self.native_window_focused = Some(raw_input.focused);
+        #[cfg(not(target_arch = "wasm32"))]
+        if native_writer::application_held(self) {
+            // Never let input received during setup land after readiness changes
+            // later in this frame. Viewport close/geometry and screenshots survive.
+            raw_input.events.retain(|e| matches!(e, egui::Event::Screenshot { .. }));
+            raw_input.dropped_files.clear();
+            raw_input.hovered_files.clear();
+            raw_input.events.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+            self.synthetic.clear();
+            self.synthetic_modifiers = Default::default();
+            #[cfg(target_os = "macos")]
+            {
+                self.mac_ctrl_click_armed = false;
+            }
+            return;
+        }
+
         #[cfg(target_os = "macos")]
         if !self.control_input_only {
             synthesize_mac_ctrl_click(&mut self.mac_ctrl_click_armed, raw_input);
@@ -2106,8 +2150,14 @@ impl eframe::App for FilmcraftApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(not(target_arch = "wasm32"))]
+        native_writer::poll(self, ctx);
         // a native file dialog's answer first, so the panels draw what it chose (#260)
-        self.poll_native_dialog(ctx);
+        if !self.session.is_display_only() {
+            #[cfg(not(target_arch = "wasm32"))]
+            media_intake::poll(self, ctx);
+            self.poll_native_dialog(ctx);
+        }
         if !self.styled {
             theme::install(ctx, &self.tokens);
             // theme::install replaces the fonts: add the system Japanese font back (or fall back to
@@ -2137,8 +2187,35 @@ impl eframe::App for FilmcraftApp {
         }
         self.timeline_still = if self.ui.timeline.animating() { 0 } else { self.timeline_still.saturating_add(1) };
         // Quitting with unsaved changes asks to save them first.
-        if ctx.input(|i| i.viewport().close_requested()) && panels::clip_dialogs::intercept_quit(self) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if ctx.input(|i| i.viewport().close_requested()) {
+            // Scoped update retirement/candidate cancellation owns this close.
+            // Its manager already joined the rail before pausing the native writer.
+            let update_active = self.session.workspace_update_status().is_some() || {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    native_writer::application_initial(self)
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    false
+                }
+            };
+            let waiting_for_composer = !update_active
+                && self.composer_panel.as_mut().is_some_and(|p| {
+                    if p.update.phase != composer_panel::ClosePhase::Open {
+                        p.update.cancel();
+                        true
+                    } else {
+                        p.close.intercept()
+                    }
+                });
+            #[cfg(not(target_arch = "wasm32"))]
+            let waiting_for_owner = !waiting_for_composer && native_writer::request_close(self);
+            #[cfg(target_arch = "wasm32")]
+            let waiting_for_owner = false;
+            if waiting_for_composer || waiting_for_owner || panels::clip_dialogs::intercept_quit(self) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
         }
         let had_synthetic = !self.synthetic.is_empty();
         self.drain_control(ctx);
@@ -2168,6 +2245,15 @@ impl eframe::App for FilmcraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if !self.fonts_ready {
             ui.ctx().request_repaint();
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.native_writer.pending.is_some() || self.session.workspace_update_status().is_some() || native_writer::application_held(self) {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| native_writer::show(self, ui))).is_err() {
+                self.ui_error = Some(crash::take_last().unwrap_or_else(|| "native operation display failed".into()));
+            }
+            self.error_window(ui.ctx());
+            self.last_ui_time = ui.ctx().input(|i| i.time);
             return;
         }
         // No frame worker threads on the web: render queued frames here, within a time budget

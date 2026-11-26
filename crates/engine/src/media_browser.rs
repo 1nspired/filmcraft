@@ -20,13 +20,17 @@
 //! directories and the view settings are preferences ([`MediaBrowserPrefs`]).
 
 use std::collections::BTreeMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+};
 
 use filmcraft_media::MediaInfo;
 use filmcraft_project::ItemId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::commands::{CommandSpec, always, bad, bool_p, f64_p, str_p, u64_p};
+use crate::commands::{CommandSpec, always, bad, bool_p, f64_p, str_p};
 use crate::{EngineError, Result, Services, Session};
 
 /// One directory entry as the host reports it.
@@ -428,6 +432,72 @@ fn paths_p(s: &Session, p: &Value) -> Vec<String> {
 const FOLDER_IMPORT_MAX_FOLDERS: usize = 4096;
 const FOLDER_IMPORT_MAX_DEPTH: usize = 32;
 
+// Folder selection is planned completely before any bin or media is added.
+// A depth/file/folder bound must refuse, rather than silently import a subset.
+/// Cancellation and progress only. The existing Session remains the only
+/// writer; a file already being read is allowed to settle before Stop wins.
+#[derive(Clone, Default)]
+pub(crate) struct ImportControl {
+    stop: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
+    total: Arc<AtomicUsize>,
+    completed: Arc<AtomicUsize>,
+}
+impl ImportControl {
+    pub(crate) fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+    pub(crate) fn cancel(&self) -> Value {
+        let accepted = self.phase.load(Ordering::Acquire) != 2;
+        if accepted {
+            self.stop.store(true, Ordering::Release);
+        }
+        json!({"cancellationAccepted":accepted,"cancellationRequested":self.stopped(),"rollback":false})
+    }
+    pub(crate) fn progress(&self) -> Value {
+        json!({"kind":"native_media_import","phase":match self.phase.load(Ordering::Acquire) { 0=>"scanning",1=>"importing",_=>"settled" },
+            "cancellable":self.phase.load(Ordering::Acquire)!=2,"cancel_requested":self.stopped(),
+            "planned_files":self.total.load(Ordering::Relaxed),"completed_files":self.completed.load(Ordering::Relaxed)})
+    }
+    pub(crate) fn importing(&self) {
+        self.phase.store(1, Ordering::Release);
+    }
+    pub(crate) fn file_finished(&self) {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn finish(&self) {
+        self.phase.store(2, Ordering::Release);
+    }
+    fn check_scan(&self) -> Result<()> {
+        if self.stopped() { Err(bad("mediaBrowser.import", "selection scan stopped; no files or bins were imported")) } else { Ok(()) }
+    }
+}
+struct ImportBudget {
+    folders: usize,
+    files: usize,
+    maximum_files: usize,
+    media_only: bool,
+    control: Option<ImportControl>,
+}
+impl ImportBudget {
+    fn file(&mut self) -> Result<()> {
+        if let Some(c) = &self.control {
+            c.check_scan()?;
+        }
+        self.files = self.files.checked_add(1).ok_or_else(|| bad("mediaBrowser.import", "file count overflow"))?;
+        if self.files > self.maximum_files {
+            return Err(bad("mediaBrowser.import", "selection exceeds its file limit; no files or bins were imported"));
+        }
+        if let Some(c) = &self.control {
+            c.total.store(self.files, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+    fn accepts(&self, kind: &str) -> bool {
+        !self.media_only || matches!(kind, "video" | "audio" | "image")
+    }
+}
+
 /// A folder to import as a bin: its name, its files and its sub-folders that hold files.
 struct Folder {
     name: String,
@@ -436,21 +506,33 @@ struct Folder {
 }
 
 /// The files the browser shows in `dir` and its sub-folders, as a tree; `None` when the tree
-/// holds none (or `budget` folders were walked already).
-fn walk_folder(services: &dyn Services, dir: &str, depth: usize, budget: &mut usize) -> Option<Folder> {
-    *budget = budget.checked_sub(1)?;
-    let entries = list(services, dir, "all").ok()?;
+/// holds none. A failed or incomplete scan never authorizes a partial import.
+fn walk_folder(services: &dyn Services, dir: &str, depth: usize, budget: &mut ImportBudget) -> Result<Option<Folder>> {
+    if let Some(c) = &budget.control {
+        c.check_scan()?;
+    }
+    budget.folders = budget.folders.checked_sub(1).ok_or_else(|| bad("mediaBrowser.import", "folder limit reached; no files or bins were imported"))?;
+    let entries = list(services, dir, "all").map_err(|e| bad("mediaBrowser.import", format!("{dir}: {e}; no files or bins were imported")))?;
     let mut folder = Folder { name: base_name(dir), files: Vec::new(), subs: Vec::new() };
     for e in entries {
+        if let Some(c) = &budget.control {
+            c.check_scan()?;
+        }
         if !e.is_dir {
-            folder.files.push(e.path);
-        } else if depth < FOLDER_IMPORT_MAX_DEPTH
-            && let Some(sub) = walk_folder(services, &e.path, depth + 1, budget)
-        {
-            folder.subs.push(sub);
+            if budget.accepts(e.kind) {
+                budget.file()?;
+                folder.files.push(e.path);
+            }
+        } else {
+            if depth >= FOLDER_IMPORT_MAX_DEPTH {
+                return Err(bad("mediaBrowser.import", "folder depth limit reached; no files or bins were imported"));
+            }
+            if let Some(sub) = walk_folder(services, &e.path, depth + 1, budget)? {
+                folder.subs.push(sub);
+            }
         }
     }
-    (!folder.files.is_empty() || !folder.subs.is_empty()).then_some(folder)
+    Ok((!folder.files.is_empty() || !folder.subs.is_empty()).then_some(folder))
 }
 
 /// Add a `file.import` result to the merged one: arrays add up, other values (the Ingest result)
@@ -483,6 +565,9 @@ fn import_into(s: &mut Session, files: &[String], bin: Option<u64>, out: &mut se
 /// Import a folder as a bin named after it, in `parent`: its files go into the bin, each
 /// sub-folder becomes a bin inside it (Premiere's Media Browser keeps the folder structure).
 fn import_folder(s: &mut Session, folder: &Folder, parent: Option<u64>, out: &mut serde_json::Map<String, Value>) -> Result<()> {
+    if s.media_import_control.as_ref().is_some_and(ImportControl::stopped) {
+        return Ok(());
+    }
     let name = folder.name.clone();
     let bin = s.edit("New Bin", |pr, _| Ok(pr.add_bin(&name, parent.map(filmcraft_project::BinId))))?;
     merge_import(out, json!({"bins": [bin.0]}));
@@ -506,23 +591,52 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("mediaBrowser.import", "select files in the Media Browser"));
     }
     let seq = bool_p(p, "imageSequence").unwrap_or(s.prefs.media_browser.import_as_image_sequence);
-    let bin = u64_p(p, "bin");
+    let bin = crate::commands::nullable_u64_p(p, "bin")?;
     let mut files = Vec::new();
     let mut folders = Vec::new();
     let mut empty = Vec::new();
-    let mut budget = FOLDER_IMPORT_MAX_FOLDERS;
+    let maximum_files = match p.get("maxFiles") {
+        None => 100_000,
+        Some(v) => v
+            .as_u64()
+            .filter(|n| (1..=100_000).contains(n))
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| bad("mediaBrowser.import", "maxFiles must be an integer from 1 to 100000"))?,
+    };
+    let media_only = match p.get("mediaOnly") {
+        None => false,
+        Some(v) => v.as_bool().ok_or_else(|| bad("mediaBrowser.import", "mediaOnly must be a boolean"))?,
+    };
+    let control = s.media_import_control.clone();
+    let mut budget = ImportBudget { folders: FOLDER_IMPORT_MAX_FOLDERS, files: 0, maximum_files, media_only, control: control.clone() };
     for path in paths {
-        let is_dir = matches!(s.services.list_entries(&path), Some(Ok(_))) && kind_of(&path).is_none();
+        if let Some(c) = &control {
+            c.check_scan()?;
+        }
+        // A real selected directory remains a directory even when its name
+        // ends in a media extension (for example a camera card named .MXF).
+        let is_dir = matches!(s.services.list_entries(&path), Some(Ok(_)));
         if !is_dir {
+            if !budget.accepts(kind_of(&path).unwrap_or("unsupported")) {
+                return Err(bad("mediaBrowser.import", "media-only selection requires video, audio or image files; nothing was imported"));
+            }
+            budget.file()?;
             files.push(path);
         } else if seq {
             // an image sequence: the folder's frames
             match list(&*s.services, &path, "all") {
-                Ok(entries) => files.extend(entries.into_iter().filter(|e| !e.is_dir).map(|e| e.path)),
-                Err(_) => files.push(path),
+                Ok(entries) => {
+                    for e in entries.into_iter().filter(|e| !e.is_dir) {
+                        if budget.accepts(e.kind) {
+                            budget.file()?;
+                            files.push(e.path);
+                        }
+                    }
+                }
+                Err(e) => return Err(bad("mediaBrowser.import", format!("{path}: {e}; nothing was imported"))),
             }
         } else {
-            match walk_folder(&*s.services, &path, 0, &mut budget) {
+            match walk_folder(&*s.services, &path, 0, &mut budget)? {
                 Some(f) => folders.push(f),
                 None => empty.push(path),
             }
@@ -532,25 +646,34 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
     if seq {
         files.truncate(1);
     }
-    if folders.is_empty() {
-        if files.is_empty() && !empty.is_empty() {
-            return Err(bad("mediaBrowser.import", format!("no media files in {}", empty.join(", "))));
+    if let Some(c) = &control {
+        c.check_scan()?;
+        c.importing();
+    }
+    s.edit_group("Import Media", |s| {
+        if folders.is_empty() {
+            if files.is_empty() && !empty.is_empty() {
+                return Err(bad("mediaBrowser.import", format!("no media files in {}", empty.join(", "))));
+            }
+            let mut q = json!({"paths": files, "imageSequence": seq});
+            if let Some(b) = bin {
+                q["bin"] = json!(b);
+            }
+            return s.execute("file.import", q);
         }
-        let mut q = json!({"paths": files, "imageSequence": seq});
-        if let Some(b) = bin {
-            q["bin"] = json!(b);
+        let mut out = serde_json::Map::new();
+        merge_import(&mut out, json!({"items": [], "errors": empty.iter().map(|e| format!("{e}: no media files")).collect::<Vec<_>>(), "bins": []}));
+        if !files.is_empty() {
+            import_into(s, &files, bin, &mut out);
         }
-        return s.execute("file.import", q);
-    }
-    let mut out = serde_json::Map::new();
-    merge_import(&mut out, json!({"items": [], "errors": empty.iter().map(|e| format!("{e}: no media files")).collect::<Vec<_>>(), "bins": []}));
-    if !files.is_empty() {
-        import_into(s, &files, bin, &mut out);
-    }
-    for f in &folders {
-        import_folder(s, f, bin, &mut out)?;
-    }
-    Ok(Value::Object(out))
+        for f in &folders {
+            import_folder(s, f, bin, &mut out)?;
+        }
+        if let Some(c) = &control {
+            out.insert("cancelled".into(), json!(c.stopped()));
+        }
+        Ok(Value::Object(out))
+    })
 }
 
 /// The project item that already references a file.
@@ -681,7 +804,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             r#"{"fileTypes":"all|video|audio|image|project|caption|<ext>"?,"view":"list|thumbnails"?,"columns":[str]?,"importAsImageSequence":bool?,"hoverScrub":bool?,"thumbnailSize":f32?}"#,
             settings,
         ),
-        c("mediaBrowser.import", "Import", r#"{"paths":[str]?,"bin":binId?,"imageSequence":bool?}"#, import),
+        c("mediaBrowser.import", "Import", r#"{"paths":[str]?,"bin":binId?,"imageSequence":bool?,"mediaOnly":bool?,"maxFiles":1..100000?}"#, import),
         CommandSpec {
             id: "mediaBrowser.openInSource",
             label: "Open In Source Monitor",

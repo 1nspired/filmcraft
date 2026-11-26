@@ -233,33 +233,95 @@ pub struct PinNode {
     pub resizable: bool,
 }
 
-/// New bounds of every layer after pinning (same order as `nodes`). Targets are resolved before
-/// the layers pinned to them; pins in a cycle, or to a missing layer, are ignored.
+/// Dependency information shared by pin rendering and authored-constraint inspection.
+/// Missing targets are None. Duplicate UIDs retain the renderer's first-match fallback,
+/// while `ambiguous` lets an authoring boundary refuse that ambiguous reference explicitly.
+pub struct PinGraph {
+    pub targets: Vec<Option<usize>>,
+    pub ambiguous: Vec<bool>,
+    pub cyclic: Vec<bool>,
+    pub order: Vec<usize>,
+}
+
+/// One bounded iterative walk of the supplied nodes, without geometry evaluation or mutation.
+/// Every node enters `order` once, after its target (cycle members retain their base bounds).
+pub fn pin_graph(nodes: &[PinNode]) -> PinGraph {
+    let mut by_uid = BTreeMap::new();
+    for (i, node) in nodes.iter().enumerate().filter(|(_, n)| n.uid != 0) {
+        let entry = by_uid.entry(node.uid).or_insert((i, false));
+        if entry.0 != i {
+            entry.1 = true;
+        }
+    }
+    let references: Vec<_> = nodes
+        .iter()
+        .map(|node| {
+            node.pin.as_ref().and_then(|pin| match pin.to {
+                PinTarget::Layer(uid) => by_uid.get(&uid).copied(),
+                PinTarget::Frame => None,
+            })
+        })
+        .collect();
+    let targets: Vec<_> = references.iter().map(|r| r.map(|v| v.0)).collect();
+    let ambiguous = references.iter().map(|r| r.is_some_and(|v| v.1)).collect();
+    let mut cyclic = vec![false; nodes.len()];
+    let mut order = Vec::new();
+    let mut state = vec![0_u8; nodes.len()]; // unseen, in this walk, resolved
+    let mut path = Vec::new();
+    // Every index below comes from enumerating this slice, or from by_uid built from it.
+    for root in 0..nodes.len() {
+        if state[root] == 2 {
+            continue;
+        }
+        path.clear();
+        let mut next = Some(root);
+        while let Some(i) = next {
+            if state[i] == 2 {
+                break;
+            }
+            if state[i] == 1 {
+                // Ignore all edges of the cycle, rather than resolving one against another
+                // member's provisional bounds. Noncyclic followers may follow those base bounds.
+                for &member in path.iter().skip_while(|&&member| member != i) {
+                    state[member] = 2;
+                    cyclic[member] = true;
+                    order.push(member);
+                }
+                break;
+            }
+            state[i] = 1;
+            path.push(i);
+            next = if nodes[i].pin.as_ref().is_some_and(|p| p.any()) { targets[i] } else { None };
+        }
+        for &i in path.iter().rev() {
+            if state[i] == 2 {
+                continue;
+            }
+            state[i] = 2;
+            order.push(i);
+        }
+    }
+    PinGraph { targets, ambiguous, cyclic, order }
+}
+
+/// New bounds in paint order. Targets resolve first; every pin in a cycle, or to a missing
+/// layer, is ignored. The shared iterative dependency walk has no call-stack depth cost.
 pub fn resolve_pins(nodes: &[PinNode], frame: [f64; 4]) -> Vec<[f64; 4]> {
-    let mut out: Vec<Option<[f64; 4]>> = vec![None; nodes.len()];
-    fn solve(i: usize, nodes: &[PinNode], frame: [f64; 4], out: &mut Vec<Option<[f64; 4]>>, visiting: &mut Vec<usize>) -> [f64; 4] {
-        if let Some(b) = out[i] {
-            return b;
+    let graph = pin_graph(nodes);
+    let mut out: Vec<_> = nodes.iter().map(|n| n.bounds).collect();
+    // Graph indices were built by enumerating this exact slice; arrays have equal lengths.
+    for &i in &graph.order {
+        if graph.cyclic[i] {
+            continue;
         }
         let n = &nodes[i];
         let own = n.bounds;
-        let Some(pin) = n.pin.as_ref().filter(|p| p.any()) else {
-            out[i] = Some(own);
-            return own;
-        };
-        if visiting.contains(&i) {
-            return own; // cycle: this pin is ignored
-        }
-        visiting.push(i);
+        let Some(pin) = n.pin.as_ref().filter(|p| p.any()) else { continue };
         let target = match pin.to {
             PinTarget::Frame => Some(frame),
-            PinTarget::Layer(uid) => nodes.iter().position(|m| m.uid == uid && uid != 0).filter(|&j| j != i).map(|j| solve(j, nodes, frame, out, visiting)),
+            PinTarget::Layer(_) => graph.targets[i].map(|j| out[j]),
         };
-        visiting.pop();
-        let Some(t) = target else {
-            out[i] = Some(own);
-            return own;
-        };
+        let Some(t) = target else { continue };
         let axis = |lo_on: bool, hi_on: bool, lo: usize, hi: usize| -> (f64, f64) {
             let size = own[hi] - own[lo];
             match (lo_on, hi_on) {
@@ -272,11 +334,11 @@ pub fn resolve_pins(nodes: &[PinNode], frame: [f64; 4]) -> Vec<[f64; 4]> {
         let (x0, x1) = axis(pin.left, pin.right, 0, 2);
         let (y0, y1) = axis(pin.top, pin.bottom, 1, 3);
         let b = [x0, y0, x1, y1];
-        out[i] = Some(b);
-        b
+        if b.iter().all(|v| v.is_finite()) {
+            out[i] = b;
+        }
     }
-    let mut visiting = Vec::new();
-    (0..nodes.len()).map(|i| solve(i, nodes, frame, &mut out, &mut visiting)).collect()
+    out
 }
 
 /// Roll / crawl direction (Responsive Design – Time ▸ Roll).
@@ -520,6 +582,128 @@ mod tests {
         let f = Pin::new(PinTarget::Frame, [false, false, true, true], [1700.0, 900.0, 1820.0, 1000.0], [0.0, 0.0, 1920.0, 1080.0]);
         let n = [PinNode { uid: 1, pin: Some(f), bounds: [1700.0, 900.0, 1820.0, 1000.0], resizable: false }];
         assert_eq!(resolve_pins(&n, [0.0, 0.0, 1280.0, 720.0])[0], [1060.0, 540.0, 1180.0, 640.0]);
+    }
+
+    #[test]
+    fn pin_cycles_ignore_every_cycle_member_independently_of_paint_order() {
+        let a = PinNode {
+            uid: 1,
+            pin: Some(Pin { to: PinTarget::Layer(2), left: true, offsets: [7.0, 0.0, 0.0, 0.0], ..Default::default() }),
+            bounds: [10.0, 20.0, 30.0, 40.0],
+            resizable: false,
+        };
+        let b = PinNode {
+            uid: 2,
+            pin: Some(Pin { to: PinTarget::Layer(1), left: true, offsets: [11.0, 0.0, 0.0, 0.0], ..Default::default() }),
+            bounds: [50.0, 60.0, 70.0, 80.0],
+            resizable: false,
+        };
+        let follower = PinNode {
+            uid: 3,
+            pin: Some(Pin { to: PinTarget::Layer(1), left: true, offsets: [3.0, 0.0, 0.0, 0.0], ..Default::default() }),
+            bounds: [0.0, 1.0, 5.0, 6.0],
+            resizable: false,
+        };
+        for nodes in [vec![a.clone(), b.clone(), follower.clone()], vec![follower.clone(), b.clone(), a.clone()]] {
+            let actual = resolve_pins(&nodes, [0.0, 0.0, 128.0, 128.0]);
+            for (node, bounds) in nodes.iter().zip(actual) {
+                assert_eq!(bounds, if node.uid == 3 { [13.0, 1.0, 18.0, 6.0] } else { node.bounds });
+            }
+        }
+    }
+
+    #[test]
+    fn pin_graph_diagnostics_and_render_order_share_cycle_missing_and_ambiguous_references() {
+        let node = |uid, to| PinNode { uid, pin: Some(Pin { to, left: true, ..Default::default() }), bounds: [0.0, 0.0, 1.0, 1.0], resizable: false };
+        let nodes = [
+            node(1, PinTarget::Layer(2)),
+            node(2, PinTarget::Layer(1)),
+            node(3, PinTarget::Layer(1)),
+            node(4, PinTarget::Layer(99)),
+            node(5, PinTarget::Frame),
+        ];
+        let graph = pin_graph(&nodes);
+        assert_eq!(graph.cyclic, vec![true, true, false, false, false]);
+        assert_eq!(graph.targets, vec![Some(1), Some(0), Some(0), None, None]);
+        assert_eq!(graph.order.len(), nodes.len());
+        assert!(graph.order.iter().position(|i| *i == 0) < graph.order.iter().position(|i| *i == 2));
+        let duplicates = [node(1, PinTarget::Frame), node(1, PinTarget::Frame), node(2, PinTarget::Layer(1))];
+        let graph = pin_graph(&duplicates);
+        assert_eq!(graph.targets[2], Some(0));
+        assert_eq!(graph.ambiguous, vec![false, false, true]);
+        let own = [node(1, PinTarget::Layer(1))];
+        assert!(pin_graph(&own).cyclic[0]);
+        assert_eq!(resolve_pins(&own, [0.0; 4]), vec![own[0].bounds]);
+    }
+
+    #[test]
+    fn pin_long_chains_resolve_on_a_small_stack_without_recursion() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                // Reverse dependencies force the deepest walk on the first node.
+                let nodes: Vec<_> = (1..=4096)
+                    .map(|uid| PinNode {
+                        uid,
+                        pin: Some(Pin {
+                            to: if uid == 4096 { PinTarget::Frame } else { PinTarget::Layer(uid + 1) },
+                            left: true,
+                            offsets: [1.0, 0.0, 0.0, 0.0],
+                            ..Default::default()
+                        }),
+                        bounds: [0.0, 0.0, 2.0, 2.0],
+                        resizable: false,
+                    })
+                    .collect();
+                let actual = resolve_pins(&nodes, [10.0, 0.0, 128.0, 128.0]);
+                assert_eq!(actual[0], [4106.0, 0.0, 4108.0, 2.0]);
+                assert_eq!(actual[4095], [11.0, 0.0, 13.0, 2.0]);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn pin_graph_resolution_is_order_independent_and_retains_missing_self_and_first_uid_rules() {
+        let mut nodes = Vec::new();
+        for uid in 1..=127_u64 {
+            nodes.push(PinNode {
+                uid,
+                pin: Some(Pin {
+                    to: if uid == 1 { PinTarget::Frame } else { PinTarget::Layer(uid / 2) },
+                    left: true,
+                    offsets: [1.0, 0.0, 0.0, 0.0],
+                    ..Default::default()
+                }),
+                bounds: [0.0, 0.0, 2.0, 2.0],
+                resizable: false,
+            });
+        }
+        for shift in 0..nodes.len() {
+            nodes.rotate_left(1);
+            if shift % 2 == 0 {
+                nodes.reverse();
+            }
+            for (node, b) in nodes.iter().zip(resolve_pins(&nodes, [10.0, 0.0, 100.0, 100.0])) {
+                let depth = 64 - node.uid.leading_zeros();
+                assert_eq!(b, [10.0 + f64::from(depth), 0.0, 12.0 + f64::from(depth), 2.0]);
+            }
+        }
+        let base = |uid, to| PinNode {
+            uid,
+            pin: Some(Pin { to, left: true, offsets: [3.0, 0.0, 0.0, 0.0], ..Default::default() }),
+            bounds: [20.0, 0.0, 25.0, 5.0],
+            resizable: false,
+        };
+        let missing = [base(0, PinTarget::Layer(0)), base(1, PinTarget::Layer(1)), base(2, PinTarget::Layer(99))];
+        assert_eq!(resolve_pins(&missing, [0.0; 4]), vec![[20.0, 0.0, 25.0, 5.0]; 3]);
+        let duplicate =
+            [base(1, PinTarget::Layer(99)), PinNode { uid: 1, pin: None, bounds: [70.0, 0.0, 75.0, 5.0], resizable: false }, base(2, PinTarget::Layer(1))];
+        assert_eq!(resolve_pins(&duplicate, [0.0; 4])[2], [23.0, 0.0, 28.0, 5.0]);
+        let mut invalid = base(1, PinTarget::Frame);
+        invalid.pin.as_mut().unwrap().offsets[0] = f64::INFINITY;
+        assert_eq!(resolve_pins(&[invalid], [0.0; 4]), vec![[20.0, 0.0, 25.0, 5.0]]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Where FilmCraft falls short of Premiere Pro
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** major (new file: ROADMAP's "Where we are lacking" re-measured against Premiere Pro 26.5.2 and the open issue list) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-21 · **Change:** minor (local retime validation and dialog preservation; G6 and readiness estimates remain open/unchanged) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
 
 Every known shortfall, one entry each, ranked by what most stops an editor using FilmCraft for real
 work. This is the work list: agents should prefer it over adding checklist items. Numbers are in
@@ -65,6 +65,15 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
 
 ## G3. 10-bit and 4:2:2 camera media needs hardware
 
+- **Local integration fix (2026-10-19):** MXF AVC now feeds the registered
+  decoder path through a bounded Annex B → avcC packet adapter instead of
+  directly forcing the software H.264 decoder. Generated 10-bit 4:2:2 MXF
+  and three local Canon EOS R5 C samples decode bit-exactly against ffmpeg
+  on the tested Apple Silicon Mac; a short UHD ProRes export from an
+  original passes. See `crates/platform/README.md` (MXF routing). This fixes
+  a container-specific hardware bypass, not the software codec limitation
+  or cross-platform camera compatibility. No readiness estimate changed.
+
 - **Missing:** our H.264 decoder is 8-bit 4:2:0 only (`crates/h264/README.md`: no High 10, High
   4:2:2, 4:4:4, lossless, interlaced field / MBAFF); HEVC has no 4:2:2 / RExt. Most mirrorless and
   cinema cameras record exactly these (Sony XAVC S-I / XAVC HS 4:2:2 10-bit, Panasonic, Canon
@@ -118,6 +127,53 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
   [hardware-parity.md](hardware-parity.md).
 
 ## G6. No real-world media corpus or workflow acceptance tests
+
+The local source-clock follow-up supplies read-only current-instance source
+coordinates from the existing native clock, instead of JavaScript reconstruction
+from floored frame labels. Generated holds/fractional-start and cross-language
+original-image checks are not real-camera, continuous-motion or full editorial
+workflow qualification. G6 remains open; no readiness estimate changed.
+
+The local Speed/Duration follow-up repairs malformed-option defaults and native
+dialog initialization of reverse and precise saved speed. Generated rejection,
+history, defaults, Undo/Redo, saved-reopen and headless dialog regressions do not
+qualify real-camera retiming or full human/agent parity. G6 remains open.
+
+The local mixer follow-up adds generated rejection/history and insert-parameter
+regressions, including an existing Redo branch, valid native Undo/Redo and saved
+reopen. These repair shared command boundaries, not camera/output qualification
+or full human/agent mixer parity. G6 remains open.
+
+The local October 21 Project/mark validation follow-up adds generated rejection
+and recovery checks for malformed explicit target lists and nullable source
+marks, including unchanged source-file bytes after rejected offline requests.
+These are command-boundary regressions, not real-camera workflow qualification;
+G6 remains open. See `crates/engine/README.md`.
+
+Local Poema integration evidence (2026-10-20, not general readiness): the native guarded bridge
+now verifies split → current-fragment half trim → two guarded undos on a generated sample and a
+local Canon MXF proposal copy, including linked picture/audio duplicates, exact-clamp rejection and
+manual-intervention refusal. Eleven focused bridge regressions and engine-library Clippy pass.
+The next local increment also verifies original-source insertion, no-overwrite gap moves,
+same-track reorder, linked ripple-delete and guarded Undo through the actual composer/provider
+contract on generated and Canon data. Twenty focused bridge tests and 682 engine-library tests
+pass (three existing ignored); no estimate changes. These private, local-only artifacts are not
+a public corpus or full-workspace/cross-platform CI. A further source-preview increment passes
+25 focused bridge tests and 687 engine-library tests (three existing ignored). Generated/private
+Canon composer fixtures verify source marks without timeline changes, follow-up context across a
+composer restart, fresh-process saved-mark reopen and guarded Undo, with zero paid model calls;
+the sequence-family increment now passes 694 engine-library tests (three existing ignored),
+202 UI-library tests and generated/six-clip Canon assembly/save/reopen/navigation/Undo acceptance.
+Four pre-existing UI Clippy findings remain outside the changed code; no full-workspace CI claim.
+G6 remains open. Boundary and recovery semantics: `crates/engine/README.md`.
+
+The October 21 local retiming increment reuses native Speed/Duration through
+the guarded bridge, with explicit percentage/reverse/ripple/interpolation and
+expanded editing-state reads. Generated composer acceptance compares sampled
+Program pixels and native mixed PCM against the human command, with matching
+native state and Undo. This does not qualify real-camera retiming, continuous
+motion quality, all interpolation modes or general finishing/delivery parity.
+The user's existing app/cut is not upgraded or changed.
 
 - **Done:** first scripted MCP workflows (#835, `apps/filmcraft-cli/tests/workflows.rs`): the
   `filmcraft-cli mcp` binary imports ffmpeg-made phone-like VFR H.264 + AAC MP4 and long-GOP
@@ -320,3 +376,6 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
 | 2026-10-10 | major | Created from ROADMAP.md's "Where we are lacking" (2026-10-05); re-ranked against Premiere 26.5.2 and the 188 open issues; added `.prproj`, 10-bit / 4:2:2 camera decode, launch crashes and missing PR CI, localization, delivery formats |
 | 2026-10-12 | minor | G10: MP1 (`A_MPEG/L1`) in Matroska imports (#1402) |
 | 2026-10-12 | minor | G10: OpenEXR PXR24 import |
+| 2026-10-19 | minor | G3: local MXF AVC decoder-registry routing; generated and Canon 10-bit 4:2:2 samples measured on one Apple Silicon Mac, without changing the software-codec gap or readiness estimate |
+| 2026-10-21 | minor | G6: generated Poema composer/native Speed/Duration parity compares sequence state, sampled Program PNGs, mixed PCM and Undo; real-camera/continuous-motion qualification and general readiness remain open |
+| 2026-10-21 | minor | G6: malformed retime rejection and native dialog preservation gain generated regressions; no real-camera or full-parity qualification claim |

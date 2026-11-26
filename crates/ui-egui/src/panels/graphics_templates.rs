@@ -605,7 +605,10 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             }))
         }
         "graphics.template.export" | "file.exportGraphicsTemplate" if empty => {
-            let clip = filmcraft_engine::graphics::target_clip(&app.session, &Value::Null);
+            let clip = match filmcraft_engine::graphics::target_clip(&app.session, &Value::Null) {
+                Ok(clip) => clip,
+                Err(error) => return Some(Err(error.to_string())),
+            };
             let Some(clip) = clip else { return Some(Err("select a graphic clip".into())) };
             let it = app.session.active_sequence().and_then(|q| q.find_item(clip)).map(|(_, i)| i.clone())?;
             let idx = layer_indices(&it.effects);

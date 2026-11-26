@@ -31,9 +31,7 @@ use filmcraft_project::{AudioChannels, ClipId, ItemId, Label, Marker, MarkerId, 
 use filmcraft_time::{Tick, TimeRange};
 use serde_json::{Value, json};
 
-use crate::commands::{
-    CommandSpec, always, bad, bool_p, clips_p, has_seq, marker_color_p, sequence_time_p, source_mark_time, str_p, time_p, track_p, with_links,
-};
+use crate::commands::{CommandSpec, always, bad, bool_p, clips_p, has_seq, sequence_time_p, source_mark_time, str_p, time_p, track_p, with_links};
 use crate::{EngineError, Result, Session};
 
 type Run = fn(&mut Session, &Value) -> Result<Value>;
@@ -340,7 +338,7 @@ fn join_through_edits(s: &mut Session, p: &Value) -> Result<Value> {
         return join_through_edit_at(s, cut);
     }
     let all = bool_p(p, "all").unwrap_or(false) || (p.get("clips").is_none() && p.get("clip").is_none() && s.state.selection.is_empty());
-    let only = if all { Vec::new() } else { with_links(s, &clips_p(s, p)) };
+    let only = if all { Vec::new() } else { with_links(s, &clips_p(s, p)?) };
     let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
     let any = edit::through::through_edits(q)
         .iter()
@@ -646,7 +644,7 @@ fn placement(p: &Value, key: &str, letter: char, len: usize) -> Result<usize> {
 
 /// Give the tracks that still carry a default name (`<prefix> <number>`) the number of their
 /// place, as Premiere numbers its tracks; a track the user named keeps its name.
-fn renumber(tracks: &mut [filmcraft_project::Track], prefix: &str) {
+pub(crate) fn renumber(tracks: &mut [filmcraft_project::Track], prefix: &str) {
     for (i, t) in tracks.iter_mut().enumerate() {
         let default = t.name.strip_prefix(prefix).and_then(|r| r.strip_prefix(' ')).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
         if default {
@@ -662,11 +660,12 @@ fn renumber(tracks: &mut [filmcraft_project::Track], prefix: &str) {
 pub(crate) fn add_tracks(s: &mut Session, p: &Value) -> Result<Value> {
     use crate::commands::u64_p;
     let cmd = "sequence.addTracks";
+    crate::track_ops::fields(p, &["video", "audio", "submix", "videoAfter", "audioAfter", "submixAfter", "audioType", "submixType"], cmd)?;
     let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
     let amount = |key: &str, default: u64, have: usize| -> Result<usize> {
         let n = match p.get(key) {
             None | Some(Value::Null) => default,
-            Some(_) => u64_p(p, key).ok_or_else(|| bad(cmd, format!("`{key}` must be a number of tracks")))?,
+            Some(_) => u64_p(p, key)?.ok_or_else(|| bad(cmd, format!("`{key}` must be a number of tracks")))?,
         };
         if n > MAX_ADDED_TRACKS {
             return Err(bad(cmd, format!("`{key}`: at most {MAX_ADDED_TRACKS} tracks at a time")));
@@ -682,15 +681,14 @@ pub(crate) fn add_tracks(s: &mut Session, p: &Value) -> Result<Value> {
         placement(p, "audioAfter", 'A', q.audio_tracks.len())?,
         placement(p, "submixAfter", 'S', q.submix_tracks.len())?,
     );
-    let channels = |key: &str, default: AudioChannels| match p.get(key).and_then(Value::as_str) {
-        None => Ok(default),
-        Some(x) => crate::mixer::channels_from(x).ok_or_else(|| bad(cmd, format!("`{key}`: unknown track type {x:?} (standard, stereo, 5.1, adaptive, mono)"))),
-    };
-    let (audio_type, submix_type) = (channels("audioType", AudioChannels::Stereo)?, channels("submixType", AudioChannels::Stereo)?);
+    let (audio_type, submix_type) =
+        (crate::track_ops::channels(p, "audioType", AudioChannels::Stereo, cmd)?, crate::track_ops::channels(p, "submixType", AudioChannels::Stereo, cmd)?);
     if nv + na + ns == 0 {
         return Err(bad(cmd, "no tracks to add"));
     }
+    let start = crate::project_ids::allocation_start(&s.project, (nv + na + ns) as u64)?;
     let added = s.edit_sequence("Add Tracks", |q, ctx, _| {
+        *ctx.next_id = start;
         let mut new = |kind: TrackKind, prefix: &str, channels: Option<AudioChannels>| {
             let mut t = filmcraft_project::Track::new(TrackId(ctx.alloc()), kind, format!("{prefix} 0"));
             if let Some(c) = channels {
@@ -736,7 +734,7 @@ pub(crate) fn wants_new_track(p: &Value) -> bool {
 /// goes on it. One undo step; when the placement fails, the new tracks go away again.
 pub(crate) fn place_on_new_tracks(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "timeline.place";
-    let item = crate::commands::item_p(p, "item").ok_or_else(|| bad(cmd, "need `item`"))?;
+    let item = crate::commands::item_p(p, "item")?.ok_or_else(|| bad(cmd, "need `item`"))?;
     s.project.item(item).ok_or_else(|| bad(cmd, "no such item"))?;
     let (video, audio) = s.project.source_streams(item);
     let is_new = |k: &str| p.get(k).and_then(Value::as_str).is_some_and(|v| v.eq_ignore_ascii_case("new"));
@@ -775,7 +773,7 @@ pub(crate) fn place_on_new_tracks(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn delete_tracks(s: &mut Session, p: &Value) -> Result<Value> {
-    let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
+    crate::track_ops::fields(p, &["video", "audio", "captions"], "sequence.deleteTracks")?;
     let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
     let mut doomed: Vec<TrackId> = Vec::new();
     for (key, kind) in [("video", TrackKind::Video), ("audio", TrackKind::Audio)] {
@@ -795,7 +793,9 @@ fn delete_tracks(s: &mut Session, p: &Value) -> Result<Value> {
         };
         if mine.len() == tracks.len() {
             // keep the first one
-            mine.retain(|id| *id != tracks[0].id);
+            if let Some(first) = tracks.first() {
+                mine.retain(|id| *id != first.id);
+            }
         }
         doomed.extend(mine);
     }
@@ -815,23 +815,7 @@ fn delete_tracks(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Other("no tracks to delete".into()));
     }
     let n = doomed.len();
-    s.edit_sequence("Delete Tracks", |q, _, st| {
-        q.video_tracks.retain(|t| !doomed.contains(&t.id));
-        q.audio_tracks.retain(|t| !doomed.contains(&t.id));
-        q.caption_tracks.retain(|t| !doomed.contains(&t.id));
-        st.selection.retain(|c| q.find_item(*c).is_some());
-        st.caption_selection.retain(|c| q.find_caption(*c).is_some());
-        if let Some(tg) = st.targeting.get_mut(&seq_id) {
-            tg.targeted.retain(|t| !doomed.contains(t));
-            if tg.video_dest.is_some_and(|t| doomed.contains(&t)) {
-                tg.video_dest = q.video_tracks.first().map(|t| t.id);
-            }
-            if tg.audio_dest.is_some_and(|t| doomed.contains(&t)) {
-                tg.audio_dest = q.audio_tracks.first().map(|t| t.id);
-            }
-        }
-        Ok(())
-    })?;
+    crate::track_ops::remove(s, &doomed, "Delete Tracks", "sequence.deleteTracks")?;
     Ok(json!({"deleted": n}))
 }
 
@@ -966,14 +950,7 @@ pub fn ripple_markers(markers: &mut Vec<Marker>, from: Tick, shift: Tick) {
 }
 
 fn add_marker(s: &mut Session, cmd: &str, label: &str, t: Tick, dur: Tick, kind: MarkerKind, name: String, p: &Value) -> Result<MarkerId> {
-    let comment = str_p(p, "comment").unwrap_or("").to_string();
-    let color = marker_color_p(p, cmd)?.unwrap_or(Label::Green);
-    s.edit_sequence(label, |q, ctx, _| {
-        let id = MarkerId(ctx.alloc());
-        q.markers.push(Marker { id, start: t, duration: dur, name, comment, kind, color });
-        q.markers.sort_by_key(|m| m.start);
-        Ok(id)
-    })
+    crate::marker_ops::add_sequence(s, cmd, label, t, dur, kind, name, p)
 }
 
 /// Markers ▸ Add Range Marker: a marker with a duration (one second unless `durationFrames` or
@@ -981,12 +958,7 @@ fn add_marker(s: &mut Session, cmd: &str, label: &str, t: Tick, dur: Tick, kind:
 fn add_range_marker(s: &mut Session, p: &Value) -> Result<Value> {
     let rate = s.sequence_rate();
     let t = sequence_time_p(s, p, "", "markers.addRange")?.unwrap_or(s.playhead());
-    let dur = p
-        .get("duration")
-        .and_then(Value::as_i64)
-        .map(Tick)
-        .or_else(|| p.get("durationFrames").and_then(Value::as_i64).map(|f| rate.tick_of(f)))
-        .unwrap_or(rate.tick_of(rate.timecode_base()));
+    let dur = crate::marker_ops::duration(p, rate, rate.tick_of(rate.timecode_base()), "markers.addRange")?;
     if dur <= Tick::ZERO {
         return Err(bad("markers.addRange", "the duration must be positive"));
     }

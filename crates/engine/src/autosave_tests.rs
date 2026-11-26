@@ -325,3 +325,21 @@ fn project_captured_folder_outside_the_project_is_not_used() {
     assert!(s.execute("file.projectSettings.scratchDisks", json!({"captured": "file://192.0.2.1/s/cap"})).is_err());
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn complete_native_journal_without_legacy_snapshot_is_preserved_by_scan_and_clean_shutdown() {
+    let d = temp_dir("full-journal-retained");
+    let cfg = autosave::AutosaveConfig::new(&d);
+    let p = autosave::Persistence::start(&cfg, Default::default()).unwrap();
+    let dir = p.session_dir.clone();
+    let file = dir.join(crate::agent_bridge::NATIVE_JOURNAL_FILE);
+    std::fs::write(&file, b"retained complete companion").unwrap();
+    p.close();
+    assert_eq!(std::fs::read(&file).unwrap(), b"retained complete companion");
+    let p = autosave::Persistence::start(&cfg, Default::default()).unwrap();
+    assert!(p.candidates.iter().any(|c| c.dir == dir));
+    p.close();
+    assert_eq!(std::fs::read(&file).unwrap(), b"retained complete companion");
+    std::fs::remove_dir_all(d).unwrap();
+}
