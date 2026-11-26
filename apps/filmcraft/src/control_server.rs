@@ -22,21 +22,30 @@ pub const MAX_LINE: usize = 4 * 1024 * 1024;
 /// Connections served at once; further ones get an error line and are closed.
 pub const MAX_CONNECTIONS: usize = 16;
 
-pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
-    let (tx, rx) = channel::<ControlRequest>();
-    let listener = match TcpListener::bind(("127.0.0.1", port)) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("filmcraft: control server failed to bind 127.0.0.1:{port}: {e}");
-            return rx;
-        }
-    };
-    eprintln!("filmcraft: control server listening on 127.0.0.1:{port}");
-    std::thread::spawn(move || accept_loop(listener, tx, ctx));
-    rx
+pub fn start(port: u16, ctx: egui::Context, journal: filmcraft_engine::agent_bridge::CommandJournal) -> Receiver<ControlRequest> {
+    match start_bound(port, ctx, journal) {
+        Ok((rx, _)) => rx,
+        Err(error) => { let _ = writeln!(std::io::stderr(), "filmcraft: {error}"); let (_, rx) = channel(); rx }
+    }
 }
 
+/// Shared by the native UI and the headless native command process. Port0 is allocated atomically.
+pub fn start_bound(port: u16, ctx: egui::Context, journal: filmcraft_engine::agent_bridge::CommandJournal) -> Result<(Receiver<ControlRequest>, u16), String> {
+    let (tx, rx) = channel::<ControlRequest>();
+    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+    let bound = listener.local_addr().map_err(|e| e.to_string())?.port();
+    std::thread::Builder::new().name("control-listener".into()).spawn(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| accept_loop_with_journal(listener, tx, ctx, journal)));
+    }).map_err(|e| e.to_string())?;
+    Ok((rx, bound))
+}
+
+#[cfg(test)]
 fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context) {
+    accept_loop_with_journal(listener, tx, ctx, Default::default())
+}
+
+fn accept_loop_with_journal(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context, journal: filmcraft_engine::agent_bridge::CommandJournal) {
     let open = Arc::new(AtomicUsize::new(0));
     for mut stream in listener.incoming().flatten() {
         if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
@@ -46,12 +55,13 @@ fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Con
         }
         let tx = tx.clone();
         let ctx = ctx.clone();
+        let journal = journal.clone();
         // The slot is given back when the guard drops: after `serve` returns, if it panics, or if
         // the thread can't be started (the closure, and with it the guard, is dropped).
         let slot = Slot(Arc::clone(&open));
         let spawned = std::thread::Builder::new().name("control-conn".into()).spawn(move || {
             let _slot = slot;
-            serve(stream, &tx, &ctx);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serve(stream, &tx, &ctx, journal)));
         });
         if let Err(e) = spawned {
             eprintln!("filmcraft: control server could not start a connection thread: {e}");
@@ -68,14 +78,15 @@ impl Drop for Slot {
     }
 }
 
-fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context) {
+fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context, journal: filmcraft_engine::agent_bridge::CommandJournal) {
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let Ok(read) = stream.try_clone() else { return };
-    serve_lines(read, stream, |method, params| {
+    serve_lines_with_journal(read, stream, |method, params| {
         let (req, rrx) = ControlRequest::new(method, params);
         tx.send(req).ok()?;
         ctx.request_repaint();
         Some(rrx.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|_| json!({"ok": false, "error": "timeout"})))
-    });
+    }, Some(journal));
 }
 
 /// One parsed line.
@@ -138,7 +149,12 @@ fn read_bounded_line(reader: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -
 /// Serve requests from `read`, answering on `out`, until the peer closes, sends something that is
 /// not a request, or `handle` returns `None` (app gone). `handle` gets `(method, params)` and
 /// returns the reply object (the request's `id` is added here).
-fn serve_lines<R: Read, W: Write>(read: R, mut out: W, mut handle: impl FnMut(String, Value) -> Option<Value>) {
+#[cfg(test)]
+fn serve_lines<R: Read, W: Write>(read: R, out: W, handle: impl FnMut(String, Value) -> Option<Value>) {
+    serve_lines_with_journal(read, out, handle, None)
+}
+
+fn serve_lines_with_journal<R: Read, W: Write>(read: R, mut out: W, mut handle: impl FnMut(String, Value) -> Option<Value>, journal: Option<filmcraft_engine::agent_bridge::CommandJournal>) {
     let mut reader = BufReader::new(read);
     let mut buf = Vec::new();
     loop {
@@ -149,6 +165,15 @@ fn serve_lines<R: Read, W: Write>(read: R, mut out: W, mut handle: impl FnMut(St
                 Line::Blank => continue,
                 Line::Reject(e) => e,
                 Line::Request { id, method, params } => {
+                    if method == "engine.journal.subscribe" && let Some(journal) = &journal {
+                        let (cursor, rx) = journal.subscribe();
+                        if writeln!(out, "{}", json!({"id":id,"ok":true,"result":{"protocol":1,"cursor":cursor}})).and_then(|()| out.flush()).is_err() { return; }
+                        for event in rx {
+                            if writeln!(out, "{event}").and_then(|()| out.flush()).is_err() { return; }
+                        }
+                        let _ = writeln!(out, "{}", json!({"event":"journal_closed","error":"subscriber fell behind; reconnect and read again"})).and_then(|()| out.flush());
+                        return;
+                    }
                     let Some(mut r) = handle(method, params) else { return };
                     if let Some(o) = r.as_object_mut() {
                         o.insert("id".into(), id);
