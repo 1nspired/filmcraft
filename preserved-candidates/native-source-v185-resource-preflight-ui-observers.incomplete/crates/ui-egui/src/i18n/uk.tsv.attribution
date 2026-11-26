@@ -1,0 +1,9 @@
+asset:        uk.tsv
+title:        Ukrainian interface translation catalog
+author:       FilmCraft contributors
+source:       original work
+license:      MIT OR Apache-2.0
+license-file: LICENSE-MIT and LICENSE-APACHE
+added:        2026-10-09 by dmatviichuk
+notes:        Original English-to-Ukrainian menu translations migrated to the TSV catalog format.
+notes-poema: Product and upstream-link labels updated for the Poema native fork on 2026-10-31; original translations and author attribution retained.

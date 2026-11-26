@@ -1,0 +1,1797 @@
+//! The FilmCraft engine façade.
+//!
+//! Every user-visible action is a command with a stable id (`sequence.addEdit`,
+//! `timeline.trim`, `markers.markIn`…) and JSON parameters, dispatched through
+//! [`Session::execute`]. The egui UI, the CLI, the control channel and the MCP server all use this
+//! one entry point; that is what makes the UI swappable and the whole app agent-drivable.
+//!
+//! The project is an `Arc<Project>` edited copy-on-write; undo keeps whole-project snapshots (cheap
+//! thanks to structural sharing of untouched items).
+
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
+
+pub mod aaf_omf;
+mod agent_bridge;
+#[cfg(not(target_arch = "wasm32"))]
+pub use agent_bridge::application_tab_scope::{
+    ApplicationTabHistory, ApplicationTabPreparedActivation, ApplicationTabPublication, ApplicationTabReceipt, ApplicationTabScope,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use agent_bridge::operation_control::AgentOperationControl;
+pub mod autosave;
+mod caption_import;
+pub mod captions;
+mod clip_identity;
+pub mod clip_ops;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cold_save_startup;
+pub mod color;
+pub mod commands;
+pub mod demo;
+pub mod doc_path;
+mod editor_state;
+#[cfg(test)]
+mod editor_state_tests;
+mod editorial_workspace;
+pub(crate) mod effect_stack;
+pub mod essential_sound;
+pub mod export_tools;
+pub mod graphic_templates;
+pub mod graphics;
+#[cfg(test)]
+mod graphics_input_tests;
+pub mod interchange;
+pub mod keyboard;
+mod keyframe_move;
+mod marker_export;
+mod marker_ops;
+pub mod masks;
+pub mod media_browser;
+pub mod media_pool;
+pub mod media_watch;
+pub mod mixer;
+mod move_ops;
+#[cfg(test)]
+mod move_ops_tests;
+pub mod multicam;
+pub mod narration;
+pub mod panels;
+pub mod paste_media;
+pub mod perf;
+mod placement;
+pub mod presets;
+pub mod previews;
+mod project_clear;
+#[cfg(test)]
+mod project_clear_tests;
+mod project_ids;
+pub mod project_manager;
+mod project_organization;
+#[cfg(test)]
+mod project_organization_tests;
+pub mod project_panel;
+mod project_save;
+pub mod project_tools;
+mod project_workspace;
+#[cfg(test)]
+mod project_workspace_tests;
+pub mod proxies;
+mod range_ops;
+#[cfg(test)]
+mod range_ops_tests;
+pub mod relink;
+pub mod remix;
+mod saved_file;
+pub mod scene_detect;
+pub mod scopes;
+mod search_organization;
+#[cfg(test)]
+mod search_organization_tests;
+mod sequence_assembly;
+#[cfg(test)]
+mod sequence_assembly_tests;
+pub mod sequence_extras;
+pub mod sequence_tools;
+pub mod settings;
+pub mod shortcut_presets;
+pub mod shortcuts;
+pub mod source_monitor;
+mod speed_duration;
+pub mod sync;
+mod track_ops;
+#[cfg(test)]
+mod track_ops_tests;
+pub mod transcript;
+pub mod trim;
+mod trim_ops;
+#[cfg(test)]
+mod trim_ops_tests;
+pub mod voiceover;
+
+use std::sync::Arc;
+
+use filmcraft_edit::EditCtx;
+use filmcraft_project::{ClipId, ItemId, Project, Sequence, TrackId, TrackKind};
+use filmcraft_time::{FrameRate, Tick, TimeRange};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub use commands::{CommandSpec, command_specs, find as find_command};
+pub use filmcraft_export as export;
+pub use filmcraft_project as project;
+pub use filmcraft_render as render;
+pub use filmcraft_time as time;
+pub use media_pool::MediaPool;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod session_worker;
+
+/// The OS temp folder; `/tmp` on wasm32, where `std::env::temp_dir()` panics ("no filesystem on
+/// this platform"). Use this instead of `std::env::temp_dir()` in any code the web build runs.
+pub fn temp_dir() -> std::path::PathBuf {
+    if cfg!(target_arch = "wasm32") { std::path::PathBuf::from("/tmp") } else { std::env::temp_dir() }
+}
+
+/// Resolve generated test fixtures, requiring an explicit absolute root for managed runs.
+#[cfg(test)]
+pub(crate) fn test_fixture_root(value: Option<std::ffi::OsString>, required: bool) -> std::result::Result<std::path::PathBuf, &'static str> {
+    if let Some(value) = value {
+        let path = std::path::PathBuf::from(value);
+        if path.is_absolute() {
+            return Ok(path);
+        }
+        return Err("configured native mixer fixture root must be absolute");
+    }
+    if required {
+        return Err("managed native mixer fixture root is required; no source-tree fallback");
+    }
+    Ok(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/fixtures"))
+}
+#[derive(Debug, thiserror::Error)]
+pub enum EngineError {
+    #[error("unknown command `{0}`")]
+    UnknownCommand(String),
+    #[error("command `{0}` is not available right now: {1}")]
+    Disabled(String, String),
+    #[error("invalid parameters for `{cmd}`: {msg}")]
+    BadParams { cmd: String, msg: String },
+    #[error("no active sequence")]
+    NoSequence,
+    #[error("edit failed: {0}")]
+    Edit(#[from] filmcraft_edit::EditError),
+    #[error("media: {0}")]
+    Media(#[from] filmcraft_media::MediaError),
+    #[error("internal error in `{command}` (see the crash log); outcome unknown, reconcile before another edit")]
+    CommandPanicked { command: String },
+    #[error("{0}")]
+    Other(String),
+}
+
+pub type Result<T> = std::result::Result<T, EngineError>;
+
+/// Host services (file access, clipboard…) injected by the frontend.
+pub trait Services: Send + Sync {
+    fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>>;
+    fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()>;
+    /// Size of a file in bytes (an error when it is missing). Hosts should override this: the
+    /// default reads the whole file.
+    fn file_size(&self, path: &str) -> std::io::Result<u64> {
+        self.read_file(path).map(|b| b.len() as u64)
+    }
+    /// Up to `len` bytes of a file starting at `offset` (fewer at the end of the file).
+    fn read_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let b = self.read_file(path)?;
+        let a = (offset as usize).min(b.len());
+        Ok(b[a..(a + len).min(b.len())].to_vec())
+    }
+    /// A random-access reader for a media file, so containers are opened without reading the
+    /// whole file (web: `Blob` range reads). `None`: the host has none; media are read whole.
+    fn reader(&self, _path: &str) -> Option<std::io::Result<filmcraft_media::SharedReader>> {
+        None
+    }
+    /// File names in a directory (image sequence detection). `None`: the host cannot list
+    /// directories; sequences are then found by probing consecutive frame numbers.
+    fn list_dir(&self, _dir: &str) -> Option<std::io::Result<Vec<String>>> {
+        None
+    }
+    /// A loader the media pool keeps for reading files later (image sequence frames on demand).
+    /// `None`: the frames are read when the sequence is opened.
+    fn file_loader(&self) -> Option<filmcraft_media::sequence::FrameLoader> {
+        None
+    }
+    /// Exports are encoded in memory and handed to [`Services::write_file`] (hosts without a
+    /// filesystem, e.g. the web: the file is then offered as a download). Otherwise they stream
+    /// to the output path.
+    fn export_in_memory(&self) -> bool {
+        false
+    }
+    /// Entries of a directory with their kind, size and date (the Media Browser). The default
+    /// derives them from [`Services::list_dir`] (every name a file).
+    fn list_entries(&self, dir: &str) -> Option<std::io::Result<Vec<media_browser::DirEntry>>> {
+        self.list_dir(dir).map(|r| r.map(|names| names.into_iter().map(|name| media_browser::DirEntry { name, ..Default::default() }).collect()))
+    }
+    /// Drives and network locations (Media Browser ▸ Local Drives / Network).
+    fn volumes(&self) -> Vec<media_browser::Volume> {
+        Vec::new()
+    }
+    /// The user's home directory (where the Media Browser starts).
+    fn home_dir(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Native filesystem services.
+pub struct FsServices;
+impl Services for FsServices {
+    fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+    fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
+        // Atomic + durable: temp file in the same directory, fsync, rename, fsync the directory.
+        filmcraft_format::atomic_write(std::path::Path::new(path), data)
+    }
+    fn file_size(&self, path: &str) -> std::io::Result<u64> {
+        let m = std::fs::metadata(path)?;
+        if m.is_file() { Ok(m.len()) } else { Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{path} is not a file"))) }
+    }
+    fn list_dir(&self, dir: &str) -> Option<std::io::Result<Vec<String>>> {
+        let dir = if dir.is_empty() { "." } else { dir };
+        Some(std::fs::read_dir(dir).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect()))
+    }
+    fn file_loader(&self) -> Option<filmcraft_media::sequence::FrameLoader> {
+        Some(std::sync::Arc::new(|p: &str| std::fs::read(p)))
+    }
+    /// Media are read in place from the open file: a clip costs its index, not its size.
+    #[cfg(any(unix, windows))]
+    fn reader(&self, path: &str) -> Option<std::io::Result<filmcraft_media::SharedReader>> {
+        Some(filmcraft_media::reader::FileReader::open(std::path::Path::new(path)).map(|r| std::sync::Arc::new(r) as filmcraft_media::SharedReader))
+    }
+    fn list_entries(&self, dir: &str) -> Option<std::io::Result<Vec<media_browser::DirEntry>>> {
+        Some(media_browser::std_list_entries(dir))
+    }
+    fn volumes(&self) -> Vec<media_browser::Volume> {
+        media_browser::std_volumes()
+    }
+    fn home_dir(&self) -> Option<String> {
+        media_browser::std_home_dir()
+    }
+    fn read_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(path)?;
+        f.seek(SeekFrom::Start(offset))?;
+        let mut out = Vec::with_capacity(len);
+        f.take(len as u64).read_to_end(&mut out)?;
+        Ok(out)
+    }
+}
+
+/// A point in the undo history (its top step), from [`Session::undo_mark`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UndoMark(Option<usize>);
+
+/// Undo history of whole-project snapshots.
+#[derive(Clone, Default)]
+pub struct History {
+    pub undo: Vec<(String, Arc<Project>)>,
+    pub redo: Vec<(String, Arc<Project>)>,
+    /// Labels of all applied states, oldest first (History panel).
+    pub limit: usize,
+    /// Key of the last [`Session::edit_merged`] step: a continuous gesture (a fader drag) with the
+    /// same key folds into that one undo step.
+    pub merge_key: Option<String>,
+}
+
+impl History {
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+}
+
+/// Source patching / track targeting (the track header "V1/A1" source buttons + target toggles).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Targeting {
+    /// Timeline tracks targeted for navigation / paste / match frame.
+    pub targeted: Vec<TrackId>,
+    /// Destination track for the source's video (source patch), None = unpatched.
+    pub video_dest: Option<TrackId>,
+    pub audio_dest: Option<TrackId>,
+}
+
+/// A gap on one track of the active sequence (see [`EditorState::gap_selection`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GapSelection {
+    pub track: TrackId,
+    pub range: TimeRange,
+}
+
+/// An effect of a clip (`effects.select`): its id and which of the clip's effects with that id it
+/// is (0 = the first). Not its index, which applying an effect shifts (standard effects go first).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectSel {
+    pub clip: ClipId,
+    pub effect: String,
+    pub instance: usize,
+    /// Tracked effects keep their selection across reorders and Undo/Redo.
+    /// Older untracked documents retain the definition/occurrence fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+}
+
+impl EffectSel {
+    /// The selection of `effects[index]` of `clip`.
+    pub fn of(clip: ClipId, effects: &[filmcraft_project::EffectInstance], index: usize) -> Option<Self> {
+        let id = &effects.get(index)?.effect;
+        let instance = effects.iter().take(index).filter(|e| &e.effect == id).count();
+        Some(Self { clip, effect: id.clone(), instance, instance_id: effects.get(index)?.instance_id.clone() })
+    }
+
+    /// Where the selected effect is in the clip's `effects`.
+    pub fn index(&self, effects: &[filmcraft_project::EffectInstance]) -> Option<usize> {
+        if let Some(id) = &self.instance_id {
+            if !filmcraft_project::ClipIdentity::valid_id(id) {
+                return None;
+            }
+            let mut matches = effects.iter().enumerate().filter(|(_, effect)| effect.instance_id.as_ref() == Some(id) && effect.effect == self.effect);
+            let index = matches.next().map(|(index, _)| index)?;
+            return matches.next().is_none().then_some(index);
+        }
+        effects.iter().enumerate().filter(|(_, e)| e.effect == self.effect).nth(self.instance).map(|(i, _)| i)
+    }
+}
+
+/// Editing state that commands depend on (not project data, but headless-relevant).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EditorState {
+    pub active_sequence: Option<ItemId>,
+    /// Playhead per sequence.
+    pub playheads: std::collections::BTreeMap<ItemId, Tick>,
+    /// Item loaded in the Source monitor and its playhead (media time).
+    pub source_item: Option<ItemId>,
+    pub source_playhead: Tick,
+    /// Clips opened in the Source monitor, most recent first: the Source panel's list of recent
+    /// clips (#313). Kept up to date after every command; items gone from the project drop out.
+    #[serde(default)]
+    pub source_history: Vec<ItemId>,
+    /// Selected timeline items.
+    pub selection: Vec<ClipId>,
+    /// Selected project panel items.
+    pub project_selection: Vec<ItemId>,
+    pub targeting: std::collections::BTreeMap<ItemId, Targeting>,
+    pub snapping: bool,
+    pub linked_selection: bool,
+    /// The Timeline's "Insert and overwrite sequences as nests or individual clips" toggle, turned
+    /// off: a sequence edits in as its clips instead of one nested clip.
+    #[serde(default)]
+    pub sequences_as_clips: bool,
+    /// Open sequences (timeline tabs), in tab order.
+    pub open_sequences: Vec<ItemId>,
+    /// How each sequence is shown in the Timeline panel (zoom, scroll, track heights): every
+    /// sequence keeps its own. The frontend writes the active sequence's view here as it changes
+    /// and takes a sequence's view from here when it becomes the active one.
+    #[serde(default)]
+    pub timeline_views: std::collections::BTreeMap<ItemId, filmcraft_project::SequenceView>,
+    /// Timeline clipboard (serialized track items with their relative track index).
+    #[serde(skip)]
+    pub clipboard: Vec<(TrackKind, usize, filmcraft_project::TrackItem)>,
+    pub default_video_transition: String,
+    pub default_audio_transition: String,
+    /// Selected edit points (trim mode).
+    #[serde(default)]
+    pub edit_points: Vec<trim::EditPoint>,
+    /// Trim Monitor Out/In shift counters for the selected edit point.
+    #[serde(default)]
+    pub trim_shift: trim::TrimShift,
+    /// Selected captions (caption tracks / Captions panel).
+    #[serde(default)]
+    pub caption_selection: Vec<ClipId>,
+    /// Selected transitions (clicked in the Timeline): Effect Controls shows one, Delete removes
+    /// them. Selecting clips clears it and selecting transitions clears the clip selection.
+    #[serde(default)]
+    pub transition_selection: Vec<filmcraft_project::TransitionId>,
+    /// The selected gap (#648, #668): empty time on one track, clicked in the Timeline, from the
+    /// end of a clip (or the sequence start) up to the next clip. Delete, Backspace and Ripple
+    /// Delete close it. Selecting clips, transitions or edit points clears it, and so does an edit
+    /// that changes the gap.
+    #[serde(default)]
+    pub gap_selection: Option<GapSelection>,
+    /// Selected layers (indices among the graphic layers, 0 = back) of the selected graphic clip.
+    #[serde(default)]
+    pub graphic_layers: Vec<usize>,
+    /// The mask being edited on the Program monitor (Effect Controls selection).
+    #[serde(default)]
+    pub selected_mask: Option<masks::MaskSel>,
+    /// The effect selected in Effect Controls (its header or one of its properties): Motion and
+    /// Transform show their handles on the Program monitor. Selecting a mask clears it, and
+    /// selecting an effect clears the mask selection.
+    #[serde(default)]
+    pub selected_effect: Option<EffectSel>,
+    /// Multi-Camera Audio Follows Video: switching a multi-camera clip's angle switches its linked
+    /// audio clips too.
+    #[serde(default)]
+    pub multicam_audio_follows_video: bool,
+    /// Multi-Camera view settings: grid layout and page, selection order, preview monitor,
+    /// playback quality, transmit.
+    #[serde(default)]
+    pub multicam_view: multicam::MulticamView,
+    /// Audio Clip Mixer automation mode per audio track (track id → mode; missing = Read):
+    /// Latch / Touch / Write record the clip Volume and Panner moves as clip keyframes.
+    #[serde(default)]
+    pub clip_mixer_modes: std::collections::BTreeMap<u64, filmcraft_project::AutomationMode>,
+    /// Sequence ▸ Selection Follows Playhead: moving the playhead selects the clips under it on
+    /// targeted tracks.
+    #[serde(default)]
+    pub selection_follows_playhead: bool,
+    /// Sequence ▸ Show Through Edits: the timeline marks cuts between continuous pieces of a clip.
+    #[serde(default)]
+    pub show_through_edits: bool,
+    /// Markers ▸ Ripple Sequence Markers: ripple edits move (and delete) sequence markers too.
+    #[serde(default)]
+    pub ripple_sequence_markers: bool,
+    /// Markers ▸ Copy Paste Includes Sequence Markers.
+    #[serde(default)]
+    pub copy_paste_sequence_markers: bool,
+    /// Marker colours hidden in the Markers panel (Show All Marker Colors clears this).
+    #[serde(default)]
+    pub hidden_marker_colors: Vec<filmcraft_project::Label>,
+    /// Sequence markers copied with the clipboard clips (start relative to the copied range).
+    #[serde(skip)]
+    pub clipboard_markers: Vec<filmcraft_project::Marker>,
+    /// The last Edit ▸ Find… (Find Next continues it).
+    #[serde(default)]
+    pub find: Option<project_tools::FindState>,
+}
+
+/// Events for frontends (drained each frame).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub enum Event {
+    ProjectChanged {
+        revision: u64,
+    },
+    Toast {
+        message: String,
+        error: bool,
+    },
+    OpenSequence(ItemId),
+    OpenSource(ItemId),
+    /// Show this item in the Project panel (Reveal in Project).
+    RevealInProject(ItemId),
+}
+
+pub struct Session {
+    // A display projection never owns edit/history or persistence authority.
+    view_only: bool,
+    worker_available: bool,
+    // Only the exclusive native worker installs this transient cancellation
+    // handle. It is not serialized, copied to the display or a second writer.
+    media_import_control: Option<media_browser::ImportControl>,
+    #[cfg(not(target_arch = "wasm32"))]
+    save_lifecycle_control: Option<agent_bridge::SaveTaskControl>,
+    pub project: Arc<Project>,
+    pub history: History,
+    pub revision: u64,
+    pub saved_revision: u64,
+    saved_file: Option<saved_file::Baseline>,
+    pub path: Option<String>,
+    pub state: EditorState,
+    pub media: Arc<MediaPool>,
+    pub services: Arc<dyn Services>,
+    pub events: Vec<Event>,
+    /// Commands executed (for macros/debugging): (id, params).
+    pub journal: Vec<(String, Value)>,
+    /// Background jobs (exports, render previews…).
+    pub jobs: Vec<Job>,
+    /// Export job → the offline items it drew the slate for, filled when the export finishes
+    /// (#1054; `offlineMedia` in `file.exportMedia` and queue results).
+    pub export_offline: std::collections::HashMap<u64, Arc<std::sync::Mutex<Vec<media_pool::OfflineMedia>>>>,
+    /// User preferences (`prefs.*` commands) and where they persist (None = not persisted).
+    pub prefs: autosave::Preferences,
+    pub prefs_path: Option<std::path::PathBuf>,
+    // A complete native snapshot supplies live auxiliary values, not stale files.
+    native_auxiliary_restored: bool,
+    /// Auto-save ring + crash-recovery journal (native frontends start it; None = off).
+    pub persistence: Option<autosave::Persistence>,
+    // Declaration order matters: the original persistence worker stops BEFORE
+    // pending Save pause owners drop during Session destruction.
+    #[cfg(not(target_arch = "wasm32"))]
+    project_save_operation: project_save::operation::Slot,
+    /// Schema version of the file at `path` as found on disk (older = upgraded on load; the first
+    /// save over it keeps a backup of the original).
+    pub loaded_schema: u32,
+    /// Render preview files + render-bar segments (shared with the frontend's frame workers).
+    pub previews: Arc<previews::PreviewStore>,
+    /// Audio Track Mixer automation pass in progress.
+    pub mixrec: mixer::Recorder,
+    /// Multi-camera live switching pass in progress.
+    pub mcrec: multicam::Recorder,
+    /// Voice-over recording: the input device and the take in progress.
+    pub voiceover: voiceover::VoiceOver,
+    /// The last `tts.preview` result, for the host to play (Text to Speech ▸ Preview).
+    pub tts_preview: Option<Arc<filmcraft_tts::Audio>>,
+    /// Synthesized narrations (`tts.render` fills it from a background job).
+    pub tts_cache: narration::SynthCache,
+    /// Dynamic (J/K/L) trimming and trim-mode loop playback in progress.
+    pub trim_play: trim::TrimPlayback,
+    /// Keyboard shortcuts (active bindings, presets; `shortcuts.*` commands).
+    pub shortcuts: shortcuts::Shortcuts,
+    /// Missing / offline media found by the last scan (Link Media dialog).
+    pub offline: relink::OfflineState,
+    /// Proxy / ingest / project-manager jobs whose results still have to be applied to the project.
+    pub media_jobs: Vec<proxies::PendingJob>,
+    /// Mask tracking jobs whose keyframes are still being written.
+    pub mask_jobs: Vec<masks::PendingTrack>,
+    /// Scene Edit Detection jobs whose results are applied when they finish.
+    pub scene_jobs: Vec<scene_detect::PendingScene>,
+    /// Effect presets (built-in + the user's, persisted in the data directory).
+    pub presets: presets::PresetLibrary,
+    /// Export presets (built-in + the user's, persisted in the data directory) and favourites.
+    pub export_presets: export_tools::ExportPresetLibrary,
+    /// The export queue (session state, not saved with the project).
+    pub export_queue: export_tools::ExportQueue,
+    /// Exports run a batch at a time by [`Session::pump_jobs`] (hosts without threads: web).
+    pub stepped: Vec<SteppedJob>,
+    /// Speech recogniser for `transcript.generate` (None = the Whisper model named by the command,
+    /// feature `whisper`). Hosts and tests install one here.
+    pub transcriber: Option<Arc<dyn filmcraft_speech::Transcriber>>,
+    /// The Events panel log: failed commands, job results, auto-save errors, messages.
+    pub log: panels::EventLog,
+    /// Media Browser navigation (directory, back / forward history, selected files).
+    pub browser: media_browser::BrowserState,
+    /// Nesting depth of [`Session::execute`] (commands that run other commands).
+    exec_depth: u32,
+    /// Ephemeral read tickets / batch receipts; never loaded from a project file.
+    agent_bridge: agent_bridge::Bridge,
+    /// Each media file's size and modification time when last seen (Settings ▸ Media ▸
+    /// Automatically refresh growing files, [`media_watch`]).
+    pub media_stamps: std::collections::HashMap<String, media_watch::Stamp>,
+    /// The stamps being taken on a worker thread ([`Session::start_media_scan`]).
+    pub media_scan: Option<media_watch::MediaScan>,
+}
+
+/// An export advanced a batch at a time on the host's thread ([`Session::pump_jobs`]).
+pub struct SteppedJob {
+    pub job: u64,
+    pub exporter: filmcraft_export::Exporter,
+    pub provider: media_pool::PoolProvider,
+    pub progress: Arc<filmcraft_export::Progress>,
+    pub result: Arc<std::sync::Mutex<Option<std::result::Result<filmcraft_export::Report, String>>>>,
+}
+
+/// A background job with shared progress.
+#[derive(Clone)]
+pub struct Job {
+    pub id: u64,
+    pub label: String,
+    pub progress: Arc<filmcraft_export::Progress>,
+    pub result: Arc<std::sync::Mutex<Option<std::result::Result<filmcraft_export::Report, String>>>>,
+}
+
+impl Job {
+    pub fn to_json(&self) -> Value {
+        use std::sync::atomic::Ordering;
+        let res = self.result.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        serde_json::json!({
+            "id": self.id,
+            "label": self.label,
+            "progress": self.progress.fraction(),
+            // seconds left at the job's recent speed; null until it can tell
+            "etaSeconds": self.progress.eta().map(|d| d.as_secs_f64()),
+            "done": self.progress.done.load(Ordering::Relaxed),
+            "total": self.progress.total.load(Ordering::Relaxed),
+            "status": self.progress.status.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            "finished": res.is_some(),
+            "result": match res { Some(Ok(r)) => serde_json::to_value(r).unwrap_or_default(), Some(Err(e)) => serde_json::json!({"error": e}), None => Value::Null },
+        })
+    }
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new(Arc::new(FsServices))
+    }
+}
+
+impl Session {
+    /// Read-only addresses of this actual live Save owner, never a key or file grant.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn pending_save_operation_request(&self) -> Option<Value> {
+        agent_bridge::pending_save_request(self)
+    }
+    fn save_operation_held(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.project_save_operation.held()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+    fn require_owner(&self) -> Result<()> {
+        if self.save_operation_held() {
+            return Err(EngineError::Other("native Save remains pending; reconcile its exact operation before editing".into()));
+        }
+        self.require_unprojected_owner()
+    }
+    // General edits must use require_owner. Held-operation services may use
+    // this shared remaining policy only AFTER validating their actual Key.
+    fn require_unprojected_owner(&self) -> Result<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if agent_bridge::application_setup_held(self) {
+            return Err(EngineError::Other("Poema is completing this project setup; no native edit was started".into()));
+        }
+        if self.view_only {
+            return Err(EngineError::Other("a native write owns the session; this display projection cannot execute or edit".into()));
+        }
+        if agent_bridge::workspace_update_held(self) {
+            return Err(EngineError::Other("workspace update has paused native editing; cancel the update to resume".into()));
+        }
+        Ok(())
+    }
+    fn require_command_owner(&self, command: &str) -> Result<()> {
+        if self.save_operation_held() {
+            #[cfg(not(target_arch = "wasm32"))]
+            if !self.view_only && agent_bridge::pending_save_lifecycle_command(self, command) {
+                return Ok(());
+            }
+            return Err(EngineError::Other("native Save remains pending; no competing command was started".into()));
+        }
+        if self.view_only {
+            return Err(EngineError::Other("a native write owns the session; this display projection cannot execute or edit".into()));
+        }
+        agent_bridge::workspace_update_command(self, command)
+    }
+
+    /// Read-only display state while the authoritative Session runs on its native worker.
+    pub fn is_display_only(&self) -> bool {
+        self.view_only || self.save_operation_held() || agent_bridge::workspace_update_held(self)
+    }
+    /// Refuse desktop transfer while the original Save owner remains unresolved.
+    /// This negative lifecycle check grants no startup admission or worker release.
+    /// A managed workspace update may still present its original paused Session.
+    pub fn ensure_desktop_startup_transfer(&self) -> Result<()> {
+        if self.view_only || self.save_operation_held() || agent_bridge::resource_preflight_held(self) {
+            return Err(EngineError::Other("resolve the original native Save owner before desktop Session transfer".into()));
+        }
+        Ok(())
+    }
+    /// Lifecycle metadata only, never a source witness or an edit ticket.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn workspace_update_status(&self) -> Option<Value> {
+        agent_bridge::workspace_update_view(self)
+    }
+    /// Only the lifecycle fence; this does not validate command arguments or
+    /// confer a read ticket, mutation permission or source-file authority.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn workspace_update_allows(&self, command: &str) -> bool {
+        !self.save_operation_held() && agent_bridge::workspace_update_command(self, command).is_ok()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn cancel_workspace_update(&mut self) -> Result<Option<Value>> {
+        agent_bridge::cancel_workspace_update(self)
+    }
+    /// Read-only native presentation identity, including genuine sequence
+    /// absence. None denotes a legacy project without independent identity.
+    /// This grants no history, media or agent editing authority.
+    pub fn matches_project_workspace(&self, project_id: &str, workspace_id: &str) -> Result<Option<bool>> {
+        project_workspace::matches_identity(&self.project, project_id, workspace_id)
+    }
+    /// Trusted lifecycle inspection only. Captures exact native saved bytes and
+    /// read-only journal comparisons; no plan, source authority or restoration.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn capture_project_recovery_basis(&mut self, scope: &Value) -> Result<Value> {
+        agent_bridge::capture_project_recovery_basis(self, scope)
+    }
+    /// Read-only comparison of a previously captured native lifecycle basis.
+    /// It never authenticates a caller or authorizes a restore/activation. A
+    /// future cold startup must bind this into its immutable checked snapshot.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn validate_project_recovery_basis(basis: &Value) -> Result<()> {
+        agent_bridge::validate_project_recovery_basis(basis)
+    }
+    /// Trusted native startup only. Loads an opaque checked native bundle into
+    /// a fresh, paused candidate; it does not activate an editor or source proof.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_workspace_update(&mut self, params: &Value) -> Result<Value> {
+        agent_bridge::open_workspace_update(self, params)
+    }
+    /// Trusted cold startup only: recover an exact native identity decision
+    /// into a fresh paused candidate. Never a command or a live-editor restore.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_identity_publication(&mut self, params: &Value) -> Result<Value> {
+        agent_bridge::open_identity_publication(self, params)
+    }
+    /// Trusted cold startup only. Hydrates an authenticated complete independent
+    /// project snapshot into a fresh paused candidate, never a live edit.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_project_recovery(&mut self, params: &Value) -> Result<Value> {
+        agent_bridge::open_project_recovery(self, params)
+    }
+    /// Trusted cold Save startup only. Retains the original native constructor
+    /// behind a distinct fresh Save hold. This starts no persistence worker and
+    /// cannot activate or reconstruct the previous Save operation Key.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_save_recovery(&mut self, params: &Value) -> Result<Value> {
+        agent_bridge::open_save_recovery(self, params)
+    }
+    /// Read the same actual cold Save hold. A copied status cannot resume it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn cold_save_recovery_status(&self) -> Result<Option<Value>> {
+        project_save::operation::cold_recovery_status(self)
+    }
+    /// Reserve the original cold owner's journal identity without creating
+    /// storage or starting a worker. Returned JSON supplies no ownership.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn prepare_cold_save_runtime(&mut self) -> Result<Value> {
+        project_save::operation::prepare_cold_runtime(self)
+    }
+    /// Confirm only the exact durable original-journal successor of the live
+    /// one-use preparation. Editing, previews and persistence remain held.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn confirm_cold_save_runtime(&mut self, receipt: &Value) -> Result<Value> {
+        project_save::operation::confirm_cold_runtime(self, receipt)
+    }
+    /// Create only the original reserved gated worker; no preferences, cache
+    /// deletion, snapshot queueing, activation or worker release occurs here.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_cold_save_persistence(&mut self) -> Result<Value> {
+        project_save::operation::create_cold_worker(self)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn confirm_cold_save_persistence(&mut self, receipt: &Value) -> Result<Value> {
+        project_save::operation::confirm_cold_worker(self, receipt)
+    }
+    /// Trusted cold lifecycle only: original canonical payloads, no edit release.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn prepare_cold_save_canonical(&mut self) -> Result<Value> {
+        project_save::operation::cold_canonical_action(self, project_save::operation::CanonicalAction::Prepare)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn confirm_cold_save_canonical_intent(&mut self, receipt: &Value) -> Result<Value> {
+        project_save::operation::cold_canonical_action(self, project_save::operation::CanonicalAction::ConfirmIntent(receipt))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn publish_cold_save_canonical(&mut self) -> Result<Value> {
+        project_save::operation::cold_canonical_action(self, project_save::operation::CanonicalAction::Publish)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn confirm_cold_save_canonical_observation(&mut self, receipt: &Value) -> Result<Value> {
+        project_save::operation::cold_canonical_action(self, project_save::operation::CanonicalAction::ConfirmObservation(receipt))
+    }
+    /// Bind the same original libraries and preference path after canonical
+    /// confirmation. No worker, edit or cache policy release occurs here.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn bind_cold_save_services(&mut self) -> Result<Value> {
+        project_save::operation::cold_canonical_action(self, project_save::operation::CanonicalAction::BindServices)
+    }
+    /// Confirm the sole original journal successor against the same actual
+    /// bound services. This does not release editing, previews or persistence.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn confirm_cold_save_service_bindings(&mut self, receipt: &Value) -> Result<Value> {
+        project_save::operation::cold_canonical_action(self, project_save::operation::CanonicalAction::ConfirmServiceBindings(receipt))
+    }
+    /// Trusted virgin startup only. Creates one new empty independent project
+    /// exclusively and holds editing until the existing explicit activation.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_project_workspace(&mut self, params: &Value) -> Result<Value> {
+        agent_bridge::create_project_workspace(self, params)
+    }
+    /// Reserve a fresh private persistence root. No worker starts until this
+    /// candidate's explicit native activation commits.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn configure_workspace_update_persistence(&mut self, cfg: autosave::AutosaveConfig) -> Result<()> {
+        agent_bridge::configure_workspace_update_persistence(self, cfg)
+    }
+    /// Descriptive native setup status, never a source witness or edit ticket.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn application_project_admission(&self) -> Option<Value> {
+        agent_bridge::application_project_status(self)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn display_projection(&self) -> Self {
+        let mut display = Self::new(self.services.clone());
+        display.view_only = true;
+        display.project = self.project.clone();
+        display.revision = self.revision;
+        display.saved_revision = self.saved_revision;
+        display.path = self.path.clone();
+        display.state = self.state.clone();
+        display.media = self.media.clone();
+        display.previews = self.previews.clone();
+        display.prefs = self.prefs.clone();
+        display.loaded_schema = self.loaded_schema;
+        display.shortcuts = self.shortcuts.display_copy();
+        display.presets = self.presets.display_copy();
+        display.export_presets = self.export_presets.display_copy();
+        display.export_queue = self.export_queue.clone();
+        display.browser = self.browser.clone();
+        display.offline = self.offline.clone();
+        // No tickets, owned history, persistence, devices or pending job writers are copied.
+        display
+    }
+
+    pub fn new(services: Arc<dyn Services>) -> Self {
+        Self {
+            view_only: false,
+            worker_available: false,
+            media_import_control: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            save_lifecycle_control: None,
+            project: Arc::new(Project::new("Untitled")),
+            history: History { limit: 200, ..Default::default() },
+            revision: 1,
+            saved_revision: 1,
+            saved_file: None,
+            path: None,
+            state: EditorState {
+                snapping: true,
+                linked_selection: true,
+                default_video_transition: "cross_dissolve".into(),
+                default_audio_transition: "constant_power".into(),
+                ..Default::default()
+            },
+            media: Arc::new(MediaPool::default()),
+            services,
+            events: Vec::new(),
+            journal: Vec::new(),
+            jobs: Vec::new(),
+            export_offline: Default::default(),
+            prefs: Default::default(),
+            prefs_path: None,
+            native_auxiliary_restored: false,
+            persistence: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            project_save_operation: Default::default(),
+            loaded_schema: filmcraft_format::SCHEMA_VERSION,
+            previews: Arc::new(previews::PreviewStore::temp()),
+            mixrec: Default::default(),
+            mcrec: Default::default(),
+            voiceover: Default::default(),
+            tts_preview: None,
+            tts_cache: Default::default(),
+            trim_play: Default::default(),
+            shortcuts: shortcuts::Shortcuts::new(),
+            offline: Default::default(),
+            media_jobs: Vec::new(),
+            mask_jobs: Vec::new(),
+            scene_jobs: Vec::new(),
+            presets: Default::default(),
+            export_presets: Default::default(),
+            export_queue: Default::default(),
+            stepped: Vec::new(),
+            transcriber: None,
+            log: Default::default(),
+            browser: Default::default(),
+            exec_depth: 0,
+            agent_bridge: Default::default(),
+            media_stamps: Default::default(),
+            media_scan: None,
+        }
+    }
+
+    /// Advance stepped jobs ([`SteppedJob`]) for up to `budget` (at least one step). Returns
+    /// whether jobs remain. A job whose media is still loading waits for the next call.
+    pub fn pump_jobs(&mut self, budget: std::time::Duration) -> bool {
+        if self.save_operation_held() {
+            return !self.stepped.is_empty() || self.export_queue.is_active();
+        }
+        export_tools::pump_queue(self, false);
+        let t0 = web_time::Instant::now();
+        while let Some(j) = self.stepped.first_mut() {
+            match j.exporter.step(&j.provider, &j.progress) {
+                Ok(filmcraft_export::Step::Progress) => {}
+                Ok(filmcraft_export::Step::Pending) => return true,
+                Ok(filmcraft_export::Step::Done(r)) => {
+                    *j.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(r));
+                    self.stepped.remove(0);
+                }
+                Err(e) => {
+                    let e = e.to_string();
+                    *j.progress.error.lock().unwrap_or_else(|x| x.into_inner()) = Some(e.clone());
+                    j.progress.finished.store(true, std::sync::atomic::Ordering::Relaxed);
+                    *j.result.lock().unwrap_or_else(|x| x.into_inner()) = Some(Err(e));
+                    self.stepped.remove(0);
+                }
+            }
+            if t0.elapsed() >= budget {
+                break;
+            }
+        }
+        !self.stepped.is_empty() || self.export_queue.is_active()
+    }
+
+    /// Start auto-save and the crash-recovery journal (native frontends). Loads preferences from
+    /// the data directory and finds unsaved changes left by sessions that died
+    /// ([`Session::recovery_candidates`]).
+    pub fn start_autosave(&mut self, cfg: autosave::AutosaveConfig) -> std::io::Result<()> {
+        self.start_persistence(cfg, false)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn start_workspace_persistence(&mut self, cfg: autosave::AutosaveConfig) -> std::io::Result<()> {
+        self.start_persistence(cfg, true)
+    }
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    pub(crate) fn start_current_image_persistence(
+        &mut self,
+        cfg: autosave::AutosaveConfig,
+        preferences: &filmcraft_format::retained::preview_context::NodeFrame,
+        check: &impl Fn() -> std::io::Result<()>,
+        startup_check: &impl Fn() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        use filmcraft_format::retained::preview_context::NodeState;
+        use sha2::Digest;
+        let path = cfg.data_dir.join("preferences.json");
+        let bytes = crate::project_save::effects::preference_bytes(&self.prefs);
+        check()?;
+        // Canonical preferences use the original library writer's normal file
+        // mode. They are not a private startup-control or credential document.
+        // Compare complete bytes to the retained publication's exact output;
+        // current() and fence() still reject same-byte generation replacement.
+        let same = matches!(preferences.state(), NodeState::File(observed)
+            if observed.bytes == bytes.len() as u64
+                && observed.sha256 == format!("{:x}", sha2::Sha256::digest(&bytes)));
+        if preferences.path() != path || bytes.is_empty() || bytes.len() > 2 * 1024 * 1024 || !same {
+            return Err(std::io::Error::other("actual published native preferences differ; persistence remains paused"));
+        }
+        preferences.current(check)?;
+        preferences.fence(check)?;
+        check()?;
+        self.start_persistence_inner(cfg, true, true, true, startup_check)
+    }
+    fn start_persistence(&mut self, cfg: autosave::AutosaveConfig, keep_preferences: bool) -> std::io::Result<()> {
+        self.start_persistence_inner(cfg, keep_preferences, false, false, &|| Ok(()))
+    }
+    fn start_persistence_inner(
+        &mut self,
+        cfg: autosave::AutosaveConfig,
+        keep_preferences: bool,
+        preferences_published: bool,
+        startup_gated: bool,
+        startup_check: &impl Fn() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if self.is_display_only()
+            && !(keep_preferences && !self.view_only && {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    agent_bridge::application_only_held(self)
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    false
+                }
+            })
+        {
+            return Err(std::io::Error::other("display-only native state cannot own persistence"));
+        }
+        let prefs_path = cfg.data_dir.join("preferences.json");
+        if keep_preferences {
+            if !preferences_published {
+                self.prefs.save(&prefs_path)?;
+            }
+        } else {
+            self.prefs = autosave::Preferences::load(&prefs_path);
+        }
+        self.prefs.apply_hardware_decoding();
+        self.media.set_use_proxies(self.prefs.media.enable_proxies);
+        if keep_preferences && self.native_auxiliary_restored {
+            self.shortcuts.bind_directory(&cfg.data_dir);
+            self.presets.bind_directory(&cfg.data_dir);
+            self.export_presets.bind_directory(&cfg.data_dir);
+        } else {
+            self.shortcuts.set_dir(&cfg.data_dir);
+            self.presets.set_dir(&cfg.data_dir);
+            self.export_presets.set_dir(&cfg.data_dir);
+        }
+        self.prefs_path = Some(prefs_path);
+        self.apply_media_cache();
+        self.persistence = Some(if startup_gated {
+            autosave::Persistence::start_current_image(&cfg, self.prefs.auto_save.clone(), startup_check)?
+        } else {
+            autosave::Persistence::start(&cfg, self.prefs.auto_save.clone())?
+        });
+        self.sync_persistence();
+        self.native_auxiliary_restored = false;
+        Ok(())
+    }
+
+    /// Clean shutdown: flush and stop the worker. Unsaved changes stay in the journal (offered on
+    /// the next launch); otherwise the session's journal directory is removed.
+    pub fn shutdown(&mut self) {
+        if self.save_operation_held() || self.resource_preflight_pending() {
+            // No Flush, Clean, cleanup or automatic resume on an unresolved Save or resource preflight.
+            // Persistence::drop stops its exact worker and preserves recovery.
+            drop(self.persistence.take());
+            return;
+        }
+        self.sync_persistence();
+        if let Some(p) = self.persistence.take() {
+            p.close();
+        }
+    }
+
+    pub fn recovery_candidates(&self) -> &[autosave::RecoveryCandidate] {
+        self.persistence.as_ref().map(|p| p.candidates.as_slice()).unwrap_or(&[])
+    }
+
+    /// Tell the worker about the current project state if it changed (cheap: an `Arc` clone and a
+    /// channel send; serialization happens on the worker). Called after every command.
+    pub fn sync_persistence(&mut self) {
+        if self.view_only {
+            return;
+        }
+        // A cold Save retains the actual worker before service ownership is
+        // transferred. Public housekeeping must not enqueue Clean/Snapshot or
+        // update last_sent while that distinct owner still holds the session.
+        #[cfg(not(target_arch = "wasm32"))]
+        if matches!(self.project_save_operation, project_save::operation::Slot::Cold(_) | project_save::operation::Slot::ColdBusy) {
+            return;
+        }
+        let dirty = self.is_dirty();
+        let Some(p) = self.persistence.as_ref() else { return };
+        let cur = autosave::Sent { revision: self.revision, saved_revision: self.saved_revision, path: self.path.clone() };
+        if p.last_sent.as_ref() == Some(&cur) {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let native = if dirty { agent_bridge::capture_native_journal(self).map_err(|e| e.to_string()) } else { Ok(None) };
+        let Some(p) = self.persistence.as_mut() else { return };
+        if dirty {
+            #[cfg(not(target_arch = "wasm32"))]
+            p.send_dirty_native(self.project.clone(), self.revision, self.path.clone(), native);
+            #[cfg(target_arch = "wasm32")]
+            p.send_dirty(self.project.clone(), self.revision, self.path.clone());
+        } else {
+            p.send_clean();
+        }
+        p.last_sent = Some(cur);
+    }
+
+    /// Apply worker notifications (call regularly, e.g. once per UI frame). Also applies the
+    /// results of finished proxy / ingest jobs.
+    pub fn poll_persistence(&mut self) {
+        if self.is_display_only() {
+            return;
+        }
+        proxies::poll(self);
+        masks::poll(self);
+        scene_detect::poll(self);
+        export_tools::pump_queue(self, false);
+        panels::log_jobs(self);
+        self.apply_persistence_events();
+        self.sync_persistence();
+    }
+    pub(crate) fn apply_persistence_events(&mut self) {
+        let Some(p) = self.persistence.as_mut() else { return };
+        for ev in p.drain_events() {
+            match ev {
+                autosave::WorkerEvent::SavedProject { path, revision, sha256 } if self.path.as_deref() == Some(path.as_str()) => {
+                    if revision >= self.saved_revision && revision <= self.revision {
+                        self.saved_revision = revision;
+                        self.saved_file = Some(saved_file::Baseline { path, sha256 });
+                    } else {
+                        // A late worker write cannot certify the current saved
+                        // baseline, even when its graph happens to look equal.
+                        self.saved_file = None;
+                    }
+                }
+                autosave::WorkerEvent::Error(m) => {
+                    self.log.push(panels::Level::Error, "autosave", m.clone());
+                    self.events.push(Event::Toast { message: m, error: true });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Describes this actual Session's private preflight editing fence.
+    /// The boolean is not a namespace receipt, transferable owner or startup grant.
+    pub fn resource_preflight_pending(&self) -> bool {
+        agent_bridge::resource_preflight_held(self)
+    }
+
+    /// Replace preferences (persisting them and updating the worker).
+    pub fn set_prefs(&mut self, p: autosave::Preferences) -> std::io::Result<()> {
+        if self.save_operation_held() {
+            return Err(std::io::Error::other("native Save owns preferences until reconciliation"));
+        }
+        self.set_prefs_with(p, &mut project_save::effects::Original)
+    }
+    pub(crate) fn set_prefs_with(&mut self, p: autosave::Preferences, files: &mut dyn project_save::effects::FileEffects) -> std::io::Result<()> {
+        if agent_bridge::resource_preflight_held(self) {
+            return Err(std::io::Error::other("original resource preflight owns preferences until its exact release"));
+        }
+        let cache_changed = self.prefs.media_cache != p.media_cache;
+        self.prefs = p;
+        self.prefs.apply_hardware_decoding();
+        if cache_changed {
+            self.apply_media_cache();
+        }
+        if self.media.use_proxies() != self.prefs.media.enable_proxies {
+            self.media.set_use_proxies(self.prefs.media.enable_proxies);
+            self.bump_view();
+        }
+        if let Some(w) = &self.persistence {
+            w.set_prefs(self.prefs.auto_save.clone());
+        }
+        match &self.prefs_path {
+            Some(path) => self.prefs.save_with(path, files),
+            None => Ok(()),
+        }
+    }
+
+    /// Keep render previews next to the saved project (moves an unsaved project's previews).
+    pub fn previews_follow_path(&mut self) {
+        if self.save_operation_held() {
+            return;
+        }
+        self.previews_follow_path_with(&mut project_save::effects::Original)
+    }
+    pub(crate) fn previews_follow_path_with(&mut self, files: &mut dyn project_save::effects::FileEffects) {
+        if agent_bridge::resource_preflight_held(self) {
+            return;
+        }
+        if let Some(p) = &self.path
+            && !cfg!(target_arch = "wasm32")
+        {
+            self.previews.move_to_with(project_tools::previews_dir(self).unwrap_or_else(|| previews::dir_for_project(p)), files);
+        }
+    }
+
+    /// A change of what the project *looks like* that isn't an edit (proxies toggled): bumps the
+    /// revision so frame caches refresh, without marking a clean project as modified.
+    pub fn bump_view(&mut self) {
+        let clean = !self.is_dirty();
+        self.bump();
+        if clean {
+            self.saved_revision = self.revision;
+        }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.revision != self.saved_revision
+    }
+
+    /// Independent cancellation handle for this session's guarded agent writes.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn agent_operation_control(&self) -> AgentOperationControl {
+        self.agent_bridge.operations.clone()
+    }
+
+    /// Run a command by id.
+    pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
+        self.require_command_owner(id)?;
+        let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
+        if self.exec_depth == 0 && spec.journal && self.trim_play.active() {
+            self.settle_trim_playback(id);
+        }
+        if let Err(why) = self.enabled_for(spec, &params) {
+            let e = EngineError::Disabled(id.to_string(), why);
+            if self.exec_depth == 0 {
+                self.log.push(panels::Level::Warning, id, e.to_string());
+            }
+            return Err(e);
+        }
+        self.exec_depth += 1;
+        // Last-resort guard: a panic in a command (a bug that escaped the never-crash rules)
+        // becomes an error for the caller (UI, CLI, control channel, MCP) instead of taking the
+        // session and its unsaved project down. The panic hook has logged where it happened.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| agent_bridge::run_command(self, id, &params, spec.run)))
+            .unwrap_or_else(|_| Err(EngineError::CommandPanicked { command: id.into() }));
+        self.exec_depth -= 1;
+        if self.exec_depth == 0 {
+            source_monitor::track_history(self);
+        }
+        // source graphics: an edited instance updates the shared layers and the other instances
+        if r.is_ok() && spec.journal && id.starts_with("graphics.") && !self.project.source_graphics.is_empty() {
+            graphic_templates::sync_source_graphics(self);
+        }
+        if self.exec_depth == 0
+            && let Err(e) = &r
+        {
+            self.log.push(panels::Level::Error, id, e.to_string());
+        }
+        if r.is_ok() && spec.journal {
+            self.journal.push((id.to_string(), params));
+            if self.journal.len() > 10_000 {
+                self.journal.drain(..1000);
+            }
+        }
+        self.sync_persistence();
+        // playback reads the newest snapshot (mixer moves, mutes… are heard while playing)
+        self.previews.live.publish_project(self.project.clone());
+        r
+    }
+
+    /// Preserve the original pre-command trim behavior through the shared native service.
+    fn settle_trim_playback(&mut self, id: &str) {
+        trim::command_settlement::settle_before_command(self, id);
+    }
+
+    /// Enablement of `spec` for one call. `enabled()` reads the selection, which is right for the
+    /// menus and for a call without targets. A caller that names its targets in `params`, under a
+    /// key the command documents (`clips` / `clip`: timeline clips, `items` / `item`: project
+    /// items), is asked the same question about those targets instead: the check runs again with
+    /// them standing in for the selection, so every other condition (an open sequence, a filled
+    /// clipboard, the kind of item…) still applies. The selections are put back before returning.
+    fn enabled_for(&mut self, spec: &CommandSpec, params: &Value) -> std::result::Result<(), String> {
+        let by_selection = (spec.enabled)(self);
+        if by_selection.is_ok() {
+            return by_selection;
+        }
+        let clips = commands::named_clips(self, spec, params);
+        let items = commands::named_items(self, spec, params);
+        // clips were named but none is one of the active sequence: say which and why, rather
+        // than "no clips selected" to a caller that did not mean the selection (#591)
+        let missing = if clips.is_none() { commands::named_clips_missing(self, spec, params) } else { None };
+        if clips.is_none() && items.is_none() {
+            return by_selection.map_err(|why| missing.unwrap_or(why));
+        }
+        let mut clips = clips.unwrap_or_else(|| self.state.selection.clone());
+        let mut items = items.unwrap_or_else(|| self.state.project_selection.clone());
+        std::mem::swap(&mut self.state.selection, &mut clips);
+        std::mem::swap(&mut self.state.project_selection, &mut items);
+        let by_params = (spec.enabled)(self);
+        self.state.selection = clips;
+        self.state.project_selection = items;
+        by_params.map_err(|why| missing.unwrap_or(why))
+    }
+
+    /// Whether the command can run on the current selection (what the menus show).
+    pub fn is_enabled(&self, id: &str) -> bool {
+        commands::find(id).is_some_and(|c| (c.enabled)(self).is_ok())
+    }
+
+    /// What is open, to store beside the project when it is saved.
+    pub fn project_view(&self) -> filmcraft_project::ProjectView {
+        let is_seq = |id: &ItemId| self.project.sequence(*id).is_some();
+        filmcraft_project::ProjectView {
+            open_sequences: self.state.open_sequences.iter().copied().filter(is_seq).collect(),
+            active_sequence: self.state.active_sequence.filter(is_seq),
+            sequences: self.state.timeline_views.iter().filter(|(id, _)| is_seq(id)).map(|(id, v)| (*id, *v)).collect(),
+            playheads: self.state.playheads.iter().filter(|(id, _)| is_seq(id)).map(|(id, t)| (*id, *t)).collect(),
+        }
+    }
+
+    /// Open what was open when the project was saved. Nothing in `view` is trusted: ids that are
+    /// not sequences of this project are dropped (also a second mention of the same sequence),
+    /// and numbers are brought into range (a playhead also lands on a frame of its sequence). A
+    /// view without any open sequence leaves the project on its first sequence: a project saved
+    /// by a session that never showed one (a script, the CLI) should not open on an empty Timeline.
+    pub fn restore_project_view(&mut self, view: filmcraft_project::ProjectView) {
+        let mut open: Vec<ItemId> = Vec::new();
+        for id in view.open_sequences {
+            if self.project.sequence(id).is_some() && !open.contains(&id) {
+                open.push(id);
+            }
+        }
+        if !open.is_empty() {
+            self.state.active_sequence = view.active_sequence.filter(|id| open.contains(id)).or(open.first().copied());
+            self.state.open_sequences = open;
+        }
+        self.state.timeline_views =
+            view.sequences.into_iter().filter(|(id, _)| self.project.sequence(*id).is_some()).filter_map(|(id, v)| Some((id, v.checked()?))).collect();
+        for (id, t) in view.playheads {
+            if let Some(seq) = self.project.sequence(id) {
+                let t = t.clamp(Tick::ZERO, filmcraft_project::ProjectView::MAX_PLAYHEAD);
+                self.state.playheads.insert(id, seq.settings.frame_rate.snap(t));
+            }
+        }
+    }
+
+    /// Every edit passes through here: one that would put a sequence inside itself (directly or
+    /// through another nested sequence) is refused, whichever command asked for it. A project that
+    /// was opened with such a sequence already in it can still be edited (and repaired).
+    fn refuse_self_nesting(&self, edited: &Project) -> Result<()> {
+        match edited.nest_cycle() {
+            Some(id) if self.project.nest_cycle().is_none() => {
+                let name = edited.item(id).map(|i| i.name.as_str()).unwrap_or_default();
+                Err(EngineError::Other(format!("a sequence cannot be nested inside itself (\u{201c}{name}\u{201d})")))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Apply an undoable project edit. The closure gets a mutable copy; on error nothing changes.
+    pub fn edit<R>(&mut self, label: &str, f: impl FnOnce(&mut Project, &mut EditorState) -> Result<R>) -> Result<R> {
+        self.require_owner()?;
+        let mut p = (*self.project).clone();
+        let mut st = self.state.clone();
+        let r = f(&mut p, &mut st)?;
+        clip_identity::reconcile(&self.project, &mut p)?;
+        self.commit_edit(label, p, st)?;
+        Ok(r)
+    }
+
+    /// Publish an already reconciled candidate (also used by the isolated agent staging path).
+    /// Re-minting its split/copy identities here would introduce phantom lineage parents.
+    fn commit_edit(&mut self, label: &str, p: Project, mut st: EditorState) -> Result<()> {
+        self.require_owner()?;
+        filmcraft_project::clip_identity::validate_project(&p).map_err(EngineError::Other)?;
+        self.refuse_self_nesting(&p)?;
+        editor_state::remap_committed_mask(&self.project, &p, &self.state, &mut st);
+        let old = std::mem::replace(&mut self.project, Arc::new(p));
+        self.history.undo.push((label.to_string(), old));
+        if self.history.undo.len() > self.history.limit {
+            self.history.undo.remove(0);
+        }
+        self.history.redo.clear();
+        self.history.merge_key = None;
+        self.state = st;
+        self.drop_stale_gap();
+        self.bump();
+        Ok(())
+    }
+
+    /// Like [`Session::edit`], but consecutive calls with the same `key` (and no other edit in
+    /// between) share one undo step: dragging a control is one undoable change.
+    pub fn edit_merged<R>(&mut self, label: &str, key: &str, f: impl FnOnce(&mut Project, &mut EditorState) -> Result<R>) -> Result<R> {
+        self.require_owner()?;
+        let merge = self.history.merge_key.as_deref() == Some(key) && self.history.undo.last().is_some_and(|u| u.0 == label);
+        if !merge {
+            let r = self.edit(label, f)?;
+            self.history.merge_key = Some(key.to_string());
+            return Ok(r);
+        }
+        let mut p = (*self.project).clone();
+        let mut st = self.state.clone();
+        let r = f(&mut p, &mut st)?;
+        clip_identity::reconcile(&self.project, &mut p)?;
+        self.refuse_self_nesting(&p)?;
+        editor_state::remap_committed_mask(&self.project, &p, &self.state, &mut st);
+        self.project = Arc::new(p);
+        self.state = st;
+        self.drop_stale_gap();
+        self.bump();
+        Ok(r)
+    }
+
+    /// Run project edits as one undo step. Keep the original history and project
+    /// explicitly, so long groups never disable the configured history bound.
+    /// Errors restore project, editor state and history; external I/O is not undone.
+    pub fn edit_group<R>(&mut self, label: &str, f: impl FnOnce(&mut Session) -> Result<R>) -> Result<R> {
+        self.require_owner()?;
+        let (project, state, history) = (self.project.clone(), self.state.clone(), self.history.clone());
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        let changed = !Arc::ptr_eq(&project, &self.project);
+        match r {
+            Ok(Ok(v)) => {
+                if changed {
+                    self.history = history;
+                    self.history.undo.push((label.to_string(), project));
+                    if self.history.undo.len() > self.history.limit {
+                        self.history.undo.remove(0);
+                    }
+                    self.history.redo.clear();
+                    self.history.merge_key = None;
+                }
+                Ok(v)
+            }
+            result => {
+                self.project = project;
+                self.state = state;
+                self.history = history;
+                if changed {
+                    self.bump();
+                }
+                match result {
+                    Ok(Err(error)) => Err(error),
+                    Err(panic) => std::panic::resume_unwind(panic),
+                    // Handled by the successful arm; keep this branch non-panicking.
+                    Ok(Ok(value)) => Ok(value),
+                }
+            }
+        }
+    }
+
+    /// Where the undo history stands now, for [`Session::revert_to`].
+    pub fn undo_mark(&self) -> UndoMark {
+        UndoMark(self.history.undo.last().map(|u| Arc::as_ptr(&u.1) as usize))
+    }
+
+    /// Take back every edit made since `mark` (a gesture cancelled with Escape, #580), merged or
+    /// not: the project returns to how it was at `mark`, and neither undo nor redo keeps them.
+    /// Nothing happens when `mark` has left the history. Returns how many steps were taken back.
+    pub fn revert_to(&mut self, mark: UndoMark) -> usize {
+        if self.save_operation_held() {
+            return 0;
+        }
+        if let UndoMark(Some(p)) = mark
+            && !self.history.undo.iter().any(|u| Arc::as_ptr(&u.1) as usize == p)
+        {
+            return 0;
+        }
+        let mut earliest = None;
+        let mut n = 0;
+        while self.undo_mark() != mark {
+            let Some((_, prev)) = self.history.undo.pop() else { break };
+            earliest = Some(prev);
+            n += 1;
+        }
+        if let Some(prev) = earliest {
+            let current = std::mem::replace(&mut self.project, prev);
+            self.state.selected_mask = masks::remap_selection(&current, &self.project, &self.state);
+            self.history.merge_key = None;
+            self.fix_state();
+            self.bump();
+        }
+        n
+    }
+
+    /// Edit the active sequence with the edit-algebra context.
+    pub fn edit_sequence<R>(&mut self, label: &str, f: impl FnOnce(&mut Sequence, &mut EditCtx, &mut EditorState) -> Result<R>) -> Result<R> {
+        self.edit_sequence_as(label, None, f)
+    }
+
+    /// [`Session::edit_sequence`] that shares one undo step with the previous edit of the same
+    /// `merge` key, like [`Session::edit_merged`] (a drag is one undoable change).
+    pub fn edit_sequence_as<R>(
+        &mut self,
+        label: &str,
+        merge: Option<&str>,
+        f: impl FnOnce(&mut Sequence, &mut EditCtx, &mut EditorState) -> Result<R>,
+    ) -> Result<R> {
+        let seq_id = self.state.active_sequence.ok_or(EngineError::NoSequence)?;
+        let media = self.media.clone();
+        let body = move |p: &mut Project, st: &mut EditorState| {
+            let project_snapshot = std::sync::Arc::new(p.clone());
+            let snap = project_snapshot.clone();
+            let durations = move |id: ItemId| -> Option<Tick> { media_duration(&project_snapshot, &media, id) };
+            let starts = move |id: ItemId| media_start(&snap, id);
+            let min = p.sequence(seq_id).map(|s| s.settings.frame_rate.frame_duration()).unwrap_or(Tick(1));
+            let mut next = p.next_id;
+            let r = {
+                let seq = p.sequence_mut(seq_id).ok_or(EngineError::NoSequence)?;
+                let mut ctx = EditCtx { next_id: &mut next, media_duration: &durations, media_start: &starts, min_duration: min };
+                f(seq, &mut ctx, st)?
+            };
+            p.next_id = next;
+            if let Some(s) = p.sequence(seq_id) {
+                s.check().map_err(EngineError::Other)?;
+            }
+            Ok(r)
+        };
+        match merge {
+            Some(key) => self.edit_merged(label, key, body),
+            None => self.edit(label, body),
+        }
+    }
+
+    pub fn undo(&mut self) -> Option<String> {
+        if self.is_display_only() {
+            return None;
+        }
+        let (label, prev) = self.history.undo.pop()?;
+        self.history.merge_key = None;
+        let cur = std::mem::replace(&mut self.project, prev);
+        self.state.selected_mask = masks::remap_selection(&cur, &self.project, &self.state);
+        self.history.redo.push((label.clone(), cur));
+        self.fix_state();
+        self.bump();
+        Some(label)
+    }
+
+    pub fn redo(&mut self) -> Option<String> {
+        if self.is_display_only() {
+            return None;
+        }
+        let (label, next) = self.history.redo.pop()?;
+        self.history.merge_key = None;
+        let cur = std::mem::replace(&mut self.project, next);
+        self.state.selected_mask = masks::remap_selection(&cur, &self.project, &self.state);
+        self.history.undo.push((label.clone(), cur.clone()));
+        self.fix_state();
+        if self.state.active_sequence.is_none() {
+            match project_workspace::restored_initial_sequence(&cur, &self.project) {
+                Ok(Some(id)) => match commands::open_sequence_state(&self.project, &mut self.state, id) {
+                    Ok(()) => self.events.push(Event::OpenSequence(id)),
+                    Err(error) => self.error_toast("edit.redo", error.to_string()),
+                },
+                Ok(None) => {}
+                Err(error) => self.error_toast("edit.redo", error.to_string()),
+            }
+        }
+        self.bump();
+        Some(label)
+    }
+
+    /// Drop dangling references after undo/redo/delete.
+    pub fn fix_state(&mut self) {
+        editor_state::repair(&self.project, &mut self.state);
+    }
+
+    /// Forget a selected gap that no longer exists in the active sequence.
+    fn drop_stale_gap(&mut self) {
+        editor_state::drop_stale_gap(&self.project, &mut self.state);
+    }
+
+    fn bump(&mut self) {
+        self.revision += 1;
+        self.events.push(Event::ProjectChanged { revision: self.revision });
+    }
+
+    pub fn toast(&mut self, msg: impl Into<String>) {
+        let message = msg.into();
+        self.log.push(panels::Level::Info, "app", message.clone());
+        self.events.push(Event::Toast { message, error: false });
+    }
+
+    /// An error message for the user (a toast, and an Events panel entry from `source`).
+    pub fn error_toast(&mut self, source: &str, msg: impl Into<String>) {
+        let message = msg.into();
+        self.log.push(panels::Level::Error, source, message.clone());
+        self.events.push(Event::Toast { message, error: true });
+    }
+
+    pub fn drain_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
+    }
+
+    // ---- accessors ----
+
+    pub fn active_sequence(&self) -> Option<&Sequence> {
+        self.state.active_sequence.and_then(|s| self.project.sequence(s))
+    }
+
+    pub fn playhead(&self) -> Tick {
+        self.state.active_sequence.and_then(|s| self.state.playheads.get(&s).copied()).unwrap_or_default()
+    }
+
+    pub fn set_playhead(&mut self, t: Tick) {
+        if let Some(s) = self.state.active_sequence {
+            let rate = self.active_sequence().map(|s| s.settings.frame_rate).unwrap_or_default();
+            self.state.playheads.insert(s, rate.snap(t.max(Tick::ZERO)));
+            if self.state.selection_follows_playhead {
+                sequence_tools::select_under_playhead(self);
+            }
+        }
+    }
+
+    pub fn sequence_rate(&self) -> FrameRate {
+        self.active_sequence().map(|s| s.settings.frame_rate).unwrap_or_default()
+    }
+
+    pub fn targeting(&self) -> Targeting {
+        let Some(sid) = self.state.active_sequence else { return Targeting::default() };
+        if let Some(t) = self.state.targeting.get(&sid) {
+            return t.clone();
+        }
+        // Default: V1/A1 patched and all tracks targeted.
+        let seq = self.active_sequence();
+        Targeting {
+            targeted: seq.map(|s| s.all_tracks().map(|t| t.id).collect()).unwrap_or_default(),
+            video_dest: seq.and_then(|s| s.video_tracks.first().map(|t| t.id)),
+            audio_dest: seq.and_then(|s| s.audio_tracks.first().map(|t| t.id)),
+        }
+    }
+
+    /// The media source for an item (creating it on first use).
+    pub fn source(&self, item: ItemId) -> Option<filmcraft_media::SharedSource> {
+        self.media.source_for(&self.project, item, &*self.services)
+    }
+
+    /// Render the active sequence at the playhead in its working colour space (HDR values kept;
+    /// for scopes and analysis).
+    pub fn render_program_working(&self, scale: f32) -> Option<filmcraft_render::Image> {
+        let seq = self.renderable_sequence(scale).ok()?;
+        let provider = self.media.provider(self.project.clone(), self.services.clone());
+        let opts = filmcraft_render::RenderOptions { scale, working_output: true, ..Default::default() };
+        Some(filmcraft_render::render_sequence(&self.project, seq, self.playhead(), opts, &provider))
+    }
+
+    /// Render the active sequence at the playhead (CPU reference path).
+    pub fn render_program(&self, scale: f32) -> Option<filmcraft_render::Image> {
+        self.render_program_at(scale, self.playhead())
+    }
+
+    /// Render the active sequence at `t` (snapped to its frame, as the playhead would be) without
+    /// moving the playhead (CPU reference path). `None` when there is no sequence or the frame
+    /// cannot be rendered at `scale`; [`Session::try_render_program_at`] says why.
+    pub fn render_program_at(&self, scale: f32, t: Tick) -> Option<filmcraft_render::Image> {
+        self.try_render_program_at(scale, t).ok()
+    }
+
+    /// [`Session::render_program_at`], with the reason when nothing can be rendered.
+    pub fn try_render_program_at(&self, scale: f32, t: Tick) -> Result<filmcraft_render::Image> {
+        self.render_program_with(scale, t, &self.media.provider(self.project.clone(), self.services.clone()))
+    }
+
+    /// [`Session::try_render_program_at`], also naming the offline items the frame drew the slate
+    /// for (#1054).
+    pub fn try_render_program_with_offline_at(&self, scale: f32, t: Tick) -> Result<(filmcraft_render::Image, Vec<media_pool::OfflineMedia>)> {
+        let provider = self.media.provider(self.project.clone(), self.services.clone()).recording();
+        let img = self.render_program_with(scale, t, &provider)?;
+        Ok((img, provider.offline_used()))
+    }
+
+    fn render_program_with(&self, scale: f32, t: Tick, provider: &dyn filmcraft_render::SourceProvider) -> Result<filmcraft_render::Image> {
+        let seq = self.renderable_sequence(scale)?;
+        let t = self.sequence_rate().snap(t.max(Tick::ZERO));
+        let opts = filmcraft_render::RenderOptions { scale, captions: true, ..Default::default() };
+        Ok(filmcraft_render::render_sequence(&self.project, seq, t, opts, provider))
+    }
+
+    /// The active sequence, if a frame of it at `scale` is within the image size limits.
+    fn renderable_sequence(&self, scale: f32) -> Result<ItemId> {
+        let id = self.state.active_sequence.ok_or(EngineError::NoSequence)?;
+        let seq = self.project.sequence(id).ok_or(EngineError::NoSequence)?;
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(EngineError::Other(format!("render scale {scale} must be finite and positive")));
+        }
+        let (w, h) = filmcraft_render::output_size(seq, scale);
+        let size = u32::try_from(w).ok().zip(u32::try_from(h).ok());
+        let Some((w, h)) = size else { return Err(EngineError::Other("the requested render frame exceeds the image size limits".into())) };
+        filmcraft_project::validate_frame_size(w, h).map_err(|e| EngineError::Other(format!("cannot render a {w}x{h} frame: {e}")))?;
+        Ok(id)
+    }
+}
+
+/// The earliest media time clips of an item may show: a subclip that restricts trims starts at its
+/// In point, everything else at 0.
+pub fn media_start(p: &Project, id: ItemId) -> Tick {
+    match p.item(id).map(|i| &i.kind) {
+        Some(filmcraft_project::ItemKind::Subclip { range, restrict_trims: true, .. }) => range.start,
+        _ => Tick::ZERO,
+    }
+}
+
+/// Media duration of an item (None for stills/adjustment layers = unlimited handles).
+pub fn media_duration(p: &Project, _pool: &MediaPool, id: ItemId) -> Option<Tick> {
+    // a subclip's limit is its parent's: follow the chain, bounded (a damaged project file can make
+    // it cyclic or arbitrarily deep)
+    let mut id = id;
+    for _ in 0..=MAX_SUBCLIP_CHAIN {
+        let it = p.item(id)?;
+        return match &it.kind {
+            filmcraft_project::ItemKind::Media(m) => match m.info.kind {
+                filmcraft_media::MediaKind::Still | filmcraft_media::MediaKind::Synthetic => None,
+                _ => Some(m.info.duration),
+            },
+            filmcraft_project::ItemKind::Sequence(s) => Some(s.duration()),
+            // a subclip that restricts trims ends at its Out point; otherwise its parent's media is the limit
+            filmcraft_project::ItemKind::Subclip { range, restrict_trims: true, .. } => Some(range.end()),
+            filmcraft_project::ItemKind::Subclip { parent, .. } => {
+                id = *parent;
+                continue;
+            }
+            filmcraft_project::ItemKind::AdjustmentLayer { .. } | filmcraft_project::ItemKind::Graphic { .. } => None,
+        };
+    }
+    None
+}
+
+/// Subclips of subclips followed before giving up (real projects nest one or two deep).
+const MAX_SUBCLIP_CHAIN: usize = 16;
+
+#[cfg(test)]
+mod aaf_omf_tests;
+#[cfg(test)]
+mod animated_image_tests;
+#[cfg(test)]
+mod audio_effects_tests;
+#[cfg(test)]
+mod audio_placement_tests;
+#[cfg(test)]
+mod autosave_tests;
+#[cfg(test)]
+mod avi_import_tests;
+#[cfg(test)]
+mod clip_ops_tests;
+#[cfg(test)]
+mod color_tests;
+#[cfg(test)]
+mod command_input_tests;
+#[cfg(test)]
+mod essential_sound_tests;
+#[cfg(test)]
+mod explicit_targets_tests;
+#[cfg(test)]
+mod export_tests;
+#[cfg(test)]
+mod file_tests;
+#[cfg(test)]
+mod gap_selection_tests;
+#[cfg(test)]
+mod image_sequence_tests;
+#[cfg(test)]
+mod individual_selection_tests;
+#[cfg(test)]
+mod interchange_auto_points_tests;
+#[cfg(test)]
+mod keyboard_tests;
+#[cfg(test)]
+mod linked_speed_tests;
+#[cfg(test)]
+mod locked_clip_edits_tests;
+#[cfg(test)]
+mod masks_tests;
+#[cfg(test)]
+mod media_browser_tests;
+#[cfg(test)]
+mod media_test_util;
+#[cfg(test)]
+mod media_watch_tests;
+#[cfg(test)]
+mod mixer_input_tests;
+#[cfg(test)]
+mod mixer_tests;
+#[cfg(test)]
+mod multicam_tests;
+#[cfg(test)]
+mod narration_tests;
+#[cfg(test)]
+mod nest_editing_tests;
+#[cfg(test)]
+mod nest_fidelity_tests;
+#[cfg(test)]
+mod nesting_tests;
+#[cfg(test)]
+mod panels_tests;
+#[cfg(test)]
+mod par_tests;
+#[cfg(test)]
+mod paste_media_tests;
+#[cfg(test)]
+mod place_items_tests;
+#[cfg(test)]
+mod presets_tests;
+#[cfg(test)]
+mod previews_tests;
+#[cfg(test)]
+mod project_manager_tests;
+#[cfg(test)]
+mod project_panel_tests;
+#[cfg(test)]
+mod proxies_tests;
+#[cfg(test)]
+mod relink_tests;
+#[cfg(test)]
+mod remix_tests;
+#[cfg(test)]
+mod ripple_delete_tests;
+#[cfg(test)]
+mod ripple_head_tests;
+#[cfg(test)]
+mod roll_linked_tests;
+#[cfg(test)]
+mod scopes_tests;
+#[cfg(test)]
+mod sequence_inspect_tests;
+#[cfg(test)]
+mod sequence_tabs_tests;
+#[cfg(test)]
+mod sequence_tools_tests;
+#[cfg(test)]
+mod settings_tests;
+#[cfg(test)]
+mod shortcuts_tests;
+#[cfg(test)]
+mod split_edit_ripple_trim_tests;
+#[cfg(test)]
+mod stored_paths_tests;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod timeline_move_tests;
+#[cfg(test)]
+mod track_params_tests;
+#[cfg(test)]
+mod transcript_tests;
+#[cfg(test)]
+mod trim_tests;
+#[cfg(test)]
+mod vfx_tests;
+#[cfg(test)]
+mod voiceover_tests;
+
+#[cfg(test)]
+mod source_placement_tests;
+
+#[cfg(test)]
+mod frame_export_tests;
+#[cfg(test)]
+mod wasm_clock_tests;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use agent_bridge::{ApplicationSnapshotCapture, ApplicationTabArchiveInput};

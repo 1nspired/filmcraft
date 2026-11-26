@@ -1,0 +1,9 @@
+asset: ja.tsv
+title: ja native interface translations
+author: FilmCraft contributors; Poema fork contributors
+source: Original FilmCraft translations, with Poema product and upstream-link labels
+license: MIT OR Apache-2.0
+license-file: ../../../../LICENSE-MIT and ../../../../LICENSE-APACHE
+added: 2026-10-31 by Poema fork contributors
+notes: Existing clean-room translation catalog with product identity updates.
+notes-poema: Product and upstream-link labels updated for the Poema native fork on 2026-10-31; original translations and author attribution retained.
