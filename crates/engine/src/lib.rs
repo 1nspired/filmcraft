@@ -11,6 +11,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 pub mod aaf_omf;
+pub mod agent_bridge;
 pub mod autosave;
 pub mod captions;
 pub mod clip_ops;
@@ -378,6 +379,8 @@ pub enum Event {
 }
 
 pub struct Session {
+    pub command_journal: agent_bridge::CommandJournal,
+    pub(crate) agent_bridge: agent_bridge::BridgeState,
     pub project: Arc<Project>,
     pub history: History,
     pub revision: u64,
@@ -496,6 +499,8 @@ impl Default for Session {
 impl Session {
     pub fn new(services: Arc<dyn Services>) -> Self {
         Self {
+            command_journal: Default::default(),
+            agent_bridge: Default::default(),
             project: Arc::new(Project::new("Untitled")),
             history: History { limit: 200, ..Default::default() },
             revision: 1,
@@ -691,6 +696,7 @@ impl Session {
 
     /// Run a command by id.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
+        let before_revision = self.revision;
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         if self.exec_depth == 0 && spec.journal && self.trim_play.active() {
             self.settle_trim_playback(id);
@@ -724,6 +730,9 @@ impl Session {
         self.sync_persistence();
         // playback reads the newest snapshot (mixer moves, mutes… are heard while playing)
         self.previews.live.publish_project(self.project.clone());
+        if r.is_ok() && spec.journal && self.exec_depth == 0 && self.revision != before_revision {
+            self.command_journal.publish(id, self.revision, self.state.active_sequence.map(|id| id.0));
+        }
         if r.is_ok() && spec.journal {
             self.journal.push((id.to_string(), params));
             if self.journal.len() > 10_000 {

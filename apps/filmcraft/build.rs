@@ -6,6 +6,9 @@
 //! release builds) turns it into an error.
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=FILMCRAFT_SLICE_REV");
+    let revision = std::env::var("FILMCRAFT_SLICE_REV").unwrap_or_else(|_| "unknown".into());
+    println!("cargo:rustc-env=FILMCRAFT_SLICE_REV={revision}");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../assets/app-icon/filmcraft.ico");
     println!("cargo:rerun-if-env-changed=FILMCRAFT_REQUIRE_WINRES");

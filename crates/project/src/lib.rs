@@ -9,6 +9,9 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+mod clip_identity;
+pub use clip_identity::{ClipIdentity, HandoffSpan};
+
 pub mod caption;
 pub mod effect;
 pub mod essential;
@@ -509,6 +512,9 @@ fn is_zero_stream(stream: &usize) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TrackItem {
+    /// Optional Poema provenance. Missing on legacy projects and untracked human clips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Box<ClipIdentity>>,
     pub id: ClipId,
     pub item: ItemId,
     pub name: String,
@@ -1607,6 +1613,7 @@ impl Project {
         let id = ClipId(self.alloc_id());
         let dur = seq_rate.snap_nearest(source.duration).max(seq_rate.frame_duration());
         Some(TrackItem {
+            identity: None,
             id,
             item,
             name,

@@ -339,7 +339,7 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
             app.ui.show_menu_bar = false;
         }
         if let Some(port) = control_port {
-            let rx = control_server::start(port, cc.egui_ctx.clone());
+            let rx = control_server::start(port, cc.egui_ctx.clone(), app.session.command_journal.clone());
             app = if control_input_only { app.with_control_input_only(rx) } else { app.with_control(rx) };
         }
         Ok(Box::new(app))
