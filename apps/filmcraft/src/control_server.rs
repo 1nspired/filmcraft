@@ -25,7 +25,11 @@ pub const MAX_CONNECTIONS: usize = 16;
 pub fn start(port: u16, ctx: egui::Context, journal: filmcraft_engine::agent_bridge::CommandJournal) -> Receiver<ControlRequest> {
     match start_bound(port, ctx, journal) {
         Ok((rx, _)) => rx,
-        Err(error) => { let _ = writeln!(std::io::stderr(), "filmcraft: {error}"); let (_, rx) = channel(); rx }
+        Err(error) => {
+            let _ = writeln!(std::io::stderr(), "filmcraft: {error}");
+            let (_, rx) = channel();
+            rx
+        }
     }
 }
 
@@ -34,9 +38,12 @@ pub fn start_bound(port: u16, ctx: egui::Context, journal: filmcraft_engine::age
     let (tx, rx) = channel::<ControlRequest>();
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
     let bound = listener.local_addr().map_err(|e| e.to_string())?.port();
-    std::thread::Builder::new().name("control-listener".into()).spawn(move || {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| accept_loop_with_journal(listener, tx, ctx, journal)));
-    }).map_err(|e| e.to_string())?;
+    std::thread::Builder::new()
+        .name("control-listener".into())
+        .spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| accept_loop_with_journal(listener, tx, ctx, journal)));
+        })
+        .map_err(|e| e.to_string())?;
     Ok((rx, bound))
 }
 
@@ -81,12 +88,19 @@ impl Drop for Slot {
 fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context, journal: filmcraft_engine::agent_bridge::CommandJournal) {
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let Ok(read) = stream.try_clone() else { return };
-    serve_lines_with_journal(read, stream, |method, params| {
-        let (req, rrx) = ControlRequest::new(method, params);
-        tx.send(req).ok()?;
-        ctx.request_repaint();
-        Some(rrx.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|_| json!({"ok": false, "error": "timeout"})))
-    }, Some(journal));
+    let peer = stream.try_clone().ok();
+    serve_lines_with_journal(
+        read,
+        stream,
+        |method, params| {
+            let (req, rrx) = ControlRequest::new(method, params);
+            tx.send(req).ok()?;
+            ctx.request_repaint();
+            Some(rrx.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|_| json!({"ok": false, "error": "timeout"})))
+        },
+        Some(journal),
+        peer,
+    );
 }
 
 /// One parsed line.
@@ -151,10 +165,16 @@ fn read_bounded_line(reader: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -
 /// returns the reply object (the request's `id` is added here).
 #[cfg(test)]
 fn serve_lines<R: Read, W: Write>(read: R, out: W, handle: impl FnMut(String, Value) -> Option<Value>) {
-    serve_lines_with_journal(read, out, handle, None)
+    serve_lines_with_journal(read, out, handle, None, None)
 }
 
-fn serve_lines_with_journal<R: Read, W: Write>(read: R, mut out: W, mut handle: impl FnMut(String, Value) -> Option<Value>, journal: Option<filmcraft_engine::agent_bridge::CommandJournal>) {
+fn serve_lines_with_journal<R: Read, W: Write>(
+    read: R,
+    mut out: W,
+    mut handle: impl FnMut(String, Value) -> Option<Value>,
+    journal: Option<filmcraft_engine::agent_bridge::CommandJournal>,
+    peer: Option<TcpStream>,
+) {
     let mut reader = BufReader::new(read);
     let mut buf = Vec::new();
     loop {
@@ -165,13 +185,43 @@ fn serve_lines_with_journal<R: Read, W: Write>(read: R, mut out: W, mut handle: 
                 Line::Blank => continue,
                 Line::Reject(e) => e,
                 Line::Request { id, method, params } => {
-                    if method == "engine.journal.subscribe" && let Some(journal) = &journal {
-                        let (cursor, rx) = journal.subscribe();
-                        if writeln!(out, "{}", json!({"id":id,"ok":true,"result":{"protocol":1,"cursor":cursor}})).and_then(|()| out.flush()).is_err() { return; }
-                        for event in rx {
-                            if writeln!(out, "{event}").and_then(|()| out.flush()).is_err() { return; }
+                    if method == "engine.journal.subscribe"
+                        && let Some(journal) = &journal
+                    {
+                        let Ok((cursor, rx, cancellation)) = journal.subscribe() else { return };
+                        let Some(mut reader) = peer.as_ref().and_then(|p| p.try_clone().ok()) else { return };
+                        let monitor_cancellation = cancellation.clone();
+                        if std::thread::Builder::new()
+                            .name("journal-peer".into())
+                            .spawn(move || {
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    let _ = reader.read(&mut [0u8; 1]);
+                                }));
+                                drop(monitor_cancellation);
+                            })
+                            .is_err()
+                        {
+                            return;
                         }
-                        let _ = writeln!(out, "{}", json!({"event":"journal_closed","error":"subscriber fell behind; reconnect and read again"})).and_then(|()| out.flush());
+                        struct ClosePeer(TcpStream);
+                        impl Drop for ClosePeer {
+                            fn drop(&mut self) {
+                                let _ = self.0.shutdown(std::net::Shutdown::Both);
+                            }
+                        }
+                        let Some(socket) = peer.as_ref().and_then(|p| p.try_clone().ok()) else { return };
+                        let _close = ClosePeer(socket);
+                        let _cancellation = cancellation;
+                        if writeln!(out, "{}", json!({"id":id,"ok":true,"result":{"protocol":1,"cursor":cursor}})).and_then(|()| out.flush()).is_err() {
+                            return;
+                        }
+                        for event in rx {
+                            if writeln!(out, "{event}").and_then(|()| out.flush()).is_err() {
+                                return;
+                            }
+                        }
+                        let _ = writeln!(out, "{}", json!({"event":"journal_closed","error":"subscriber fell behind; reconnect and read again"}))
+                            .and_then(|()| out.flush());
                         return;
                     }
                     let Some(mut r) = handle(method, params) else { return };

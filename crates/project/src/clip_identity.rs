@@ -1,8 +1,8 @@
 //! Poema clip provenance. ClipIdentity's instance fields are lifted from native v185;
 //! timed handoff spans extend that carrier for the four-door slice.
-use std::collections::BTreeMap;
 use filmcraft_time::Tick;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -38,7 +38,10 @@ impl ClipIdentity {
                 return Err("invalid handoff source interval".into());
             }
             let tokens: Vec<_> = span.carrier.split_whitespace().collect();
-            if tokens.is_empty() || tokens.len() > 2 || tokens.iter().any(|s| !s.starts_with("poema:") || s.len() <= 6 || !s[6..].bytes().all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))) {
+            if tokens.is_empty()
+                || tokens.len() > 2
+                || tokens.iter().any(|s| !s.starts_with("poema:") || s.len() <= 6 || !s[6..].bytes().all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b)))
+            {
                 return Err("invalid Poema handoff token".into());
             }
         }
