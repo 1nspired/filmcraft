@@ -38,6 +38,7 @@ mod native_document;
 pub mod panels;
 pub mod paste_media;
 pub mod perf;
+mod poema_metadata;
 pub mod presets;
 pub mod previews;
 pub mod project_manager;
