@@ -3448,6 +3448,7 @@ fn build() -> Vec<CommandSpec> {
     crate::clip_ops::apply_layout(&mut v);
     // Search Bin, Find, Project Settings, Scene Edit Detection, Normalize Mix Track… (M3.11)
     crate::project_tools::apply_layout(&mut v);
+    v.extend(crate::agent_bridge::commands());
     v.shrink_to_fit();
     v
 }
