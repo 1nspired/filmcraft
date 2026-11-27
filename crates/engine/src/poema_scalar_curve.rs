@@ -98,7 +98,9 @@ pub(crate) fn mark_human_curve(item: &mut filmcraft_project::TrackItem, human: b
     let Some(identity) = item.identity.as_mut() else {
         return Ok(());
     };
-    identity.protection = Some("human".into());
+    if present {
+        identity.protection = Some("human".into());
+    } // Legacy curve clear does not pin.
     identity.annotations.insert(CURVE_BY.into(), "human".into());
     identity.annotations.insert(CURVE_PRESENT.into(), present.to_string());
     identity.annotations.insert(CURVE_BASIS.into(), basis);
@@ -339,7 +341,7 @@ mod tests {
         s.execute("effects.toggleAnimation", json!({"clip":c,"effect":e,"param":"level"})).unwrap();
         let id = s.active_sequence().unwrap().find_item(ClipId(c)).unwrap().1.identity.as_ref().unwrap();
         assert_eq!(id.annotations[CURVE_PRESENT], "false");
-        assert_eq!(id.protection.as_deref(), Some("human"));
+        assert_eq!(id.protection.as_deref(), Some("agent"));
         s.execute("edit.undo", json!({})).unwrap();
         assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
     }

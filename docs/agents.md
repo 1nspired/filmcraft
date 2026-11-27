@@ -556,3 +556,7 @@ readBack refuses rather than inferring unchanged agent provenance. Multi-key
 moves and other yet-unproved tools require reconciliation until their provenance
 path is proved; native Undo restores the original project/metadata atomically.
 No schema/default/renderer change. Host curve writes and rich import stay gated.
+
+A nonempty human curve edit pins the clip; clearing its last curve keys preserves
+the existing protection, matching Poema set_curve's early clear return. By/presence
+and the digest still record the human clear in the same native Undo step.
