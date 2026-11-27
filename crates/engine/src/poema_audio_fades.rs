@@ -90,8 +90,13 @@ pub(crate) fn set(s: &mut Session, params: &Value) -> Result<Value> {
     }
     s.edit_sequence("Set clip audio fades", |q, _, _| {
         let item = q.find_item_mut(id).ok_or_else(|| bad(CMD, "unknown clip"))?.1;
-        item.effects.retain(|e| e.effect != EFFECT);
-        if !clear {
+        if let Some(index) = item.effects.iter().position(|e| e.effect == EFFECT) {
+            if clear {
+                item.effects.remove(index);
+            } else {
+                item.effects[index] = effect;
+            }
+        } else if !clear {
             item.effects.push(effect);
         }
         q.check().map_err(crate::EngineError::Other)?;
@@ -174,5 +179,32 @@ mod tests {
         assert!(s.execute(CMD, json!({"clip":id,"fadeIn":1})).is_err());
         assert!(Arc::ptr_eq(&before, &s.project));
         assert_eq!(s.revision, rev);
+    }
+
+    #[test]
+    fn fade_round_trip_in_a_batch_keeps_effect_order_and_is_a_real_noop() {
+        let mut s = demo();
+        let id = s.active_sequence().unwrap().audio_tracks[0].items[0].id.0;
+        s.execute(CMD, json!({"clip":id,"fadeIn":0.25})).unwrap();
+        s.execute("poema.setChannelSum", json!({"clip":id,"enabled":true})).unwrap();
+        let before = serde_json::to_value(&s.project).unwrap();
+        let rev = s.revision;
+        let depth = s.history.undo.len();
+        let basis = s.execute("agent.snapshot", json!({})).unwrap();
+        let applied = s
+            .execute(
+                "agent.preview",
+                json!({"token":basis["token"],"operations":[
+                    {"command":CMD,"params":{"clip":id,"fadeIn":0.5}},
+                    {"command":CMD,"params":{"clip":id,"fadeIn":0.25}}
+                ]}),
+            )
+            .unwrap();
+        assert_eq!(applied["changed"], false);
+        let committed = s.execute("agent.commitPreview", json!({"token":basis["token"],"preview":applied["preview"]})).unwrap();
+        assert_eq!(committed["changed"], false);
+        assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
+        assert_eq!(s.revision, rev);
+        assert_eq!(s.history.undo.len(), depth);
     }
 }

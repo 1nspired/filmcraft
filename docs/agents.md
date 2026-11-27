@@ -469,3 +469,6 @@ other track material. Fade-out starts retain the existing Poema millisecond
 rounding of the actual binary64 value; duration/sample conversion is explicit.
 Continuation-offset envelopes and source-drift semantics are not admitted by
 the host; host routing/import remain separately gated until their proofs.
+
+Changing an existing envelope preserves its native effect-list position. A
+change-and-revert preview is a real no-op even beside another audio effect.
