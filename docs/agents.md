@@ -572,3 +572,28 @@ No schema/default/renderer change. Host curve writes and rich import stay gated.
 A nonempty human curve edit pins the clip; clearing its last curve keys preserves
 the existing protection, matching Poema set_curve's early clear return. By/presence
 and the digest still record the human clear in the same native Undo step.
+
+
+### Explicit scoped native sequence preview
+
+`agent.previewSequence {token, sequence, label?, operations}` is an explicit
+project-owned sequence transaction. `token` remains the current ACTIVE-sequence
+read ticket; a ticket read for another sequence still cannot authorize a write.
+`sequence` must be an exact unsigned id of an existing native sequence. The same
+1..256 audited in-memory command/parameter rules, clone/check, eight-preview bound,
+60-second expiry, editor-state and project/revision/owner fences apply.
+
+Only the private clone switches sequence. Its selection is cleared before the
+commands run, and its entire interactive EditorState is restored before staging
+returns. A whole-project postcondition also refuses changes outside the scoped
+sequence item and monotonic native id allocation: shared-media/catalog changes
+need a separate project transaction proof. The live editor's tab, playheads, selections, clipboard and preferences
+never change during preview or commit. `document` is the full project with the
+original active sequence; read the requested sequence directly from that project.
+No client project replacement or implicit live sequence activation is accepted.
+
+Use the existing `agent.commitPreview {token,preview}` and discard/owned history
+doors. A changed commit is one project Undo entry and one ordered journal event;
+watch subscribers receive it without polling or sequence filtering. No-op,
+refused, discarded and expired previews publish no edit. The existing active
+`agent.preview`/`agent.apply` behavior and read-ticket guards remain unchanged.
