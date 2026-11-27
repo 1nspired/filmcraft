@@ -535,3 +535,24 @@ Volume playback evaluates on its64-sample grid; native interchange continues
 to report its existing handle-loss limitation. No promise that Native export
 or host curve routing is complete. The Poema/external-adapter code stays
 unchanged and unsupported curve state remains planned.
+
+
+### Tagged Poema clip-curve provenance
+
+For a Poema-tagged Volume.level curve, direct human effects.setParam,
+effects.toggleAnimation and single-key add/delete/move/set/interpolation edits
+stamp human by/pin and physical presence in the SAME native Undo step. Staged
+agent operations and ordinary FilmCraft clips retain existing behavior.
+`poema.gainCurve.by.v1`, `.present.v1` and `.basis.v1` are nonnumeric editorial
+intent and a digest; all actual scalar values/times/handles remain keyframes.
+
+Basis encoding is SHA-256: ASCII domain `poema-clip-gain-curve-v1` plus NUL;
+static Float64LE; countUInt32LE; for each key: timeInt64LE, valueFloat64LE,
+interpolation byte (Linear0,Hold1,Bezier2,AutoBezier3,ContinuousBezier4,EaseIn5,
+EaseOut6,Cubic7), out/in influenceFloat64LE, then in/out vector flagByte and
+optional dt/dvFloat64LE. Bound4096. A fixed independent vector and host byte
+encoder prove agreement. Unknown tool edits invalidate the basis and host
+readBack refuses rather than inferring unchanged agent provenance. Multi-key
+moves and other yet-unproved tools require reconciliation until their provenance
+path is proved; native Undo restores the original project/metadata atomically.
+No schema/default/renderer change. Host curve writes and rich import stay gated.

@@ -3032,6 +3032,7 @@ fn build() -> Vec<CommandSpec> {
                 // the end, so a ramp across a cut keeps its slope (#1055); the playhead is pinned to the clip
                 let at = time_p(s, p, "");
                 let ph = s.playhead();
+                let human = !s.agent_bridge.staging;
                 let pq = p.clone();
                 // `merge`: a drag of one parameter is one undo step (#201), and a key makes one of a
                 // drag that changes several (the Program monitor's handles); `begin` starts a new one
@@ -3044,6 +3045,7 @@ fn build() -> Vec<CommandSpec> {
                 }
                 let keyframes = s.edit_sequence_as("Change Effect Parameter", merge.as_deref(), |q, _, _| {
                     let (_, it) = q.find_item_mut(c).ok_or(filmcraft_edit::EditError::NoItem(c))?;
+                    let human_curve = human && crate::poema_scalar_curve::human_curve_target(it, &eff, &pid, p);
                     let mt = it.source_time_at(at.unwrap_or_else(|| ph.clamp(it.start, (it.end() - Tick(1)).max(it.start))));
                     let e = match &eff {
                         Value::Number(n) => it.effects.get_mut(n.as_u64().unwrap_or(0) as usize),
@@ -3103,6 +3105,7 @@ fn build() -> Vec<CommandSpec> {
                             }
                         }
                     }
+                    crate::poema_scalar_curve::mark_human_curve(it, human_curve)?;
                     Ok(keyframes)
                 })?;
                 // 0 keyframes: the value is static (`time` was not used)
@@ -3114,8 +3117,10 @@ fn build() -> Vec<CommandSpec> {
             let pid = str_p(p, "param").ok_or_else(|| bad("effects.toggleAnimation", "need `param`"))?.to_string();
             let eff = p.get("effect").cloned().unwrap_or(json!("motion"));
             let ph = s.playhead();
+            let human = !s.agent_bridge.staging;
             s.edit_sequence("Toggle Animation", |q, _, _| {
                 let (_, it) = q.find_item_mut(c).ok_or(filmcraft_edit::EditError::NoItem(c))?;
+                let human_curve = human && crate::poema_scalar_curve::human_curve_target(it, &eff, &pid, p);
                 let mt = it.source_time_at(ph.clamp(it.start, (it.end() - Tick(1)).max(it.start)));
                 let e = match &eff {
                     Value::Number(n) => it.effects.get_mut(n.as_u64().unwrap_or(0) as usize),
@@ -3132,6 +3137,7 @@ fn build() -> Vec<CommandSpec> {
                     e.params.insert(pid.clone(), filmcraft_project::Param::new(d.default.clone()));
                 }
                 crate::masks::target_param(e, p, &pid).ok_or_else(|| bad("effects.toggleAnimation", "no such param"))?.toggle_animation(mt);
+                crate::poema_scalar_curve::mark_human_curve(it, human_curve)?;
                 Ok(())
             })?;
             Ok(Value::Null)
@@ -3484,6 +3490,7 @@ fn keyframe_op(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
     let pid = str_p(p, "param").ok_or_else(|| bad("keyframe", "need `param`"))?.to_string();
     let eff = p.get("effect").cloned().unwrap_or(json!("motion"));
     let ph = time_p(s, p, "").unwrap_or(s.playhead());
+    let human = !s.agent_bridge.staging;
     let mtime = p.get("mediaTime").and_then(Value::as_i64).map(Tick);
     let to = p.get("to").and_then(Value::as_i64).map(Tick);
     let interp = str_p(p, "interpolation").map(str::to_string);
@@ -3501,6 +3508,7 @@ fn keyframe_op(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
     }
     s.edit_sequence_as(label, merge.as_deref(), |q, _, _| {
         let (_, it) = q.find_item_mut(c).ok_or(filmcraft_edit::EditError::NoItem(c))?;
+        let human_curve = human && crate::poema_scalar_curve::human_curve_target(it, &eff, &pid, p);
         let mt_now = it.source_time_at(ph.clamp(it.start, (it.end() - Tick(1)).max(it.start)));
         let e = match &eff {
             Value::Number(n) => it.effects.get_mut(n.as_u64().unwrap_or(0) as usize),
@@ -3566,6 +3574,7 @@ fn keyframe_op(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
                 k.interp = kind;
             }
         }
+        crate::poema_scalar_curve::mark_human_curve(it, human_curve)?;
         Ok(())
     })?;
     Ok(Value::Null)
