@@ -449,5 +449,5 @@ contradictory monitor map refuses atomically; the command does not silently repa
 Channel Mixer: left/right output each receive 50% left plus 50% right, with no
 inversion. It is admitted to guarded native batches/previews and normal Undo.
 A no-op does not add history. Unrelated/animated/duplicate mixer state, mapped
-channels/streams, non-audio/locked targets and unsupported source layouts refuse
+channels/streams, non-audio/locked targets and non-stereo source layouts refuse
 without replacing effects. No DSP implementation or project schema is copied.

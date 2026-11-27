@@ -41,8 +41,8 @@ pub(crate) fn set(s: &mut Session, params: &Value) -> Result<Value> {
     }
     let channels =
         s.project.resolve_media(item.item).and_then(|(_, m, _)| m.info.audio()).map(|a| a.channels).ok_or_else(|| bad(CMD, "source has no audio"))?;
-    if !(1..=2).contains(&channels) {
-        return Err(bad(CMD, "channel sum currently requires a mono/stereo source"));
+    if channels != 2 {
+        return Err(bad(CMD, "channel sum currently requires a stereo source"));
     }
     let mixers: Vec<_> = item.effects.iter().filter(|e| e.effect == EFFECT).collect();
     if mixers.len() > 1 || mixers.first().is_some_and(|e| **e != expected) {
