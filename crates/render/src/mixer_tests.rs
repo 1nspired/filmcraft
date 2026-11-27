@@ -749,3 +749,14 @@ fn a_nest_trimmed_in_starts_later_in_its_sequence() {
     let mix = mix_graph(&p, p.sequence(outer).unwrap(), start, 4800, &map, None);
     assert!(worst(&mix, start, 8, |t| tone.at(t + 3.0)) < 0.01);
 }
+
+#[test]
+fn imported_source_tail_pads_conformed_audio_with_silence() {
+    let mut rig = Rig::new(&[dc]);
+    let tail = Tick::from_units(SR * 10 - 480, SR);
+    rig.track(0).items[0].set_source_out(tail);
+    let result = rig.mix(SR * 10 - 484, 8);
+    assert!(result.iter().all(|ch| ch[..4].iter().all(|v| close(*v, 0.5, 1e-6))));
+    assert!(result.iter().all(|ch| ch[4..].iter().all(|v| *v == 0.0)), "no samples beyond declared source out");
+    assert_eq!(rig.track(0).items[0].speed, 1.0);
+}

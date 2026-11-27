@@ -771,3 +771,18 @@ native menus) in `apps/filmcraft`. [roadmap.md](roadmap.md) has the milestone st
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-10 | trivial | Status line and revision history added (craftrules progress-docs standard); milestone link points at docs/roadmap.md |
+
+### Imported source tails under record-edge conform
+
+A `TrackItem` normally derives source-out from duration and nominal speed. A
+frame-conformed import may preserve a source interval whose duration differs
+from the independently rounded record span by less than one record frame.
+`source_end_offset` holds that native boundary residual (zero/default and omitted
+from ordinary project files). `source_out()` is authoritative and native Undo
+and save/reopen retain it. Forward splits clear the left residual and carry it
+on the right tail; head trims hold the existing out point. Picture sampling
+holds inside the source tail and audio pads the excess record tail with silence;
+nominal speed is unchanged. `poema.setImportedSourceRange` accepts exact tick
+strings after record conform and refuses a discrepancy beyond one frame's edge
+rounding. No source geometry is supplied by editorial annotations. Import remains
+candidate-only until guarded ownership/checkpoint proofs pass.

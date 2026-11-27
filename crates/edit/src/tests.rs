@@ -38,6 +38,7 @@ impl Fx {
         self.next += 1;
         TrackItem {
             identity: None,
+            source_end_offset: Default::default(),
             id: ClipId(self.next),
             item: ItemId(1),
             name: format!("c{}", self.next),
@@ -905,4 +906,25 @@ fn moving_an_edge_keeps_the_media_under_the_timeline() {
             assert_eq!((trimmed.start, trimmed.duration, trimmed.source_in), (moved.start, moved.duration, moved.source_in), "{label}");
         }
     }
+}
+
+#[test]
+fn imported_source_tail_survives_native_split_and_head_trim() {
+    let mut fx = Fx::new();
+    let track = fx.v(0);
+    let id = fx.put(track, 0, 48, 0);
+    let out = f(48) - Tick(2540160000);
+    fx.seq.find_item_mut(id).unwrap().1.set_source_out(out);
+    let mut next = fx.next;
+    split_track_at(fx.seq.track_mut(track).unwrap(), f(24), &mut Fx::ctx(&mut next), &mut HashMap::new()).unwrap();
+    let items = &fx.seq.track(track).unwrap().items;
+    assert_eq!(items[0].source_out(), items[1].source_in);
+    assert_eq!(items[1].source_out(), out);
+    assert_eq!(items[0].source_end_offset, Tick::ZERO);
+    let mut shortened = items[1].clone();
+    shortened.duration -= f(1);
+    shortened.source_in += f(1);
+    assert_eq!(shortened.source_out(), out, "head trim holds the source tail");
+    assert_eq!(shortened.moving_source_time_at(shortened.end() - Tick(1)), out - Tick(1), "conformed picture cannot read beyond the exact tail");
+    fx.seq.check().unwrap();
 }
