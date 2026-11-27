@@ -451,3 +451,21 @@ inversion. It is admitted to guarded native batches/previews and normal Undo.
 A no-op does not add history. Unrelated/animated/duplicate mixer state, mapped
 channels/streams, non-audio/locked targets and non-stereo source layouts refuse
 without replacing effects. No DSP implementation or project schema is copied.
+
+### Optional clip-local audio fades (B4b3 prerequisite)
+
+`poema.setAudioFades {clip, fadeIn?, fadeOut?, fadeInCurve?, fadeOutCurve?}`
+patches an unlocked explicit audio clip through the native edit/preview/Undo
+surface. At least one property is required; durations are 0..5 seconds at saved
+six-decimal precision, curves are `equal_power` or `linear`. The optional native
+`clip_audio_fades` intrinsic owns these physical values. It is never installed
+on ordinary clips by default. Static/unique/unmasked envelope state only;
+unrelated or animated envelope state refuses. Unspecified properties survive,
+including a linear curve at zero duration. Exact no-ops add no history.
+
+Playback and export evaluate the same sample-local envelope. In/out gains
+multiply even when they overlap or exceed the clip length, without replacing
+other track material. Fade-out starts retain the existing Poema millisecond
+rounding of the actual binary64 value; duration/sample conversion is explicit.
+Continuation-offset envelopes and source-drift semantics are not admitted by
+the host; host routing/import remain separately gated until their proofs.

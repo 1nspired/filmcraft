@@ -176,6 +176,7 @@ fn allowed(id: &str) -> bool {
             | "poema.configureClip"
             | "poema.patchClip"
             | "poema.setChannelSum"
+            | "poema.setAudioFades"
             | "timeline.setTrack"
             | "clip.link"
             | "clip.fitToFrame"
@@ -365,6 +366,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec("poema.setMonitor", "Set native Poema audition", crate::poema_monitor::set, true),
         spec("agent.previewMonitor", "Preview guarded native audition", crate::poema_monitor::preview, false),
         spec("agent.monitor", "Set guarded native Poema audition", monitor, true),
+        spec("poema.setAudioFades", "Set exact clip audio fades", crate::poema_audio_fades::set, true),
         spec("poema.setChannelSum", "Set exact stereo-centre Channel Mixer", crate::poema_channel_sum::set, true),
         spec("poema.patchClip", "Set explicit clip playback properties", patch_clip, true),
         spec("poema.owner", "Read managed native project owner", crate::project_owner::status, false),

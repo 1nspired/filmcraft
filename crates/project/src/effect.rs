@@ -339,6 +339,31 @@ fn build_effects() -> Vec<EffectDef> {
             float32: true,
             yuv: false,
         },
+        // Optional intrinsic: never installed on ordinary clips by default.
+        // Record-local, sample-resolved envelopes multiply rather than replace
+        // other clips on a track when the two edges overlap.
+        EffectDef {
+            id: "clip_audio_fades",
+            name: "Clip Audio Fades",
+            kind: EffectKind::Audio,
+            category: &[],
+            params: vec![
+                fs("in_seconds", "Fade In", 0.0, (0.0, 5.0), (0.0, 5.0), "s", 6),
+                fs("out_seconds", "Fade Out", 0.0, (0.0, 5.0), (0.0, 5.0), "s", 6),
+                b("in_linear", "Linear Fade In", false),
+                b("out_linear", "Linear Fade Out", false),
+            ]
+            .into_iter()
+            .map(|mut p| {
+                p.animatable = false;
+                p
+            })
+            .collect(),
+            intrinsic: true,
+            accelerated: false,
+            float32: true,
+            yuv: false,
+        },
         // ---- video effects ----
         video(
             "brightness_contrast",
