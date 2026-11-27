@@ -331,3 +331,13 @@ ROADMAP.md and [target-app-parity.md](target-app-parity.md) keep two numbers: **
   what works;
 - benchmarks state the machine, the load average and before/after on the same build;
 - don't raise a percentage without evidence a reviewer can rerun.
+
+### Process restart and pending Poema plans
+
+Guarded read tickets and prepared previews are scoped to a randomly namespaced
+native Session, not only its revision or a process-local counter. Restarted owners
+refuse old tickets even if an identical project recreates the same ids and revision.
+A reconnect must read again and build a new plan; it must never replay a pending
+edit. This namespace is a concurrency fence, not authentication. Native Undo and
+prepared previews remain session memory; this change does not persist them across
+restart, implement project-file ownership, or activate a Poema film.
