@@ -431,3 +431,10 @@ claim is never resurrected. Corrupt intent refuses before consuming history.
 Mixed/versioned M/S on a monitored sequence refuses until separately proved.
 Host human/agent routing is still planned in the next stacked piece; this
 prerequisite does not enable a real film or write a Node monitor overlay.
+
+`agent.previewMonitor {token, updates}` evaluates the same audition command on a
+private native Session clone and returns `{preview:true,basis,changed,tracks,document}`.
+It publishes no live project/history/journal change and writes no project. The
+returned document is policy input, not a live ticket or a reusable edit plan.
+A later `agent.monitor` must still present the original basis and pass the guard.
+Host policy may refuse the clone without sending an audition.

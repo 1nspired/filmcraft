@@ -362,6 +362,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
     vec![
         spec("poema.configureClip", "Configure delivered clip", configure, true),
         spec("poema.setMonitor", "Set native Poema audition", crate::poema_monitor::set, true),
+        spec("agent.previewMonitor", "Preview guarded native audition", crate::poema_monitor::preview, false),
         spec("agent.monitor", "Set guarded native Poema audition", monitor, true),
         spec("poema.patchClip", "Set explicit clip playback properties", patch_clip, true),
         spec("poema.owner", "Read managed native project owner", crate::project_owner::status, false),

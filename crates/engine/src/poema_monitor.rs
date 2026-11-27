@@ -121,6 +121,24 @@ pub(crate) fn set(s: &mut Session, params: &Value) -> Result<Value> {
     )
 }
 
+/// A private native clone supplies policy input without publishing or saving it.
+/// Its document is a preview, never a live read ticket or a reusable edit plan.
+pub(crate) fn preview(s: &mut Session, params: &Value) -> Result<Value> {
+    const PREVIEW: &str = "agent.previewMonitor";
+    crate::agent_bridge::guard(s, params, PREVIEW)?;
+    if !params.as_object().is_some_and(|m| m.keys().all(|k| matches!(k.as_str(), "token" | "updates"))) {
+        return Err(bad(PREVIEW, "need only token and explicit updates"));
+    }
+    let mut staged = Session::new(s.services.clone());
+    staged.project = s.project.clone();
+    staged.state = s.state.clone();
+    staged.media = s.media.clone();
+    staged.prefs = s.prefs.clone();
+    let result = set(&mut staged, &json!({"updates":params.get("updates")}))?;
+    let document = crate::native_document::read(&mut staged, &json!({}))?;
+    Ok(json!({"preview":true,"basis":params.get("token"),"changed":result["changed"],"tracks":result["tracks"],"document":document}))
+}
+
 /// Keep the original Arc for ordinary FilmCraft projects. If audition intent
 /// exists, validate it BEFORE popping history, then restore its flags/field
 /// presence over the old geometry. Missing tracks remain dormant for Redo.
@@ -221,6 +239,36 @@ mod tests {
         let basis = snapshot(s);
         let c = s.active_sequence().unwrap().video_tracks[0].items[0].id.0;
         s.execute("agent.apply", json!({"token":basis["token"],"operations":[{"command":"poema.patchClip","params":{"clip":c,"gainDb":-6.0}}]})).unwrap()
+    }
+    #[test]
+    fn guarded_audition_preview_is_native_and_cannot_publish_or_own_live_history() {
+        let mut s = demo(true);
+        let t = track(&s);
+        let basis = snapshot(&mut s);
+        let before = s.project.clone();
+        let depth = s.history.undo.len();
+        let rev = s.revision;
+        let (_, events, _subscription) = s.command_journal.subscribe().unwrap();
+        let preview = s.execute("agent.previewMonitor", json!({"token":basis["token"],"updates":[{"track":t,"muted":true}]})).unwrap();
+        assert_eq!(preview["preview"], true);
+        assert_eq!(preview["basis"], basis["token"]);
+        assert_eq!(preview["changed"], true);
+        assert!(preview["document"]["project"].is_object());
+        assert_eq!(preview["tracks"][0]["muted"], true);
+        assert!(Arc::ptr_eq(&before, &s.project));
+        assert_eq!(s.history.undo.len(), depth);
+        assert_eq!(s.revision, rev);
+        assert!(events.try_recv().is_err());
+        s.execute("agent.monitor", json!({"token":basis["token"],"updates":[{"track":t,"solo":true}]})).unwrap();
+        assert!(s.execute("agent.previewMonitor", json!({"token":basis["token"],"updates":[{"track":t,"muted":true}]})).is_err());
+        let basis = snapshot(&mut s);
+        let before = s.project.clone();
+        let rev = s.revision;
+        for p in [json!({"token":basis["token"],"updates":[]}), json!({"token":basis["token"],"updates":[{"track":t,"muted":true}],"save":true})] {
+            assert!(s.execute("agent.previewMonitor", p).is_err());
+            assert!(Arc::ptr_eq(&before, &s.project));
+            assert_eq!(s.revision, rev);
+        }
     }
     #[test]
     fn audition_invalidates_reads_but_not_owned_history_and_survives_both_swaps() {
