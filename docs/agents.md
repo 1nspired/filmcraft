@@ -597,3 +597,32 @@ doors. A changed commit is one project Undo entry and one ordered journal event;
 watch subscribers receive it without polling or sequence filtering. No-op,
 refused, discarded and expired previews publish no edit. The existing active
 `agent.preview`/`agent.apply` behavior and read-ticket guards remain unchanged.
+
+### Guarded append of one stereo audio track (B6b2b prerequisite)
+
+The existing `sequence.addTracks` command is admitted inside guarded batches only
+with these exact parameters:
+
+```json
+{"video":0,"audio":1,"submix":0,"audioAfter":"last","audioType":"stereo"}
+```
+
+This appends one stereo audio track using the same native command/clone-and-check
+path as a human edit. Missing/default/extra arguments, other counts/types and
+middle placement refuse before any valid batch prefix can run. The ordinary
+human command retains its existing bounded counts and placement options.
+
+A private active or sequence-scoped preview allocates only on its clone. Commit
+is one native project Undo and one pushed edit event; owned Undo/Redo restores the
+complete project. A scoped append preserves the foreground tab, selection,
+clipboard, playheads, preferences, other sequences and catalog. Discard, stale
+editor state or a refused suffix leaves the live allocator/tracks/history intact.
+
+The controller must discover the new native track id from the raw preview, attach
+its app routing alias/default fields and configure the applicable native audio
+law through commands before exposing the complete projection. The existing
+human command may renumber default track names; a compatibility controller must
+validate or restore old names inside that same private transaction. This native
+prerequisite alone does not migrate a host caller, configure a Poema track, import
+media or enable a real film. Existing lifetime/read-ticket/owner/revision and
+whole-project scope fences remain in force.
