@@ -3220,7 +3220,7 @@ fn build() -> Vec<CommandSpec> {
             "Keyframe Interpolation",
             [],
             None,
-            r#"{"clip":id,"effect":str|index,"param":str,"mediaTime":ticks,"interpolation":"linear|bezier|autoBezier|continuousBezier|hold|easeIn|easeOut"}"#,
+            r#"{"clip":id,"effect":str|index,"param":str,"mediaTime":ticks,"interpolation":"linear|bezier|cubic|autoBezier|continuousBezier|hold|easeIn|easeOut"}"#,
             has_seq,
             |s, p| keyframe_op(s, p, "interp")
         ),
@@ -3229,7 +3229,7 @@ fn build() -> Vec<CommandSpec> {
             "Edit Keyframe",
             [],
             None,
-            r#"{"clip":id,"effect":str|index,"param":str,"mediaTime":ticks,"value":any?,"inInfluence":0..1?,"outInfluence":0..1?,"merge":bool?,"begin":bool?}"#,
+            r#"{"clip":id,"effect":str|index,"param":str,"mediaTime":ticks,"value":any?,"inInfluence":0..1?,"outInfluence":0..1?,"inHandle":[seconds,valueDelta]|null?,"outHandle":[seconds,valueDelta]|null?,"merge":bool?,"begin":bool?}"#,
             has_seq,
             |s, p| keyframe_op(s, p, "set")
         ),
@@ -3545,11 +3545,13 @@ fn keyframe_op(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
                 if let Some(x) = f64_p(p, "outInfluence") {
                     k.out_influence = x.clamp(0.01, 1.0);
                 }
+                crate::poema_scalar_curve::edit_handles(prm, at, p)?;
             }
             _ => {
                 let at = mtime.unwrap_or(mt_now);
                 let kind = match interp.as_deref().unwrap_or("linear").to_ascii_lowercase().as_str() {
                     "bezier" => filmcraft_project::Interpolation::Bezier,
+                    "cubic" => filmcraft_project::Interpolation::Cubic,
                     "autobezier" => filmcraft_project::Interpolation::AutoBezier,
                     "continuousbezier" => filmcraft_project::Interpolation::ContinuousBezier,
                     "hold" => filmcraft_project::Interpolation::Hold,
@@ -3558,6 +3560,9 @@ fn keyframe_op(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
                     _ => filmcraft_project::Interpolation::Linear,
                 };
                 let k = prm.keyframes.iter_mut().find(|k| k.time == at).ok_or_else(|| bad("keyframe", "no keyframe at that time"))?;
+                if kind == filmcraft_project::Interpolation::Cubic && !matches!(k.value, ParamValue::Float(_)) {
+                    return Err(bad("keyframe", "Cubic requires a scalar Float parameter"));
+                }
                 k.interp = kind;
             }
         }

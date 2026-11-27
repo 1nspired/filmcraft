@@ -502,3 +502,36 @@ host DSP. Schema 18 prevents older readers from silently losing these laws;
 the 17-to-18 migration preserves old values/defaults. Existing schema steps,
 licenses and notices are unchanged. Host import/readBack and PCM parity are
 qualified separately against unchanged Poema rendering.
+
+
+### Native scalar cubic keyframes (B4c prerequisite)
+
+`poema.setScalarCurve {clip, effect:index, param, points}` sets physical native
+Float keyframes on an unlocked clip. `points` is empty (clear) or 2..4096
+strictly increasing bounded source-tick times, each `{time,value,inHandle?,
+outHandle?}`. Handles are exact finite `[seconds,valueDelta]` vectors. Values
+and deltas are bounded to magnitude1e6. No provenance/numeric metadata overlay.
+The regular staged/guarded command, clone/check, Undo and journal apply; exact
+no-ops do not edit. Unknown fields, wrong targets and malformed input refuse.
+
+New `Cubic` interpolation evaluates these vectors, clamps their time reach to
+the segment, and holds edge values. Missing both handles means linear; a missing
+one-sided partner uses a flat tangent. Equal endpoint values retain a vertical
+hump. Existing influence-only Bezier and every old constructor/default are
+unchanged; schema19 appends a default-preserving migration so old readers
+cannot silently lose the new fields/mode.
+
+The scalar human graph exposes Cubic and two-axis handle drags through existing
+`effects.setKeyframe` with `inHandle`/`outHandle` (or null to clear).
+On a first drag of a linear segment, materialize the other linear control in
+the SAME native edit, preventing a shape jump or extra Undo. Whole-curve
+commands preserve the supplied missing handles exactly instead. Escape discards
+the held preview. Existing non-Cubic graph behavior is unchanged.
+
+This is native representation groundwork, not admission of Poema `set_curve`.
+Poema curve projection, additive clip/track offset lanes and legacy render
+sampling/rounding compatibility still need separate proofs. Existing Native
+Volume playback evaluates on its64-sample grid; native interchange continues
+to report its existing handle-loss limitation. No promise that Native export
+or host curve routing is complete. The Poema/external-adapter code stays
+unchanged and unsupported curve state remains planned.

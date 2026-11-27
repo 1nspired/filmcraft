@@ -736,15 +736,27 @@ fn keyframe_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui, target: KeyframeRef,
         params["mask"] = json!(mask);
     }
     ui.label(egui::RichText::new(tl!("Temporal Interpolation")).color(app.tokens.text_dim));
+    let scalar = target.mask.is_none()
+        && app
+            .session
+            .active_sequence()
+            .and_then(|q| q.find_item(ClipId(target.clip)))
+            .and_then(|(_, c)| c.effects.get(target.effect))
+            .and_then(|e| e.params.get(&target.param))
+            .is_some_and(|p| matches!(p.value, ParamValue::Float(_)));
     for (label, key) in [
         (tl!("Linear"), "linear"),
         (tl!("Bezier"), "bezier"),
+        (tl!("Cubic"), "cubic"),
         (tl!("Auto Bezier"), "autoBezier"),
         (tl!("Continuous Bezier"), "continuousBezier"),
         (tl!("Hold"), "hold"),
         (tl!("Ease In"), "easeIn"),
         (tl!("Ease Out"), "easeOut"),
     ] {
+        if key == "cubic" && !scalar {
+            continue;
+        }
         let response = ui.button(label);
         app.auto.add(&format!("effectControls.keyframeMenu.{key}"), response.rect, label);
         if response.clicked() {
@@ -1113,7 +1125,18 @@ pub(crate) fn graph_rows(
     let vals: Vec<Vec<f64>> = (0..=n).map(|i| graph_components(&param.value_at(to_media(i as f64 / n as f64)))).collect();
     let curves = graph_components(&param.value).len();
     let at_keys: Vec<Vec<f64>> = param.keyframes.iter().map(|k| graph_components(&k.value)).collect();
-    let (mut lo, mut hi) = vals.iter().chain(&at_keys).flatten().filter(|v| v.is_finite()).fold((f64::MAX, f64::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+    let controls: Vec<Vec<f64>> = param
+        .keyframes
+        .iter()
+        .filter(|k| k.interp == filmcraft_project::Interpolation::Cubic)
+        .map(|k| {
+            let v = k.value.as_f64().unwrap_or(0.0);
+            [k.in_handle, k.out_handle].into_iter().flatten().map(|h| v + h[1]).collect()
+        })
+        .collect();
+    let custom = param.keyframes.iter().any(|k| k.interp == filmcraft_project::Interpolation::Cubic);
+    let (mut lo, mut hi) =
+        vals.iter().chain(&at_keys).chain(&controls).flatten().filter(|v| v.is_finite()).fold((f64::MAX, f64::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
     if lo > hi {
         (lo, hi) = (0.0, 0.0);
     }
@@ -1123,7 +1146,9 @@ pub(crate) fn graph_rows(
     }
     let pad = (hi - lo) * 0.12;
     let (mut lo, mut hi) = (lo - pad, hi + pad);
-    if let ParamKind::Float { min, max, .. } = pd.kind {
+    if let ParamKind::Float { min, max, .. } = pd.kind
+        && !custom
+    {
         lo = lo.max(min);
         hi = hi.min(max);
     }
@@ -1215,9 +1240,61 @@ pub(crate) fn graph_rows(
                 _ => format!("effectControls.{}.graph.keyframe.{}.y", pd.id, k.time.0),
             };
             app.auto.add(&auto_id, r, "keyframe value");
+            // Cubic tangents use both axes; the serialized vectors remain native
+            // seconds/value deltas, not screen offsets or influence approximations.
+            let cubic_in = i.checked_sub(1).and_then(|j| ks.get(j)).is_some_and(|a| a.interp == filmcraft_project::Interpolation::Cubic);
+            let cubic_out = k.interp == filmcraft_project::Interpolation::Cubic;
+            if (cubic_in || cubic_out) && comps.len() == 1 {
+                for (side, nb, raw, key) in
+                    [(1.0f64, ks.get(i + 1), k.out_handle, "outHandle"), (-1.0f64, i.checked_sub(1).and_then(|j| ks.get(j)), k.in_handle, "inHandle")]
+                {
+                    let Some(nb) = nb else { continue };
+                    if (side > 0.0 && !cubic_out) || (side < 0.0 && !cubic_in) {
+                        continue;
+                    }
+                    let secs = nb.time.0.saturating_sub(k.time.0) as f64 / filmcraft_time::TICKS_PER_SECOND as f64;
+                    let partner = if side > 0.0 { nb.in_handle } else { nb.out_handle };
+                    let default_dv = if raw.is_none() && partner.is_none() { (nb.value.as_f64().unwrap_or(v) - v) / 3.0 } else { 0.0 };
+                    let h = raw.unwrap_or([secs / 3.0, default_dv]);
+                    let dt = if side > 0.0 { h[0].clamp(0.0, secs.max(0.0)) } else { h[0].clamp(secs.min(0.0), 0.0) };
+                    let hid = id.with(key);
+                    let delta: egui::Vec2 = ui.data(|d| d.get_temp(hid)).unwrap_or(egui::Vec2::ZERO);
+                    let hx = c.x + (dt * filmcraft_time::TICKS_PER_SECOND as f64 / speed / dur) as f32 * lane.width() + delta.x;
+                    let hp = pos2(hx, y_of(v + h[1]) + delta.y);
+                    p.line_segment([c, hp], Stroke::new(1.0, t.plot_handle_dim));
+                    p.circle_filled(hp, 3.5, t.keyframe_handle);
+                    app.auto.add(
+                        &format!("effectControls.{}.graph.keyframe.{}.{}", pd.id, k.time.0, key),
+                        Rect::from_center_size(hp, vec2(10.0, 10.0)),
+                        "cubic tangent",
+                    );
+                    let hr = ui.interact(Rect::from_center_size(hp, vec2(10.0, 10.0)), hid.with("h"), Sense::drag());
+                    if hr.dragged_by(egui::PointerButton::Primary) {
+                        let gesture = graph_drag_offset(ui, &hr, delta);
+                        ui.data_mut(|d| d.insert_temp(hid, gesture));
+                    }
+                    if hr.drag_stopped() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        ui.data_mut(|d| d.remove::<egui::Vec2>(hid));
+                    } else if hr.drag_stopped_by(egui::PointerButton::Primary) {
+                        ui.data_mut(|d| d.remove::<egui::Vec2>(hid));
+                        let dt = (f64::from(hp.x - c.x) / f64::from(lane.width().max(1.0))) * dur * speed / filmcraft_time::TICKS_PER_SECOND as f64;
+                        let dt = if side > 0.0 { dt.clamp(0.0, secs.max(0.0)) } else { dt.clamp(secs.min(0.0), 0.0) };
+                        let dv = v_of(hp.y) - v;
+                        if delta != egui::Vec2::ZERO {
+                            actions.push((
+                                "effects.setKeyframe".into(),
+                                with_mask(json!({"clip":clip.0,"effect":idx,"param":pd.id,"mediaTime":k.time.0,key:[dt,dv]})),
+                            ));
+                        }
+                    }
+                }
+            }
             // influence handles: flat (ease) tangents with length ∝ influence × neighbouring segment;
             // a point's sit on its X curve only, as both coordinates share the influence
-            let (eases_out, eases_in) = (ci == 0 && eases_out, ci == 0 && eases_in);
+            let (eases_out, eases_in) = (
+                ci == 0 && eases_out && k.interp != filmcraft_project::Interpolation::Cubic,
+                ci == 0 && eases_in && k.interp != filmcraft_project::Interpolation::Cubic && !cubic_in,
+            );
             for (side, on, nb) in [(1.0f32, eases_out, ks.get(i + 1)), (-1.0f32, eases_in && i > 0, if i > 0 { ks.get(i - 1) } else { None })] {
                 let (true, Some(nb)) = (on, nb) else { continue };
                 let seg = (x_of(to_f(nb.time)) - c.x).abs();
@@ -1559,6 +1636,51 @@ mod graph_drag_tests {
 
     fn button(pos: Pos2, pressed: bool) -> egui::Event {
         egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }
+    }
+
+    #[test]
+    fn cubic_handle_drag_moves_both_axes_and_commits_one_undo_or_cancels() {
+        for cancel in [false, true] {
+            let mut d = Driver::new();
+            let seq = d.app.session.state.active_sequence.unwrap();
+            let item = std::sync::Arc::make_mut(&mut d.app.session.project).sequence_mut(seq).unwrap().find_item_mut(d.clip).unwrap().1;
+            for k in &mut item.effects.iter_mut().find(|e| e.effect == "motion").unwrap().params.get_mut("scale").unwrap().keyframes {
+                k.interp = Interpolation::Cubic;
+            }
+            let before = d.param();
+            let undo = d.undo_len();
+            let start = d.frame(vec![])[1];
+            d.frame(vec![egui::Event::PointerMoved(start), button(start, true)]);
+            let offset = vec2(18.0, -12.0);
+            d.frame(vec![egui::Event::PointerMoved(start + offset)]);
+            let held = d.frame(vec![])[1];
+            assert!(held.distance(start + offset) < 0.1);
+            assert_eq!(d.param(), before);
+            assert_eq!(d.undo_len(), undo);
+            if cancel {
+                d.frame(vec![
+                    egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() },
+                    button(start + offset, false),
+                ]);
+                d.frame(vec![]);
+                assert_eq!(d.param(), before);
+                assert_eq!(d.undo_len(), undo);
+            } else {
+                d.frame(vec![button(start + offset, false)]);
+                d.frame(vec![]);
+                let changed = d.param();
+                assert_eq!(d.undo_len(), undo + 1);
+                let h = changed.keyframes[0].out_handle.unwrap();
+                let span = (before.keyframes[1].time - before.keyframes[0].time).0 as f64 / filmcraft_time::TICKS_PER_SECOND as f64;
+                assert!(h[0] > span / 3.0);
+                assert!(h[1] > (80.0 - 40.0) / 3.0);
+                assert!(changed.keyframes[1].in_handle.is_some());
+                d.app.session.undo().unwrap();
+                assert_eq!(d.param(), before);
+                d.app.session.redo().unwrap();
+                assert_eq!(d.param(), changed);
+            }
+        }
     }
 
     /// #1918, #1921: a keyframe dragged to a new value stays where it was dropped. The graph
