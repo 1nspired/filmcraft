@@ -361,3 +361,16 @@ honor this protocol. This is cooperative ownership, not authentication or a fenc
 against arbitrary external programs. Deployment must also exclude old Poema servers
 from opted-in data roots. This piece does not publish a host ownership binding,
 restore an Undo stack after restart, or enable any real film.
+
+### Guarded checkpoints and file generations
+
+`poema.owner` also reports the opaque file-lease generation and whether the native
+project is dirty. Reopening a released file creates a new generation even in the
+same Session; Save As changes it and Save a Copy retains the source generation.
+`poema.checkpoint {token, lease}` validates the unchanged native read basis and
+file generation, checks/bounds the project, and atomically saves inside one command.
+Its reply identifies the exact revision/path/owner/lease and SHA-256 of the bytes
+saved. The host must independently check the file digest and semantics. Checkpoint
+is persistence, not an edit: no new Undo step or command-journal event. A stale
+basis, replaced file owner or redirected path refuses before writing. This does
+not publish a host binding, freeze human input, or recover unclean unsaved work.

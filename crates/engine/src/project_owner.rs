@@ -59,6 +59,7 @@ pub(crate) fn required(project: &Project, path: &str) -> Result<bool> {
 }
 #[derive(Debug)]
 pub(crate) struct ProjectLease {
+    id: String,
     path: PathBuf,
     #[cfg(unix)]
     lock_path: PathBuf,
@@ -89,7 +90,7 @@ impl ProjectLease {
             let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lock_path).map_err(error)?;
             file.try_lock().map_err(|e| error(format!("another owner holds this project, or locking failed: {e}")))?;
             let project_present = AtomicBool::new(path.exists());
-            let lease = Self { path, lock_path, file, project_present };
+            let lease = Self { id: crate::agent_bridge::fresh_owner(), path, lock_path, file, project_present };
             lease.validate()?;
             Ok(lease)
         }
@@ -163,7 +164,41 @@ pub(crate) fn current(s: &Session) -> Result<()> {
 pub(crate) fn status(s: &mut Session, _: &serde_json::Value) -> Result<serde_json::Value> {
     current(s)?;
     Ok(
-        serde_json::json!({"protocol":1,"owner":s.agent_bridge.owner,"path":s.path,"managed":s.project_lease.is_some(),"revision":s.revision.to_string(),"schemaVersion":filmcraft_format::SCHEMA_VERSION}),
+        serde_json::json!({"protocol":1,"owner":s.agent_bridge.owner,"path":s.path,"managed":s.project_lease.is_some(),"lease":s.project_lease.as_ref().map(|lease|&lease.id),"dirty":s.is_dirty(),"revision":s.revision.to_string(),"schemaVersion":filmcraft_format::SCHEMA_VERSION}),
+    )
+}
+
+/// One native command guards the exact basis, validates and saves it, then
+/// returns the digest of those exact bytes. No read/save race with human edits.
+pub(crate) fn checkpoint(s: &mut Session, p: &serde_json::Value) -> Result<serde_json::Value> {
+    use crate::commands::bad;
+    use sha2::Digest;
+    crate::agent_bridge::guard(s, p, "poema.checkpoint")?;
+    current(s)?;
+    if p.as_object().is_none_or(|params| params.keys().any(|key| key != "token" && key != "lease")) {
+        return Err(bad("poema.checkpoint", "checkpoint accepts only the original token and file lease"));
+    }
+    let lease = s.project_lease.as_ref().ok_or_else(|| bad("poema.checkpoint", "a managed file owner is required"))?;
+    if p["lease"].as_str() != Some(lease.id.as_str()) {
+        return Err(bad("poema.checkpoint", "file lease changed; reconcile the owning file before checkpointing"));
+    }
+    crate::native_document::bounded_json(&s.project).map_err(|e| bad("poema.checkpoint", format!("checkpoint preflight: {e}")))?;
+    for item in s.project.items.values() {
+        if let filmcraft_project::ItemKind::Sequence(q) = &item.kind {
+            q.check().map_err(|e| bad("poema.checkpoint", e))?;
+        }
+    }
+    let view = s.project_view();
+    let bytes = filmcraft_format::encode_with_view(&s.project, Some(&view), false);
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err(bad("poema.checkpoint", "checkpoint exceeds 4MiB"));
+    }
+    let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+    lease.save(&bytes)?;
+    s.saved_revision = s.revision;
+    s.loaded_schema = filmcraft_format::SCHEMA_VERSION;
+    Ok(
+        serde_json::json!({"protocol":1,"owner":s.agent_bridge.owner,"lease":lease.id,"path":lease.path()?,"revision":s.revision.to_string(),"sha256":digest,"bytes":bytes.len()}),
     )
 }
 
@@ -292,6 +327,63 @@ mod tests {
         std::os::unix::fs::symlink(&outside, sidecar(&path)).unwrap();
         assert!(ProjectLease::acquire(path.to_str().unwrap()).is_err());
         assert_eq!(fs::read(&outside).unwrap(), b"keep");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn checkpoint_guards_revision_lease_and_parameters_and_preserves_undo_and_journal() {
+        use serde_json::json;
+        let dir = directory();
+        let path = dir.join("checkpoint.fcproj");
+        let mut s = managed();
+        s.execute("file.saveAs", json!({"path":path})).unwrap();
+        let old = s.execute("agent.snapshot", json!({})).unwrap();
+        let owner = s.execute("poema.owner", json!({})).unwrap();
+        let original = fs::read(&path).unwrap();
+        s.execute("sequence.addEdit", json!({"seconds":1.5})).unwrap();
+        assert!(s.execute("poema.checkpoint", json!({"token":old["token"],"lease":owner["lease"]})).is_err());
+        let read = s.execute("agent.snapshot", json!({})).unwrap();
+        assert!(s.execute("poema.checkpoint", json!({"token":read["token"],"lease":"foreign"})).is_err());
+        assert!(s.execute("poema.checkpoint", json!({"token":read["token"],"lease":owner["lease"],"path":dir.join("redirect.fcproj")})).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(s.is_dirty());
+        let project = s.project.clone();
+        let depth = s.history.undo.len();
+        let revision = s.revision;
+        let (_, events, _subscription) = s.command_journal.subscribe().unwrap();
+        let result = s.execute("poema.checkpoint", json!({"token":read["token"],"lease":owner["lease"]})).unwrap();
+        assert_eq!(result["revision"], revision.to_string());
+        assert_eq!(result["sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(filmcraft_format::decode(&fs::read(&path).unwrap()).unwrap().project, *project);
+        assert!(Arc::ptr_eq(&project, &s.project));
+        assert_eq!(s.history.undo.len(), depth);
+        assert_eq!(s.revision, revision);
+        assert!(!s.is_dirty());
+        assert!(events.try_recv().is_err());
+        s.execute("edit.undo", json!({})).unwrap();
+        assert!(s.is_dirty());
+        drop(s);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn a_file_lease_generation_changes_on_reopen_and_save_as_but_not_save_copy() {
+        use serde_json::json;
+        let dir = directory();
+        let path = dir.join("a.fcproj");
+        let mut s = managed();
+        s.execute("file.saveAs", json!({"path":path})).unwrap();
+        let first = s.execute("poema.owner", json!({})).unwrap();
+        s.execute("file.saveCopy", json!({"path":dir.join("copy.fcproj")})).unwrap();
+        assert_eq!(s.execute("poema.owner", json!({})).unwrap()["lease"], first["lease"]);
+        s.execute("file.newProject", json!({})).unwrap();
+        s.execute("file.open", json!({"path":path})).unwrap();
+        let next = s.execute("poema.owner", json!({})).unwrap();
+        assert_eq!(next["owner"], first["owner"]);
+        assert_ne!(next["lease"], first["lease"]);
+        let read = s.execute("agent.snapshot", json!({})).unwrap();
+        assert!(s.execute("poema.checkpoint", json!({"token":read["token"],"lease":first["lease"]})).is_err());
+        s.execute("file.saveAs", json!({"path":dir.join("b.fcproj")})).unwrap();
+        assert_ne!(s.execute("poema.owner", json!({})).unwrap()["lease"], next["lease"]);
+        drop(s);
         fs::remove_dir_all(dir).unwrap();
     }
 }
