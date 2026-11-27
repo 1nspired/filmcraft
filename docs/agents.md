@@ -374,3 +374,29 @@ saved. The host must independently check the file digest and semantics. Checkpoi
 is persistence, not an edit: no new Undo step or command-journal event. A stale
 basis, replaced file owner or redirected path refuses before writing. This does
 not publish a host binding, freeze human input, or recover unclean unsaved work.
+
+### Publication freeze
+
+`poema.freezeCheckpoint {token, lease}` performs the same guarded checkpoint and
+atomically holds its file-write generation frozen. The reply adds a transient
+`freeze` identity. While held, only `poema.owner`, `agent.snapshot`,
+`agent.document` and `poema.releaseCheckpoint` may execute. Direct edits,
+Undo/Redo/revert, document replacement and saves refuse too. Read-only control
+queries and the pushed journal remain available. No project edit, Undo entry or
+journal event is created. `poema.owner.frozen` reports the state, not its release
+identity. There is no timeout, automatic thaw or edit replay.
+
+`poema.releaseCheckpoint {lease, freeze}` requires the exact original pair and
+releases once; foreign, extra and repeated arguments refuse. Both transitions
+discard pending agent plans/tickets and owned-Undo claims, without discarding
+native history. Obtain a fresh basis afterwards. These local concurrency
+identities are not authentication or protection against arbitrary external code.
+
+Foreground saves and freeze/release advance an in-memory persistence generation.
+Queued autosaves capture that generation and check it under the same mutex as the
+atomic file write, so an old worker cannot overwrite a checkpoint after release.
+The recovery ring remains available; a refused stale current-project save is
+reported. Unmarked projects have no managed generation and behave as before.
+This is a temporary native prerequisite, not a host binding transaction, a
+persisted Undo stack, or a public film switch. The controller must retain the
+freeze while publication is uncertain and reconcile rather than guessing.

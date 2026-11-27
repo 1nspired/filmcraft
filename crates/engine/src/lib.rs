@@ -710,6 +710,11 @@ impl Session {
 
     /// Run a command by id.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
+        if self.project_lease.as_ref().is_some_and(|lease| lease.frozen())
+            && !matches!(id, "poema.owner" | "poema.releaseCheckpoint" | "agent.snapshot" | "agent.document")
+        {
+            project_owner::writable(self)?;
+        }
         if !matches!(id, "file.newProject" | "file.openDemoProject" | "file.open" | "file.recover") {
             project_owner::current(self)?;
         }
@@ -860,7 +865,7 @@ impl Session {
 
     /// Apply an undoable project edit. The closure gets a mutable copy; on error nothing changes.
     pub fn edit<R>(&mut self, label: &str, f: impl FnOnce(&mut Project, &mut EditorState) -> Result<R>) -> Result<R> {
-        project_owner::current(self)?;
+        project_owner::writable(self)?;
         let mut p = (*self.project).clone();
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
@@ -887,7 +892,7 @@ impl Session {
             self.history.merge_key = Some(key.to_string());
             return Ok(r);
         }
-        project_owner::current(self)?;
+        project_owner::writable(self)?;
         let mut p = (*self.project).clone();
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
@@ -902,7 +907,7 @@ impl Session {
     /// Run several undoable edits as one undo step labelled `label`. If `f` fails, every edit it made
     /// is rolled back and the history is as before.
     pub fn edit_group<R>(&mut self, label: &str, f: impl FnOnce(&mut Session) -> Result<R>) -> Result<R> {
-        project_owner::current(self)?;
+        project_owner::writable(self)?;
         let (project, state, undo, redo, limit) =
             (self.project.clone(), self.state.clone(), self.history.undo.len(), self.history.redo.clone(), self.history.limit);
         // keep every step the group makes, however many, so the first one can be found afterwards
@@ -950,7 +955,7 @@ impl Session {
     /// not: the project returns to how it was at `mark`, and neither undo nor redo keeps them.
     /// Nothing happens when `mark` has left the history. Returns how many steps were taken back.
     pub fn revert_to(&mut self, mark: UndoMark) -> usize {
-        if let Err(e) = project_owner::current(self) {
+        if let Err(e) = project_owner::writable(self) {
             self.log.push(panels::Level::Error, "project ownership", e.to_string());
             return 0;
         }
@@ -1015,7 +1020,7 @@ impl Session {
     }
 
     pub fn undo(&mut self) -> Option<String> {
-        if let Err(e) = project_owner::current(self) {
+        if let Err(e) = project_owner::writable(self) {
             self.log.push(panels::Level::Error, "project ownership", e.to_string());
             return None;
         }
@@ -1029,7 +1034,7 @@ impl Session {
     }
 
     pub fn redo(&mut self) -> Option<String> {
-        if let Err(e) = project_owner::current(self) {
+        if let Err(e) = project_owner::writable(self) {
             self.log.push(panels::Level::Error, "project ownership", e.to_string());
             return None;
         }

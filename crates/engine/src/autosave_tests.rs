@@ -352,3 +352,35 @@ fn managed_background_save_keeps_the_file_owner_until_its_snapshot_is_released()
     drop(b);
     let _ = std::fs::remove_dir_all(d);
 }
+
+#[cfg(unix)]
+#[test]
+fn a_real_queued_worker_cannot_replace_a_checkpoint_after_publication_freeze_and_release() {
+    let d = temp_dir("managed-worker-freeze");
+    let path = d.join("managed.fcproj");
+    let mut s = demo();
+    let seq = s.state.active_sequence.unwrap();
+    std::sync::Arc::make_mut(&mut s.project).items.get_mut(&seq).unwrap().metadata.insert("poema.editorial.v1".into(), "{}".into());
+    start(&mut s, &d);
+    s.execute("prefs.set", json!({"key":"autoSave.saveCurrentProject","value":true})).unwrap();
+    s.execute("file.saveAs", json!({"path":path})).unwrap();
+    s.execute("sequence.addEdit", json!({"seconds":1.5})).unwrap();
+    // The actual worker retains an old dirty snapshot. Keep its queue separate
+    // from the Session's following clean notifications, deterministically.
+    let mut worker = s.persistence.take().unwrap();
+    let owner = s.execute("poema.owner", json!({})).unwrap();
+    let basis = s.execute("agent.snapshot", json!({})).unwrap();
+    let frozen = s.execute("poema.freezeCheckpoint", json!({"token":basis["token"],"lease":owner["lease"]})).unwrap();
+    s.execute("poema.releaseCheckpoint", json!({"lease":owner["lease"],"freeze":frozen["freeze"]})).unwrap();
+    s.execute("sequence.addEdit", json!({"seconds":2.5})).unwrap();
+    s.execute("file.save", json!({})).unwrap();
+    let expected = std::fs::read(&path).unwrap();
+    assert!(worker.auto_save_now().unwrap().is_some());
+    assert_eq!(std::fs::read(&path).unwrap(), expected);
+    assert!(
+        worker.drain_events().iter().any(|event| matches!(event, autosave::WorkerEvent::Error(message) if message.contains("queued autosave basis expired")))
+    );
+    drop(worker);
+    drop(s);
+    let _ = std::fs::remove_dir_all(d);
+}
