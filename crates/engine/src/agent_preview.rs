@@ -61,7 +61,8 @@ pub(crate) fn preview(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let editor = editor_basis(s)?;
     let (mut staged, results, label) = agent_bridge::stage(s, p)?;
-    let changed = native_document::bounded_json(&project)? != native_document::bounded_json(&staged.project)?;
+    let changed = native_document::bounded_json(&project)? != native_document::bounded_json(&staged.project)?
+        && !crate::poema_audio_fades::same_project_up_to_envelope_layout(&project, &staged.project)?;
     let document = native_document::read(&mut staged, &Value::Null)?;
     let store = &mut s.agent_bridge.previews;
     store.serial = store.serial.checked_add(1).ok_or_else(|| bad("agent.preview", "preview counter exhausted"))?;

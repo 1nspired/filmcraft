@@ -1,6 +1,6 @@
 //! Explicit audio fades live in a native optional intrinsic, never annotations.
 use crate::{Result, Session, commands::bad};
-use filmcraft_project::{ClipId, EffectInstance, ParamValue, TrackKind, find_effect};
+use filmcraft_project::{ClipId, EffectInstance, ItemKind, ParamValue, Project, TrackKind, find_effect};
 use serde::Deserialize;
 use serde_json::{Value, json};
 const CMD: &str = "poema.setAudioFades";
@@ -37,6 +37,51 @@ fn valid(effect: &EffectInstance) -> bool {
         p.value = ParamValue::Bool(value);
     }
     effect == &expected
+}
+
+// The renderer evaluates this intrinsic separately from the ordered DSP
+// chain. Canonicalize only private comparison copies, never a live project.
+// Every other field and the relative order of every other effect stay exact.
+fn envelope_layout(project: &mut Project) -> bool {
+    let mut supported = false;
+    for item in project.items.values_mut() {
+        let ItemKind::Sequence(q) = &mut item.kind else { continue };
+        let q = std::sync::Arc::make_mut(q);
+        for track in &mut q.audio_tracks {
+            for clip in &mut track.items {
+                if clip.effects.iter().filter(|e| e.effect == EFFECT).count() != 1 {
+                    continue;
+                }
+                let Some(index) = clip.effects.iter().position(|e| e.effect == EFFECT && valid(e)) else { continue };
+                supported = true;
+                let effect = clip.effects.remove(index);
+                let neutral = ["in_seconds", "out_seconds"].iter().all(|key| effect.f64_at(key, filmcraft_time::Tick::ZERO).to_bits() == 0.0f64.to_bits())
+                    && ["in_linear", "out_linear"].iter().all(|key| effect.param(key).and_then(|p| p.value.as_bool()) == Some(false));
+                if !neutral {
+                    clip.effects.push(effect);
+                }
+            }
+        }
+    }
+    supported
+}
+pub(crate) fn same_project_up_to_envelope_layout(before: &Project, after: &Project) -> Result<bool> {
+    let has_envelope = |project: &Project| {
+        project.items.values().any(|item| {
+            let ItemKind::Sequence(q) = &item.kind else { return false };
+            q.audio_tracks.iter().any(|track| track.items.iter().any(|clip| clip.effects.iter().any(|effect| effect.effect == EFFECT && valid(effect))))
+        })
+    };
+    if !has_envelope(before) && !has_envelope(after) {
+        return Ok(false);
+    }
+    let (mut before, mut after) = (before.clone(), after.clone());
+    let a = envelope_layout(&mut before);
+    let b = envelope_layout(&mut after);
+    if !a && !b {
+        return Ok(false);
+    }
+    Ok(crate::native_document::bounded_json(&before)? == crate::native_document::bounded_json(&after)?)
 }
 pub(crate) fn set(s: &mut Session, params: &Value) -> Result<Value> {
     crate::project_owner::writable(s)?;
@@ -206,5 +251,65 @@ mod tests {
         assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
         assert_eq!(s.revision, rev);
         assert_eq!(s.history.undo.len(), depth);
+    }
+
+    #[test]
+    fn clear_and_recreate_preview_keeps_the_original_project_and_history() {
+        let mut s = demo();
+        let id = s.active_sequence().unwrap().audio_tracks[0].items[0].id.0;
+        s.execute(CMD, json!({"clip":id,"fadeIn":0.25})).unwrap();
+        s.execute("poema.setChannelSum", json!({"clip":id,"enabled":true})).unwrap();
+        let before = s.project.clone();
+        let rev = s.revision;
+        let depth = s.history.undo.len();
+        let basis = s.execute("agent.snapshot", json!({})).unwrap();
+        let preview = s
+            .execute(
+                "agent.preview",
+                json!({"token":basis["token"],"operations":[
+                    {"command":CMD,"params":{"clip":id,"fadeIn":0}},
+                    {"command":CMD,"params":{"clip":id,"fadeIn":0.25}}
+                ]}),
+            )
+            .unwrap();
+        assert_eq!(preview["changed"], false);
+        let result = s.execute("agent.commitPreview", json!({"token":basis["token"],"preview":preview["preview"]})).unwrap();
+        assert_eq!(result["changed"], false);
+        assert!(Arc::ptr_eq(&before, &s.project));
+        assert_eq!(s.revision, rev);
+        assert_eq!(s.history.undo.len(), depth);
+    }
+
+    #[test]
+    fn envelope_noop_does_not_hide_gain_or_nonintrinsic_effect_order() {
+        for reorder in [false, true] {
+            let mut s = demo();
+            let id = s.active_sequence().unwrap().audio_tracks[0].items[0].id.0;
+            s.execute(CMD, json!({"clip":id,"fadeIn":0.25})).unwrap();
+            s.execute("poema.setChannelSum", json!({"clip":id,"enabled":true})).unwrap();
+            if reorder {
+                let seq = s.state.active_sequence.unwrap();
+                Arc::make_mut(&mut s.project)
+                    .sequence_mut(seq)
+                    .unwrap()
+                    .find_item_mut(ClipId(id))
+                    .unwrap()
+                    .1
+                    .effects
+                    .push(find_effect("amplify").unwrap().instance());
+            }
+            let basis = s.execute("agent.snapshot", json!({})).unwrap();
+            let mut operations = vec![json!({"command":CMD,"params":{"clip":id,"fadeIn":0}}), json!({"command":CMD,"params":{"clip":id,"fadeIn":0.25}})];
+            if reorder {
+                operations.extend([
+                    json!({"command":"poema.setChannelSum","params":{"clip":id,"enabled":false}}),
+                    json!({"command":"poema.setChannelSum","params":{"clip":id,"enabled":true}}),
+                ]);
+            } else {
+                operations.push(json!({"command":"poema.patchClip","params":{"clip":id,"gainDb":-1}}));
+            }
+            let preview = s.execute("agent.preview", json!({"token":basis["token"],"operations":operations})).unwrap();
+            assert_eq!(preview["changed"], true);
+        }
     }
 }
