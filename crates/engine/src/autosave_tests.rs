@@ -325,3 +325,30 @@ fn project_captured_folder_outside_the_project_is_not_used() {
     assert!(s.execute("file.projectSettings.scratchDisks", json!({"captured": "file://192.0.2.1/s/cap"})).is_err());
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[cfg(unix)]
+#[test]
+fn managed_background_save_keeps_the_file_owner_until_its_snapshot_is_released() {
+    let d = temp_dir("managed-worker-owner");
+    let path = d.join("managed.fcproj");
+    let mut a = demo();
+    let seq = a.state.active_sequence.unwrap();
+    std::sync::Arc::make_mut(&mut a.project).items.get_mut(&seq).unwrap().metadata.insert("poema.editorial.v1".into(), "{}".into());
+    start(&mut a, &d);
+    a.execute("prefs.set", json!({"key":"autoSave.saveCurrentProject","value":true})).unwrap();
+    a.execute("file.saveAs", json!({"path":path})).unwrap();
+    a.execute("sequence.addEdit", json!({"seconds":1.5})).unwrap();
+    let expected = a.project.clone();
+    let worker = a.persistence.take().unwrap();
+    // Keep the real queued worker alive after releasing the Session's own ref.
+    drop(a);
+    assert!(worker.auto_save_now().unwrap().is_some());
+    let mut b = Session::default();
+    assert!(b.execute("file.open", json!({"path":path})).is_err());
+    drop(worker);
+    b.execute("file.open", json!({"path":path})).unwrap();
+    assert_eq!(*b.project, *expected);
+    b.shutdown();
+    drop(b);
+    let _ = std::fs::remove_dir_all(d);
+}

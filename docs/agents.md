@@ -341,3 +341,23 @@ A reconnect must read again and build a new plan; it must never replay a pending
 edit. This namespace is a concurrency fence, not authentication. Native Undo and
 prepared previews remain session memory; this change does not persist them across
 restart, implement project-file ownership, or activate a Poema film.
+
+### Poema-managed project-file ownership (Unix)
+
+`poema.owner` reports the opaque Session owner, canonical project path, managed
+status and current revision without changing history. It is read-only identity,
+not authorization.
+
+A project containing Poema editorial bindings, or a path with a persistent
+`.poema-owner.lock` sidecar, requires an exclusive OS file lease before open/save.
+The sidecar remains after close; process death releases the lock. Symlink aliases
+resolve to the same owner. Hardlinked projects/sidecars, missing/replaced locks and
+unsupported platforms refuse. Save As acquires its destination before changing
+memory; Save a Copy retains the source lease. Saves use the format's atomic writer.
+Queued auto-saves retain the lease until their snapshot is released. Direct edit,
+Undo/Redo and command paths refuse if ownership is lost. Ordinary unmarked projects
+keep their existing behavior. Schema 17 excludes older native readers that do not
+honor this protocol. This is cooperative ownership, not authentication or a fence
+against arbitrary external programs. Deployment must also exclude old Poema servers
+from opted-in data roots. This piece does not publish a host ownership binding,
+restore an Undo stack after restart, or enable any real film.

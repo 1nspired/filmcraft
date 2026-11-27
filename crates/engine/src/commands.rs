@@ -1139,6 +1139,7 @@ fn build() -> Vec<CommandSpec> {
         // ================= File =================
         cmd!("file.newProject", "Project…", ["File", "New"], Some("Cmd+Alt+N"), r#"{"name":str}"#, always, |s, p| {
             let name = str_p(p, "name").unwrap_or("Untitled").to_string();
+            s.project_lease = None;
             s.project = std::sync::Arc::new(filmcraft_project::Project::new(&name));
             s.history = Default::default();
             s.history.limit = 200;
@@ -1152,6 +1153,7 @@ fn build() -> Vec<CommandSpec> {
             Ok(Value::Null)
         }),
         cmd!("file.openDemoProject", "Demo Project", ["File", "New"], None, "{}", always, |s, _| {
+            s.project_lease = None;
             let (p, seq) = crate::demo::demo_project(&s.media);
             s.project = std::sync::Arc::new(p);
             s.history = Default::default();
@@ -4333,17 +4335,25 @@ fn name_project(p: &mut filmcraft_project::Project, name: String) {
 }
 
 fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
+    let lease = crate::project_owner::target(s, &s.project, path, true)?;
+    let path = lease.as_ref().map(|l| l.path()).transpose()?.unwrap_or(path);
+    let mut project = s.project.clone();
     let t0 = web_time::Instant::now();
     // Save As renames the project after its new file (not an edit: no undo step, not dirty).
     if adopt
         && let Some(name) = project_name_for(path)
         && s.project.name != name
     {
-        name_project(std::sync::Arc::make_mut(&mut s.project), name);
+        if lease.is_some() {
+            name_project(std::sync::Arc::make_mut(&mut project), name);
+        } else {
+            name_project(std::sync::Arc::make_mut(&mut s.project), name);
+            project = s.project.clone();
+        }
     }
     // what is open (sequence tabs, how each is shown) goes into the file beside the project
     let view = s.project_view();
-    let bytes = filmcraft_format::encode_with_view(&s.project, Some(&view), false);
+    let bytes = filmcraft_format::encode_with_view(&project, Some(&view), false);
     let mut backup = None;
     if adopt && s.path.as_deref() == Some(path) && s.loaded_schema < filmcraft_format::SCHEMA_VERSION {
         let b = schema_backup_path(path, s.loaded_schema);
@@ -4354,8 +4364,16 @@ fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
             backup = Some(b);
         }
     }
-    s.services.write_file(path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    if let Some(lease) = &lease {
+        lease.save(&bytes)?;
+    } else {
+        s.services.write_file(path, &bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    }
     if adopt {
+        if lease.is_some() {
+            s.project = project;
+        }
+        s.project_lease = lease.clone();
         s.path = Some(path.to_string());
         s.previews_follow_path();
         s.note_recent_project();
@@ -4371,7 +4389,14 @@ fn schema_backup_path(path: &str, schema: u32) -> String {
 }
 
 /// Make `proj` the session's project (fresh history, media pool and editor state).
-fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Option<String>, clean: bool) {
+fn install_project(
+    s: &mut Session,
+    proj: filmcraft_project::Project,
+    path: Option<String>,
+    clean: bool,
+    lease: Option<std::sync::Arc<crate::project_owner::ProjectLease>>,
+) {
+    s.project_lease = lease;
     let proxies = s.media.use_proxies();
     s.media = std::sync::Arc::new(crate::MediaPool::default());
     s.media.set_use_proxies(proxies);
@@ -4400,9 +4425,16 @@ fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Opti
 
 fn open_project(s: &mut Session, path: &str) -> Result<Value> {
     let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
-    let loaded = filmcraft_format::decode(&bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let mut loaded = filmcraft_format::decode(&bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let lease = crate::project_owner::target(s, &loaded.project, path, false)?;
+    let path = lease.as_ref().map(|l| l.path()).transpose()?.unwrap_or(path);
+    if lease.is_some() {
+        // The earlier read only discovers the marker. Re-read under ownership.
+        let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        loaded = filmcraft_format::decode(&bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    }
     let (from, migrated) = (loaded.schema_version, loaded.migrated());
-    install_project(s, loaded.project, Some(path.to_string()), true);
+    install_project(s, loaded.project, Some(path.to_string()), true, lease.clone());
     if let Some(view) = loaded.view.filter(|_| s.prefs.timeline.restore_open_sequences) {
         s.restore_project_view(view);
     }
@@ -4429,7 +4461,8 @@ fn recover(s: &mut Session, id: Option<&str>) -> Result<Value> {
     let c = per.candidates[idx].clone();
     let saved_at = per.local_time(c.meta.saved_unix);
     let loaded = crate::autosave::load_candidate(&c).map_err(EngineError::Other)?;
-    install_project(s, loaded.project, c.meta.project_path.clone(), false);
+    let lease = c.meta.project_path.as_deref().map(|path| crate::project_owner::target(s, &loaded.project, path, false)).transpose()?.flatten();
+    install_project(s, loaded.project, c.meta.project_path.clone(), false, lease);
     if let Some(seq) = s.state.active_sequence {
         s.events.push(crate::Event::OpenSequence(seq));
     }

@@ -290,6 +290,7 @@ fn spec(id: &'static str, label: &'static str, run: fn(&mut Session, &Value) -> 
 pub(crate) fn commands() -> Vec<CommandSpec> {
     vec![
         spec("poema.configureClip", "Configure delivered clip", configure, true),
+        spec("poema.owner", "Read managed native project owner", crate::project_owner::status, false),
         spec("agent.snapshot", "Read guarded native sequence", snapshot, false),
         spec("agent.document", "Read lossless native project", crate::native_document::read, false),
         spec("agent.apply", "Apply guarded Poema batch", apply, true),

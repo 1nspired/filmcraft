@@ -44,6 +44,7 @@ mod poema_metadata;
 pub mod presets;
 pub mod previews;
 pub mod project_manager;
+mod project_owner;
 pub mod project_panel;
 pub mod project_tools;
 pub mod proxies;
@@ -390,6 +391,7 @@ pub struct Session {
     pub revision: u64,
     pub saved_revision: u64,
     pub path: Option<String>,
+    pub(crate) project_lease: Option<Arc<project_owner::ProjectLease>>,
     pub state: EditorState,
     pub media: Arc<MediaPool>,
     pub services: Arc<dyn Services>,
@@ -505,6 +507,7 @@ impl Session {
         Self {
             command_journal: Default::default(),
             agent_bridge: Default::default(),
+            project_lease: None,
             project: Arc::new(Project::new("Untitled")),
             history: History { limit: 200, ..Default::default() },
             revision: 1,
@@ -614,6 +617,13 @@ impl Session {
     /// Tell the worker about the current project state if it changed (cheap: an `Arc` clone and a
     /// channel send; serialization happens on the worker). Called after every command.
     pub fn sync_persistence(&mut self) {
+        if let Err(e) = project_owner::current(self) {
+            if let Some(p) = &self.persistence {
+                p.send_clean();
+            }
+            self.log.push(panels::Level::Error, "project ownership", e.to_string());
+            return;
+        }
         let dirty = self.is_dirty();
         let Some(p) = self.persistence.as_mut() else { return };
         let cur = autosave::Sent { revision: self.revision, saved_revision: self.saved_revision, path: self.path.clone() };
@@ -621,7 +631,7 @@ impl Session {
             return;
         }
         if dirty {
-            p.send_dirty(self.project.clone(), self.revision, self.path.clone());
+            p.send_dirty(self.project.clone(), self.revision, self.path.clone(), self.project_lease.clone());
         } else {
             p.send_clean();
         }
@@ -700,6 +710,9 @@ impl Session {
 
     /// Run a command by id.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
+        if !matches!(id, "file.newProject" | "file.openDemoProject" | "file.open" | "file.recover") {
+            project_owner::current(self)?;
+        }
         let before_revision = self.revision;
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         if self.exec_depth == 0 && spec.journal && self.trim_play.active() {
@@ -847,6 +860,7 @@ impl Session {
 
     /// Apply an undoable project edit. The closure gets a mutable copy; on error nothing changes.
     pub fn edit<R>(&mut self, label: &str, f: impl FnOnce(&mut Project, &mut EditorState) -> Result<R>) -> Result<R> {
+        project_owner::current(self)?;
         let mut p = (*self.project).clone();
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
@@ -873,6 +887,7 @@ impl Session {
             self.history.merge_key = Some(key.to_string());
             return Ok(r);
         }
+        project_owner::current(self)?;
         let mut p = (*self.project).clone();
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
@@ -887,6 +902,7 @@ impl Session {
     /// Run several undoable edits as one undo step labelled `label`. If `f` fails, every edit it made
     /// is rolled back and the history is as before.
     pub fn edit_group<R>(&mut self, label: &str, f: impl FnOnce(&mut Session) -> Result<R>) -> Result<R> {
+        project_owner::current(self)?;
         let (project, state, undo, redo, limit) =
             (self.project.clone(), self.state.clone(), self.history.undo.len(), self.history.redo.clone(), self.history.limit);
         // keep every step the group makes, however many, so the first one can be found afterwards
@@ -934,6 +950,10 @@ impl Session {
     /// not: the project returns to how it was at `mark`, and neither undo nor redo keeps them.
     /// Nothing happens when `mark` has left the history. Returns how many steps were taken back.
     pub fn revert_to(&mut self, mark: UndoMark) -> usize {
+        if let Err(e) = project_owner::current(self) {
+            self.log.push(panels::Level::Error, "project ownership", e.to_string());
+            return 0;
+        }
         if let UndoMark(Some(p)) = mark
             && !self.history.undo.iter().any(|u| Arc::as_ptr(&u.1) as usize == p)
         {
@@ -995,6 +1015,10 @@ impl Session {
     }
 
     pub fn undo(&mut self) -> Option<String> {
+        if let Err(e) = project_owner::current(self) {
+            self.log.push(panels::Level::Error, "project ownership", e.to_string());
+            return None;
+        }
         let (label, prev) = self.history.undo.pop()?;
         self.history.merge_key = None;
         let cur = std::mem::replace(&mut self.project, prev);
@@ -1005,6 +1029,10 @@ impl Session {
     }
 
     pub fn redo(&mut self) -> Option<String> {
+        if let Err(e) = project_owner::current(self) {
+            self.log.push(panels::Level::Error, "project ownership", e.to_string());
+            return None;
+        }
         let (label, next) = self.history.redo.pop()?;
         self.history.merge_key = None;
         let cur = std::mem::replace(&mut self.project, next);
