@@ -442,3 +442,12 @@ Host policy may refuse the clone without sending an audition.
 Audition and history restoration validate that persisted monitor intent agrees
 with current native flags before consuming input or history. A parseable but
 contradictory monitor map refuses atomically; the command does not silently repair it.
+
+### Exact stereo-centre channel sum (B4b1)
+
+`poema.setChannelSum {clip, enabled:bool}` manages only the exact static native
+Channel Mixer: left/right output each receive 50% left plus 50% right, with no
+inversion. It is admitted to guarded native batches/previews and normal Undo.
+A no-op does not add history. Unrelated/animated/duplicate mixer state, mapped
+channels/streams, non-audio/locked targets and unsupported source layouts refuse
+without replacing effects. No DSP implementation or project schema is copied.

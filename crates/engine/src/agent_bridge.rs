@@ -175,6 +175,7 @@ fn allowed(id: &str) -> bool {
             | "poema.setImportedSourceRange"
             | "poema.configureClip"
             | "poema.patchClip"
+            | "poema.setChannelSum"
             | "timeline.setTrack"
             | "clip.link"
             | "clip.fitToFrame"
@@ -364,6 +365,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec("poema.setMonitor", "Set native Poema audition", crate::poema_monitor::set, true),
         spec("agent.previewMonitor", "Preview guarded native audition", crate::poema_monitor::preview, false),
         spec("agent.monitor", "Set guarded native Poema audition", monitor, true),
+        spec("poema.setChannelSum", "Set exact stereo-centre Channel Mixer", crate::poema_channel_sum::set, true),
         spec("poema.patchClip", "Set explicit clip playback properties", patch_clip, true),
         spec("poema.owner", "Read managed native project owner", crate::project_owner::status, false),
         spec("poema.checkpoint", "Checkpoint the guarded native owner", crate::project_owner::checkpoint, false),
