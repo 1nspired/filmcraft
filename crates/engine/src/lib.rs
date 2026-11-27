@@ -41,6 +41,7 @@ pub mod panels;
 pub mod paste_media;
 pub mod perf;
 mod poema_audio_fades;
+mod poema_audio_law;
 mod poema_channel_sum;
 mod poema_metadata;
 mod poema_monitor;

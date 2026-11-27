@@ -15,6 +15,7 @@ pub mod audio_fx;
 pub mod blend;
 pub mod color_match;
 pub mod colorman;
+mod decimal;
 pub mod effects;
 pub mod flow;
 pub mod gpufx;
