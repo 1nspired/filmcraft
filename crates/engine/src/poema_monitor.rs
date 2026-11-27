@@ -55,7 +55,7 @@ pub(crate) fn validate(project: &Project) -> Result<()> {
                 if let Some(flags) = monitor.tracks.get(&track.id.0.to_string())
                     && (flags.muted != track.muted || flags.solo != track.solo)
                 {
-                    return Err(bad(CMD, "versioned track flags disagree with native audition; use the monitor command"));
+                    return Err(bad(CMD, "native track flags disagree with audition intent; refusing inconsistent state"));
                 }
             }
         }
@@ -67,6 +67,7 @@ fn tagged(s: &Session) -> bool {
 }
 pub(crate) fn set(s: &mut Session, params: &Value) -> Result<Value> {
     crate::project_owner::writable(s)?;
+    validate(&s.project)?;
     let count = params.get("updates").and_then(Value::as_array).map(Vec::len).ok_or_else(|| bad(CMD, "need updates"))?;
     if count == 0 || count > 128 {
         return Err(bad(CMD, "need 1..128 explicit audio monitor updates"));
@@ -143,6 +144,7 @@ pub(crate) fn preview(s: &mut Session, params: &Value) -> Result<Value> {
 /// exists, validate it BEFORE popping history, then restore its flags/field
 /// presence over the old geometry. Missing tracks remain dormant for Redo.
 pub(crate) fn restore(current: &Arc<Project>, target: &Arc<Project>) -> Result<Arc<Project>> {
+    validate(current)?;
     let mut states = Vec::new();
     for (id, item) in &current.items {
         if item.metadata.contains_key(KEY)
@@ -335,6 +337,27 @@ mod tests {
             s.execute("agent.apply", json!({"token":basis["token"],"operations":[{"command":"timeline.setTrack","params":{"track":t,"solo":true}}]})).is_err()
         );
         assert!(Arc::ptr_eq(&s.project, &before));
+    }
+    #[test]
+    fn contradictory_persisted_intent_cannot_be_repaired_silently_or_consumed_by_undo() {
+        let mut s = demo(true);
+        apply(&mut s);
+        let t = track(&s);
+        let id = s.state.active_sequence.unwrap();
+        let encoded = json!({"schema":1,"tracks":{t.to_string():{"muted":true,"solo":false}}}).to_string();
+        Arc::make_mut(&mut s.project).item_mut(id).unwrap().metadata.insert(KEY.into(), encoded);
+        assert_eq!(flags(&s), (false, false));
+        let before = s.project.clone();
+        let depth = s.history.undo.len();
+        let revision = s.revision;
+        assert!(s.execute(CMD, json!({"updates":[{"track":t,"solo":true}]})).is_err(), "contradictory input must refuse, not silently replace its intent");
+        assert!(Arc::ptr_eq(&before, &s.project));
+        assert_eq!(s.revision, revision);
+        assert_eq!(s.history.undo.len(), depth);
+        assert!(s.undo().is_none(), "Undo cannot apply corrupt audition intent");
+        assert!(Arc::ptr_eq(&before, &s.project));
+        assert_eq!(s.revision, revision);
+        assert_eq!(s.history.undo.len(), depth);
     }
     #[test]
     fn malformed_persisted_intent_refuses_without_consuming_history() {

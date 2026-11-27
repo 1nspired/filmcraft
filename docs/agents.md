@@ -438,3 +438,7 @@ It publishes no live project/history/journal change and writes no project. The
 returned document is policy input, not a live ticket or a reusable edit plan.
 A later `agent.monitor` must still present the original basis and pass the guard.
 Host policy may refuse the clone without sending an audition.
+
+Audition and history restoration validate that persisted monitor intent agrees
+with current native flags before consuming input or history. A parseable but
+contradictory monitor map refuses atomically; the command does not silently repair it.
