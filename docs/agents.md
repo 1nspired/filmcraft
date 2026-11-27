@@ -400,3 +400,16 @@ reported. Unmarked projects have no managed generation and behave as before.
 This is a temporary native prerequisite, not a host binding transaction, a
 persisted Undo stack, or a public film switch. The controller must retain the
 freeze while publication is uncertain and reconcile rather than guessing.
+
+### Explicit clip properties
+
+`poema.patchClip {clip, gainDb?, enabled?}` patches only the supplied properties
+on the addressed clip. Supply at least one: gain is finite and in `[-60,12]` dB,
+enablement is a boolean. Unknown fields, absent clips and locked tracks refuse.
+Speed, source/record geometry, track mute and provenance remain unchanged. The
+delivery configurator's defaults are deliberately not used for property edits.
+
+The guarded batch/preview door admits this command and `timeline.setTrack`.
+Mixed operations stage and check together, then commit as one native Undo and
+one journal event. Host admission and policy are separate: this prerequisite
+does not migrate a Poema caller or enable any real film.
