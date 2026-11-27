@@ -41,6 +41,7 @@ pub mod panels;
 pub mod paste_media;
 pub mod perf;
 mod poema_metadata;
+mod poema_monitor;
 pub mod presets;
 pub mod previews;
 pub mod project_manager;
@@ -734,8 +735,11 @@ impl Session {
         // Last-resort guard: a panic in a command (a bug that escaped the never-crash rules)
         // becomes an error for the caller (UI, CLI, control channel, MCP) instead of taking the
         // session and its unsaved project down. The panic hook has logged where it happened.
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)))
-            .unwrap_or_else(|_| Err(EngineError::Other(format!("internal error in `{id}` (see the crash log); the command did not complete"))));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match poema_monitor::command(self, id, &params) {
+            Some(result) => result,
+            None => (spec.run)(self, &params),
+        }))
+        .unwrap_or_else(|_| Err(EngineError::Other(format!("internal error in `{id}` (see the crash log); the command did not complete"))));
         self.exec_depth -= 1;
         if self.exec_depth == 0 {
             source_monitor::track_history(self);
@@ -854,6 +858,7 @@ impl Session {
     /// through another nested sequence) is refused, whichever command asked for it. A project that
     /// was opened with such a sequence already in it can still be edited (and repaired).
     fn refuse_self_nesting(&self, edited: &Project) -> Result<()> {
+        poema_monitor::validate(edited)?;
         match edited.nest_cycle() {
             Some(id) if self.project.nest_cycle().is_none() => {
                 let name = edited.item(id).map(|i| i.name.as_str()).unwrap_or_default();
@@ -964,20 +969,27 @@ impl Session {
         {
             return 0;
         }
-        let mut earliest = None;
-        let mut n = 0;
-        while self.undo_mark() != mark {
-            let Some((_, prev)) = self.history.undo.pop() else { break };
-            earliest = Some(prev);
-            n += 1;
+        // Validate the final target before consuming any cancelled history.
+        let count = self.history.undo.iter().rev().take_while(|(_, project)| Some(Arc::as_ptr(project) as usize) != mark.0).count();
+        if count == 0 {
+            return 0;
         }
-        if let Some(prev) = earliest {
-            self.project = prev;
-            self.history.merge_key = None;
-            self.fix_state();
-            self.bump();
-        }
-        n
+        let Some((_, target)) = self.history.undo.get(self.history.undo.len() - count) else {
+            return 0;
+        };
+        let restored = match poema_monitor::restore(&self.project, target) {
+            Ok(project) => project,
+            Err(error) => {
+                self.log.push(panels::Level::Error, "audition history", error.to_string());
+                return 0;
+            }
+        };
+        self.history.undo.truncate(self.history.undo.len() - count);
+        self.project = restored;
+        self.history.merge_key = None;
+        self.fix_state();
+        self.bump();
+        count
     }
 
     /// Edit the active sequence with the edit-algebra context.
@@ -1024,7 +1036,16 @@ impl Session {
             self.log.push(panels::Level::Error, "project ownership", e.to_string());
             return None;
         }
-        let (label, prev) = self.history.undo.pop()?;
+        let target = &self.history.undo.last()?.1;
+        let restored = match poema_monitor::restore(&self.project, target) {
+            Ok(project) => project,
+            Err(error) => {
+                self.log.push(panels::Level::Error, "audition history", error.to_string());
+                return None;
+            }
+        };
+        let (label, _) = self.history.undo.pop()?;
+        let prev = restored;
         self.history.merge_key = None;
         let cur = std::mem::replace(&mut self.project, prev);
         self.history.redo.push((label.clone(), cur));
@@ -1038,7 +1059,16 @@ impl Session {
             self.log.push(panels::Level::Error, "project ownership", e.to_string());
             return None;
         }
-        let (label, next) = self.history.redo.pop()?;
+        let target = &self.history.redo.last()?.1;
+        let restored = match poema_monitor::restore(&self.project, target) {
+            Ok(project) => project,
+            Err(error) => {
+                self.log.push(panels::Level::Error, "audition history", error.to_string());
+                return None;
+            }
+        };
+        let (label, _) = self.history.redo.pop()?;
+        let next = restored;
         self.history.merge_key = None;
         let cur = std::mem::replace(&mut self.project, next);
         self.history.undo.push((label.clone(), cur));
