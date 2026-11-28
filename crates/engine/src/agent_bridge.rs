@@ -172,6 +172,8 @@ fn allowed(id: &str) -> bool {
             | "poema.setSequenceMetadata"
             | "poema.setImportedSourceRange"
             | "poema.configureClip"
+            | "poema.patchClip"
+            | "timeline.setTrack"
             | "clip.link"
             | "clip.fitToFrame"
             | "clip.audioChannels"
@@ -292,12 +294,52 @@ fn carrier(s: &mut Session, p: &Value) -> Result<Value> {
     })?;
     Ok(Value::Null)
 }
+
+// Property edits must not use the delivery configurator: its defaults also
+// reset speed, enablement and track mute. This typed patch changes only the
+// explicitly addressed native fields and retains normal native Undo.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClipPatch {
+    clip: u64,
+    #[serde(rename = "gainDb")]
+    gain_db: Option<f64>,
+    enabled: Option<bool>,
+}
+fn patch_clip(s: &mut Session, params: &Value) -> Result<Value> {
+    const CMD: &str = "poema.patchClip";
+    let patch: ClipPatch = serde_json::from_value(params.clone()).map_err(|e| bad(CMD, e.to_string()))?;
+    if patch.gain_db.is_none() && patch.enabled.is_none() {
+        return Err(bad(CMD, "need an explicit gainDb or enabled property"));
+    }
+    if patch.gain_db.is_some_and(|v| !v.is_finite() || !(-60.0..=12.0).contains(&v)) {
+        return Err(bad(CMD, "gainDb must be finite and in [-60,12]"));
+    }
+    let id = ClipId(patch.clip);
+    s.edit_sequence("Clip playback properties", |q, _, _| {
+        let (track_id, _) = q.find_item(id).ok_or_else(|| bad(CMD, "unknown clip"))?;
+        let track = q.track_mut(track_id).ok_or_else(|| bad(CMD, "unknown track"))?;
+        if track.locked {
+            return Err(bad(CMD, "track is locked"));
+        }
+        let clip = track.items.iter_mut().find(|c| c.id == id).ok_or_else(|| bad(CMD, "unknown clip"))?;
+        if let Some(gain) = patch.gain_db {
+            clip.gain_db = gain;
+        }
+        if let Some(enabled) = patch.enabled {
+            clip.enabled = enabled;
+        }
+        Ok(())
+    })?;
+    Ok(Value::Null)
+}
 fn spec(id: &'static str, label: &'static str, run: fn(&mut Session, &Value) -> Result<Value>, journal: bool) -> CommandSpec {
     CommandSpec { id, label, menu: &[], shortcut: None, params: "{…}", enabled: always, run, journal }
 }
 pub(crate) fn commands() -> Vec<CommandSpec> {
     vec![
         spec("poema.configureClip", "Configure delivered clip", configure, true),
+        spec("poema.patchClip", "Set explicit clip playback properties", patch_clip, true),
         spec("poema.owner", "Read managed native project owner", crate::project_owner::status, false),
         spec("poema.checkpoint", "Checkpoint the guarded native owner", crate::project_owner::checkpoint, false),
         spec("poema.freezeCheckpoint", "Freeze a guarded checkpoint for ownership publication", crate::project_owner::freeze_checkpoint, false),
@@ -332,6 +374,76 @@ mod tests {
     }
     fn trim(id: u64) -> Value {
         json!({"command":"timeline.trim","params":{"clip":id,"edge":"out","deltaFrames":-1}})
+    }
+    #[test]
+    fn explicit_playback_patch_and_track_settings_share_one_checked_undo() {
+        let mut s = demo();
+        let id = clip(&s);
+        let track = s.active_sequence().unwrap().video_tracks[0].id.0;
+        s.execute("poema.configureClip", json!({"clip":id,"speed":0.5,"enabled":false,"trackEnabled":false})).unwrap();
+        let before = serde_json::to_value(&s.project).unwrap();
+        let basis = s.execute("agent.snapshot", json!({})).unwrap();
+        let (_, events, _subscription) = s.command_journal.subscribe().unwrap();
+        let applied = s
+            .execute(
+                "agent.apply",
+                json!({"token":basis["token"],"operations":[
+                    {"command":"poema.patchClip","params":{"clip":id,"gainDb":-6.25}},
+                    {"command":"timeline.setTrack","params":{"track":track,"volumeDb":-3.5,"pan":25.0}}
+                ]}),
+            )
+            .unwrap();
+        let q = s.active_sequence().unwrap();
+        let c = q.find_item(ClipId(id)).unwrap().1;
+        assert_eq!(c.gain_db, -6.25);
+        assert_eq!(c.speed, 0.5);
+        assert!(!c.enabled);
+        assert!(q.video_tracks[0].muted);
+        assert_eq!(q.video_tracks[0].volume_db, -3.5);
+        assert_eq!(q.video_tracks[0].pan, 25.0);
+        assert_eq!(events.try_recv().unwrap()["command"], "agent.apply");
+        assert!(events.try_recv().is_err());
+        let basis = s.execute("agent.snapshot", json!({})).unwrap();
+        s.execute("agent.undo", json!({"token":basis["token"],"commit":applied["commit"]})).unwrap();
+        assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
+        assert_eq!(events.try_recv().unwrap()["command"], "agent.undo");
+        assert!(events.try_recv().is_err());
+    }
+    #[test]
+    fn playback_patch_rejects_hostile_properties_atomically_and_preserves_other_fields() {
+        let mut s = demo();
+        let id = clip(&s);
+        for p in [
+            json!({"clip":id}),
+            json!({"clip":id,"gainDb":13}),
+            json!({"clip":id,"gainDb":-61}),
+            json!({"clip":id,"gainDb":"-3"}),
+            json!({"clip":id,"enabled":"false"}),
+            json!({"clip":id,"gainDb":-3,"speed":2}),
+            json!({"clip":u64::MAX,"enabled":true}),
+        ] {
+            let before = s.project.clone();
+            let revision = s.revision;
+            assert!(s.execute("poema.patchClip", p).is_err());
+            assert!(Arc::ptr_eq(&before, &s.project));
+            assert_eq!(s.revision, revision);
+        }
+        let track = s.active_sequence().unwrap().video_tracks[0].id.0;
+        let before = s.project.clone();
+        let basis = s.execute("agent.snapshot", json!({})).unwrap();
+        assert!(
+            s.execute(
+                "agent.apply",
+                json!({"token":basis["token"],"operations":[
+                    {"command":"timeline.setTrack","params":{"track":track,"locked":true}},
+                    {"command":"poema.patchClip","params":{"clip":id,"enabled":false}}
+                ]})
+            )
+            .is_err()
+        );
+        assert!(Arc::ptr_eq(&before, &s.project));
+        s.execute("poema.patchClip", json!({"clip":id,"enabled":false})).unwrap();
+        assert!(!s.active_sequence().unwrap().find_item(ClipId(id)).unwrap().1.enabled);
     }
     #[test]
     fn watcher_reads_share_a_basis_without_cancelling_an_agent_plan() {
