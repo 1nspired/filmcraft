@@ -10,7 +10,9 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 mod clip_identity;
+mod program_extent;
 pub use clip_identity::{ClipIdentity, HandoffSpan};
+pub use program_extent::ProgramExtentPolicy;
 
 pub mod caption;
 pub mod effect;
@@ -989,6 +991,9 @@ impl SequenceSettings {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Sequence {
+    /// Explicit program extent; absent preserves FilmCraft's ordinary full-item duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_extent: Option<ProgramExtentPolicy>,
     pub settings: SequenceSettings,
     pub video_tracks: Vec<Track>,
     pub audio_tracks: Vec<Track>,
@@ -1058,6 +1063,9 @@ impl SplitMarks {
 
 impl Sequence {
     pub fn duration(&self) -> Tick {
+        if self.program_extent == Some(ProgramExtentPolicy::Poema) {
+            return program_extent::poema_duration(self);
+        }
         let media = self.video_tracks.iter().chain(&self.audio_tracks).map(Track::end).max().unwrap_or(Tick::ZERO);
         media.max(self.caption_tracks.iter().map(CaptionTrack::end).max().unwrap_or(Tick::ZERO))
     }
@@ -1532,6 +1540,7 @@ impl Project {
     /// Create an empty sequence with `v` video and `a` audio tracks.
     pub fn new_sequence(&mut self, name: &str, settings: SequenceSettings, v: usize, a: usize, bin: Option<BinId>) -> ItemId {
         let mut seq = Sequence {
+            program_extent: None,
             settings,
             video_tracks: Vec::new(),
             audio_tracks: Vec::new(),

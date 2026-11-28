@@ -626,3 +626,24 @@ validate or restore old names inside that same private transaction. This native
 prerequisite alone does not migrate a host caller, configure a Poema track, import
 media or enable a real film. Existing lifetime/read-ticket/owner/revision and
 whole-project scope fences remain in force.
+
+
+### Optional native program extent (B3b4b prerequisite)
+
+`poema.setExtentPolicy {policy:"poema"|"native"}` is a bounded native sequence
+command. The policy is stored in `Sequence.program_extent`, cloned/checked,
+serialized in schema20 and restored by native Undo/Redo. It is admitted to the
+same active/scoped guarded batches; unknown/missing/extra arguments refuse.
+`native` removes the override; ordinary sequences and older files keep the
+existing furthest-item/caption duration. No ordinary editor default changes.
+
+`poema` uses the first video track's end or a harness-protected audio item's
+end when that spine has picture; without spine picture, sound defines the
+program. Free audio/overlay/caption tails do not extend it. All values derive
+from actual native items in integer ticks, including after split/trim/Undo.
+There is no stored duration overlay or Node timeline. UI transport and export
+use the same `Sequence::duration`. This is an internal integration policy,
+not a new UI widget or a claim of complete Poema rollout.
+
+Acceptance and full suite results must be reported before the paired host
+profile is enabled. Legacy adapters/default-OFF behavior stay unchanged.
