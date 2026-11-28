@@ -188,6 +188,32 @@ fn effect_and_pan_automation_on_the_block_grid() {
     assert!(whole[1][0].abs() < 1e-6 && whole[0][4799].abs() < 1e-3);
 }
 
+/// Clip Volume follows the source-clock ramp at every sample, even away from the 64-sample
+/// processing grid. The oracle is the analytic dB ramp, not the parameter evaluator under test.
+#[test]
+fn animated_clip_volume_is_sample_accurate_and_request_invariant() {
+    for (start, source, speed) in [(0, 0, 1.0), (37, 1200, 1.0), (37, 1200, 2.0)] {
+        let mut r = Rig::new(&[dc]);
+        {
+            let it = &mut r.track(0).items[0];
+            it.start = Tick::from_units(start, SR);
+            it.source_in = Tick::from_units(source, SR);
+            it.speed = speed;
+            it.effect_mut("volume").unwrap().param_mut("level").unwrap().keyframes = vec![kf(source, -12.0), kf(source + 4800, 0.0)];
+        }
+        let whole = r.mix(start, 3000);
+        for (i, (&left, &right)) in whole[0].iter().zip(&whole[1]).enumerate() {
+            let db = -12.0 + 12.0 * (i as f64 * speed / 4800.0).min(1.0);
+            let expected = 0.5 * 10f64.powf(db / 20.0);
+            assert!((f64::from(left) - expected).abs() < 1e-6, "start={start} source={source} speed={speed} sample={i}: {left} vs {expected}");
+            assert_eq!(left, right);
+        }
+        for sizes in [&[1usize, 63, 64, 65][..], &[333], &[7, 1024, 5]] {
+            assert_eq!(r.mix_cut(start, 3000, sizes, None), whole, "start={start} source={source} speed={speed} cut={sizes:?}");
+        }
+    }
+}
+
 #[test]
 fn clip_volume_and_track_automation_both_apply() {
     let mut r = Rig::new(&[dc]);
