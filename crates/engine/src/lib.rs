@@ -48,6 +48,9 @@ mod poema_human_trim;
 mod poema_metadata;
 mod poema_monitor;
 mod poema_scalar_curve;
+mod poema_sequences;
+#[cfg(test)]
+mod poema_sequences_tests;
 mod poema_track_curve;
 pub mod presets;
 pub mod previews;

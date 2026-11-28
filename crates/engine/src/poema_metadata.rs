@@ -33,6 +33,8 @@ struct Metadata {
 #[serde(deny_unknown_fields)]
 struct Request {
     metadata: Metadata,
+    #[serde(default)]
+    sequence: Option<u64>,
 }
 fn identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= 160 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
@@ -55,8 +57,9 @@ pub(crate) fn set(s: &mut Session, params: &Value) -> Result<Value> {
             return Err(bad("poema.setSequenceMetadata", "native geometry/topology cannot be stored in root annotations"));
         }
     }
-    let sequence = s.state.active_sequence.ok_or_else(|| bad("poema.setSequenceMetadata", "no active sequence"))?;
-    let q = s.active_sequence().ok_or_else(|| bad("poema.setSequenceMetadata", "no active sequence"))?;
+    let sequence =
+        request.sequence.map(filmcraft_project::ItemId).or(s.state.active_sequence).ok_or_else(|| bad("poema.setSequenceMetadata", "no target sequence"))?;
+    let q = s.project.sequence(sequence).ok_or_else(|| bad("poema.setSequenceMetadata", "target is not a sequence"))?;
     let frame = meta.settings.get("frame").filter(|v| !v.is_null()).unwrap_or(&meta.settings);
     let width = frame.get("width").and_then(Value::as_u64);
     let height = frame.get("height").and_then(Value::as_u64);
