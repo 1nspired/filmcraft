@@ -23,6 +23,91 @@ struct Point {
     #[serde(default)]
     out_handle: Option<[f64; 2]>,
 }
+pub(crate) const CURVE_BY: &str = "poema.gainCurve.by.v1";
+pub(crate) const CURVE_PRESENT: &str = "poema.gainCurve.present.v1";
+pub(crate) const CURVE_BASIS: &str = "poema.gainCurve.basis.v1";
+/// Only tagged Poema Volume curves gain editorial human intent. Ordinary
+/// FilmCraft clips/parameters and staged agent operations retain their behavior.
+pub(crate) fn human_curve_target(item: &filmcraft_project::TrackItem, effect: &Value, param: &str, p: &Value) -> bool {
+    if param != "level" || !p.get("mask").is_none_or(Value::is_null) {
+        return false;
+    }
+    let Some(identity) = item.identity.as_ref().filter(|i| i.annotations.contains_key(crate::poema_metadata::KEY)) else {
+        return false;
+    };
+    let e = match effect {
+        Value::Number(n) => n.as_u64().and_then(|i| usize::try_from(i).ok()).and_then(|i| item.effects.get(i)),
+        Value::String(id) => item.effects.iter().find(|e| &e.effect == id),
+        _ => None,
+    };
+    e.is_some_and(|e| {
+        e.effect == "volume"
+            && (e.params.get("level").is_some_and(|v| v.keyframes.iter().any(|k| k.interp == Interpolation::Cubic))
+                || identity.annotations.contains_key(CURVE_BY))
+    })
+}
+/// Cross-language SHA-256 over scalar bytes, never numeric editorial state.
+pub(crate) fn curve_basis(p: &filmcraft_project::Param) -> Result<String> {
+    use sha2::Digest;
+    let float = |v: &ParamValue| match v {
+        ParamValue::Float(n) if n.is_finite() => Ok(*n),
+        _ => Err(bad(CMD, "curve basis requires finite Float values")),
+    };
+    if p.keyframes.len() > 4096 {
+        return Err(bad(CMD, "curve basis exceeds point bound"));
+    }
+    let mut h = sha2::Sha256::new();
+    h.update(b"poema-clip-gain-curve-v1\0");
+    h.update(float(&p.value)?.to_le_bytes());
+    h.update((p.keyframes.len() as u32).to_le_bytes());
+    for k in &p.keyframes {
+        h.update(k.time.0.to_le_bytes());
+        h.update(float(&k.value)?.to_le_bytes());
+        h.update([match k.interp {
+            Interpolation::Linear => 0,
+            Interpolation::Hold => 1,
+            Interpolation::Bezier => 2,
+            Interpolation::AutoBezier => 3,
+            Interpolation::ContinuousBezier => 4,
+            Interpolation::EaseIn => 5,
+            Interpolation::EaseOut => 6,
+            Interpolation::Cubic => 7,
+        }]);
+        h.update(k.out_influence.to_le_bytes());
+        h.update(k.in_influence.to_le_bytes());
+        for raw in [k.in_handle, k.out_handle] {
+            if let Some(v) = raw {
+                h.update([1]);
+                h.update(v[0].to_le_bytes());
+                h.update(v[1].to_le_bytes());
+            } else {
+                h.update([0]);
+            }
+        }
+    }
+    Ok(format!("{:x}", h.finalize()))
+}
+
+pub(crate) fn mark_human_curve(item: &mut filmcraft_project::TrackItem, human: bool) -> Result<()> {
+    if !human {
+        return Ok(());
+    }
+    let present = item.effect("volume").and_then(|e| e.param("level")).is_some_and(|p| !p.keyframes.is_empty());
+    let basis = item.effect("volume").and_then(|e| e.param("level")).ok_or_else(|| bad(CMD, "curve parameter disappeared"))?;
+    let basis = curve_basis(basis)?;
+    let Some(identity) = item.identity.as_mut() else {
+        return Ok(());
+    };
+    if present {
+        identity.protection = Some("human".into());
+    } // Legacy curve clear does not pin.
+    identity.annotations.insert(CURVE_BY.into(), "human".into());
+    identity.annotations.insert(CURVE_PRESENT.into(), present.to_string());
+    identity.annotations.insert(CURVE_BASIS.into(), basis);
+    identity.validate().map_err(|e| bad(CMD, e))?;
+    Ok(())
+}
+
 pub(crate) fn handle(value: &Value) -> Result<Option<[f64; 2]>> {
     if value.is_null() {
         return Ok(None);
@@ -220,5 +305,71 @@ mod tests {
         assert!(s.execute("effects.setKeyframe", json!({"clip":c,"effect":e,"param":"level","mediaTime":0,"value":-9,"outHandle":[0.2,1e7]})).is_err());
         assert!(Arc::ptr_eq(&s.project, &before));
         assert_eq!(s.revision, rev);
+    }
+    fn tagged(s: &mut Session, c: u64) {
+        let mut ann = serde_json::Map::new();
+        ann.insert(crate::poema_metadata::KEY.into(), json!(r#"{"schema":1,"fields":[],"props":{}}"#));
+        ann.insert(CURVE_BY.into(), json!("fixture"));
+        ann.insert(CURVE_PRESENT.into(), json!("true"));
+        s.execute("poema.setCarrier",json!({"clip":c,"identity":{"id":"scalar-provenance","protection":"agent","annotations":ann,"handoffSpans":[{"carrier":"poema:sel_curve","sourceIn":"0","sourceOut":"508032000000"}]}})).unwrap();
+    }
+    #[test]
+    fn human_scalar_edits_stamp_by_and_pin_in_the_same_native_undo() {
+        let (mut s, c, e) = demo();
+        s.execute(CMD, request(c, e)).unwrap();
+        tagged(&mut s, c);
+        let before = serde_json::to_value(&s.project).unwrap();
+        let depth = s.history.undo.len();
+        s.execute("effects.setKeyframe", json!({"clip":c,"effect":e,"param":"level","mediaTime":0,"value":-15})).unwrap();
+        let id = s.active_sequence().unwrap().find_item(ClipId(c)).unwrap().1.identity.as_ref().unwrap();
+        assert_eq!(id.protection.as_deref(), Some("human"));
+        assert_eq!(id.annotations[CURVE_BY], "human");
+        assert_eq!(id.annotations[CURVE_PRESENT], "true");
+        assert_eq!(id.handoff_spans[0].carrier, "poema:sel_curve");
+        assert_eq!(s.history.undo.len(), depth + 1);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
+        s.execute("effects.setParam", json!({"clip":c,"effect":e,"param":"level","time":0,"value":-15})).unwrap();
+        assert_eq!(s.active_sequence().unwrap().find_item(ClipId(c)).unwrap().1.identity.as_ref().unwrap().annotations[CURVE_BY], "human");
+    }
+    #[test]
+    fn human_curve_clear_intent_is_native_and_undoable() {
+        let (mut s, c, e) = demo();
+        s.execute(CMD, request(c, e)).unwrap();
+        tagged(&mut s, c);
+        let before = serde_json::to_value(&s.project).unwrap();
+        s.execute("effects.toggleAnimation", json!({"clip":c,"effect":e,"param":"level"})).unwrap();
+        let id = s.active_sequence().unwrap().find_item(ClipId(c)).unwrap().1.identity.as_ref().unwrap();
+        assert_eq!(id.annotations[CURVE_PRESENT], "false");
+        assert_eq!(id.protection.as_deref(), Some("agent"));
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
+    }
+    #[test]
+    fn staged_agent_and_ordinary_native_curves_do_not_gain_human_provenance() {
+        let (mut s, c, e) = demo();
+        s.execute(CMD, request(c, e)).unwrap();
+        tagged(&mut s, c);
+        s.agent_bridge.staging = true;
+        s.execute("effects.setKeyframe", json!({"clip":c,"effect":e,"param":"level","mediaTime":0,"value":-15})).unwrap();
+        s.agent_bridge.staging = false;
+        assert_eq!(s.active_sequence().unwrap().find_item(ClipId(c)).unwrap().1.identity.as_ref().unwrap().annotations[CURVE_BY], "fixture");
+        let (mut ordinary, c, e) = demo();
+        ordinary.execute(CMD, request(c, e)).unwrap();
+        ordinary.execute("effects.setKeyframe", json!({"clip":c,"effect":e,"param":"level","mediaTime":0,"value":-15})).unwrap();
+        assert!(ordinary.active_sequence().unwrap().find_item(ClipId(c)).unwrap().1.identity.is_none());
+    }
+    #[test]
+    fn curve_basis_has_a_fixed_independent_cross_language_vector() {
+        let mut p = filmcraft_project::Param::new(ParamValue::Float(0.0));
+        for (time, value) in [(0, -18.0), (508032000000, -6.0)] {
+            let mut k = Keyframe::new(Tick(time), ParamValue::Float(value));
+            k.interp = Interpolation::Cubic;
+            p.keyframes.push(k);
+        }
+        assert_eq!(curve_basis(&p).unwrap(), "b46deaa0b26e2f7eaf75cc77370b3221bb5228abfee13f4b4a46cfe4733a7e67");
+        let before = curve_basis(&p).unwrap();
+        p.keyframes[0].out_handle = Some([0.3, 4.0]);
+        assert_ne!(curve_basis(&p).unwrap(), before);
     }
 }
