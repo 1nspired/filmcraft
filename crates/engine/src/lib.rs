@@ -44,6 +44,7 @@ mod poema_audio_fades;
 mod poema_audio_law;
 mod poema_channel_sum;
 mod poema_extent;
+mod poema_human_trim;
 mod poema_metadata;
 mod poema_monitor;
 mod poema_scalar_curve;

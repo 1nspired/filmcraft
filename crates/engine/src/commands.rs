@@ -2651,11 +2651,13 @@ fn build() -> Vec<CommandSpec> {
                     .or_else(|| p.get("deltaFrames").and_then(Value::as_i64).map(|f| s.sequence_rate().tick_of(f)))
                     .unwrap_or_default();
                 let clips = with_links(s, &[c]);
+                let human = !s.agent_bridge.staging;
                 let applied = s.edit_sequence(if mode == TrimMode::Ripple { "Ripple Trim" } else { "Trim" }, |q, ctx, st| {
                     if q.find_item(c).is_some_and(|(t, _)| q.track(t).is_some_and(|tr| tr.locked)) {
                         return Err(edit::EditError::Locked.into());
                     }
                     let before = q.find_item(c).map(|(_, i)| i.range());
+                    let protection = crate::poema_human_trim::capture(q, &clips, human);
                     // clamp across all linked partners, then apply the common delta
                     let mut dd = clamp_trim_linked(q, &clips, edge, mode, d, ctx)?;
                     if mode == TrimMode::Ripple {
@@ -2686,6 +2688,7 @@ fn build() -> Vec<CommandSpec> {
                             }
                         }
                     }
+                    crate::poema_human_trim::protect(q, protection);
                     Ok(dd)
                 })?;
                 Ok(json!({"delta": applied.0}))

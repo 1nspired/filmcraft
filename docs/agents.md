@@ -647,3 +647,7 @@ not a new UI widget or a claim of complete Poema rollout.
 
 Acceptance and full suite results must be reported before the paired host
 profile is enabled. Legacy adapters/default-OFF behavior stay unchanged.
+
+### Poema native human trim protection
+
+For a sequence explicitly using the Poema program policy, a direct `timeline.trim` marks actually changed identity-bearing target clips as human protected inside that command's clone/check/Undo. Untouched/locked targets, no-op geometry, ordinary native sequences and clips without identity retain their prior behavior. Agent-staged commands remain agent edits and do not acquire an automatic human pin. Source/record/carrier data is not rewritten by this annotation. Other direct human commands require their own integration proof.
