@@ -23,7 +23,7 @@ impl Write for Bounded {
         Ok(())
     }
 }
-fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>> {
+pub(crate) fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>> {
     let mut out = Bounded::default();
     serde_json::to_writer(&mut out, value).map_err(|e| bad("agent.document", e.to_string()))?;
     Ok(out.0)

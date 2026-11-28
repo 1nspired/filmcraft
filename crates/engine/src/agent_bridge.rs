@@ -61,7 +61,8 @@ impl CommandJournal {
 }
 
 pub(crate) struct BridgeState {
-    owner: u64,
+    pub(crate) owner: u64,
+    pub(crate) previews: crate::agent_preview::PreviewState,
     serial: u64,
     tickets: BTreeMap<Option<filmcraft_project::ItemId>, String>,
     read_revision: u64,
@@ -72,6 +73,7 @@ impl Default for BridgeState {
     fn default() -> Self {
         Self {
             owner: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
+            previews: Default::default(),
             serial: 0,
             tickets: BTreeMap::new(),
             read_revision: 0,
@@ -102,7 +104,7 @@ pub(crate) fn read_token(s: &mut Session, sequence: Option<filmcraft_project::It
     b.tickets.insert(sequence, token.clone());
     Ok(token)
 }
-fn guard(s: &Session, p: &Value, command: &str) -> Result<()> {
+pub(crate) fn guard(s: &Session, p: &Value, command: &str) -> Result<()> {
     if p["token"].as_str().is_none()
         || p["token"].as_str() != s.agent_bridge.tickets.get(&s.state.active_sequence).map(String::as_str)
         || s.revision != s.agent_bridge.read_revision
@@ -160,6 +162,10 @@ fn allowed(id: &str) -> bool {
 }
 fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     guard(s, p, "agent.apply")?;
+    let (staged, results, label) = stage(s, p)?;
+    commit_prepared(s, p, &label, staged.project, staged.state, results)
+}
+pub(crate) fn stage(s: &Session, p: &Value) -> Result<(Session, Vec<Value>, String)> {
     let ops: Vec<Operation> = serde_json::from_value(p["operations"].clone()).map_err(|e| bad("agent.apply", e.to_string()))?;
     if ops.is_empty() || ops.len() > 256 || ops.iter().any(|o| !allowed(&o.command)) {
         return Err(bad("agent.apply", "batch needs 1..256 audited, in-memory edit operations"));
@@ -174,6 +180,7 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     staged.project = s.project.clone();
     staged.state = s.state.clone();
     staged.media = s.media.clone();
+    staged.prefs = s.prefs.clone();
     let mut results = Vec::new();
     for op in ops {
         results.push(staged.execute(&op.command, op.params)?);
@@ -183,10 +190,18 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
             q.check().map_err(crate::EngineError::Other)?;
         }
     }
-    let project = (*staged.project).clone();
-    let state = staged.state.clone();
+    Ok((staged, results, label.to_owned()))
+}
+pub(crate) fn commit_prepared(
+    s: &mut Session,
+    p: &Value,
+    label: &str,
+    project: Arc<filmcraft_project::Project>,
+    state: crate::EditorState,
+    results: Vec<Value>,
+) -> Result<Value> {
     s.edit(label, |p, st| {
-        *p = project;
+        *p = (*project).clone();
         *st = state;
         Ok(())
     })?;
@@ -268,6 +283,9 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec("agent.snapshot", "Read guarded native sequence", snapshot, false),
         spec("agent.document", "Read lossless native project", crate::native_document::read, false),
         spec("agent.apply", "Apply guarded Poema batch", apply, true),
+        spec("agent.preview", "Preview isolated Poema batch", crate::agent_preview::preview, false),
+        spec("agent.commitPreview", "Commit checked Poema preview", crate::agent_preview::commit, true),
+        spec("agent.discardPreview", "Discard Poema preview", crate::agent_preview::discard, false),
         spec("agent.undo", "Undo owned Poema batch", |s, p| history(s, p, false), true),
         spec("agent.redo", "Redo owned Poema batch", |s, p| history(s, p, true), true),
         spec("poema.setCarrier", "Stamp timed Poema ids", carrier, true),

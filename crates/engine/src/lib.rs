@@ -12,6 +12,7 @@
 
 pub mod aaf_omf;
 pub mod agent_bridge;
+mod agent_preview;
 pub mod autosave;
 pub mod captions;
 pub mod clip_ops;
