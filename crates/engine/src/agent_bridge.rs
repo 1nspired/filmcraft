@@ -5,6 +5,7 @@ use crate::{Result, Session};
 use filmcraft_project::{ClipId, ClipIdentity, ItemKind};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicU64, Ordering},
@@ -12,6 +13,7 @@ use std::sync::{
 };
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+const MAX_READ_TICKETS: usize = 128;
 #[derive(Default)]
 struct JournalState {
     ordinal: u64,
@@ -61,9 +63,8 @@ impl CommandJournal {
 pub(crate) struct BridgeState {
     owner: u64,
     serial: u64,
-    token: String,
+    tickets: BTreeMap<Option<filmcraft_project::ItemId>, String>,
     read_revision: u64,
-    read_sequence: Option<filmcraft_project::ItemId>,
     read_project: Weak<filmcraft_project::Project>,
     owned: Option<(String, u64, usize, bool, Weak<filmcraft_project::Project>)>,
 }
@@ -72,28 +73,39 @@ impl Default for BridgeState {
         Self {
             owner: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
             serial: 0,
-            token: String::new(),
+            tickets: BTreeMap::new(),
             read_revision: 0,
-            read_sequence: None,
             read_project: Weak::new(),
             owned: None,
         }
     }
 }
-fn read_token(s: &mut Session) -> Result<String> {
+fn read_token(s: &mut Session, sequence: Option<filmcraft_project::ItemId>) -> Result<String> {
     let b = &mut s.agent_bridge;
+    let same_project = b.read_project.upgrade().is_some_and(|p| Arc::ptr_eq(&p, &s.project));
+    if b.read_revision != s.revision || !same_project {
+        b.tickets.clear();
+        b.read_revision = s.revision;
+        b.read_project = Arc::downgrade(&s.project);
+    }
+    // A read of an unchanged basis must not invalidate another reader's plan.
+    if let Some(token) = b.tickets.get(&sequence) {
+        return Ok(token.clone());
+    }
+    // Refuse excess readers, rather than silently evicting a pending ticket.
+    if b.tickets.len() >= MAX_READ_TICKETS {
+        return Err(bad("agent.snapshot", "too many sequence read tickets for this revision"));
+    }
     b.serial = b.serial.checked_add(1).ok_or_else(|| bad("agent.snapshot", "read counter exhausted"))?;
     // An optimistic concurrency ticket, not an authentication credential.
-    b.token = format!("{:016x}{:016x}{:016x}", b.owner, s.revision, b.serial);
-    b.read_revision = s.revision;
-    b.read_project = Arc::downgrade(&s.project);
-    Ok(b.token.clone())
+    let token = format!("{:016x}{:016x}{:016x}", b.owner, s.revision, b.serial);
+    b.tickets.insert(sequence, token.clone());
+    Ok(token)
 }
 fn guard(s: &Session, p: &Value, command: &str) -> Result<()> {
-    if s.agent_bridge.token.is_empty()
-        || p["token"].as_str() != Some(&s.agent_bridge.token)
+    if p["token"].as_str().is_none()
+        || p["token"].as_str() != s.agent_bridge.tickets.get(&s.state.active_sequence).map(String::as_str)
         || s.revision != s.agent_bridge.read_revision
-        || s.state.active_sequence != s.agent_bridge.read_sequence
         || !s.agent_bridge.read_project.upgrade().is_some_and(|p| Arc::ptr_eq(&p, &s.project))
     {
         return Err(bad(command, "stale or foreign native read ticket; read again, do not replay the edit"));
@@ -101,9 +113,8 @@ fn guard(s: &Session, p: &Value, command: &str) -> Result<()> {
     Ok(())
 }
 fn snapshot(s: &mut Session, params: &Value) -> Result<Value> {
-    let token = read_token(s)?;
     let sequence_id = params["sequence"].as_u64().map(filmcraft_project::ItemId).or(s.state.active_sequence);
-    s.agent_bridge.read_sequence = sequence_id;
+    let token = read_token(s, sequence_id)?;
     let sequence = sequence_id.and_then(|id| s.project.sequence(id)).map(|q| {
         let track = |t: &filmcraft_project::Track| {
             let items: Vec<_> = t.items.iter().map(|c| {
@@ -178,7 +189,7 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
         *st = state;
         Ok(())
     })?;
-    let commit = format!("{}-{}", s.agent_bridge.token, s.revision);
+    let commit = format!("{}-{}", p["token"].as_str().unwrap_or_default(), s.revision);
     s.agent_bridge.owned = Some((commit.clone(), s.revision, s.history.undo.len(), false, Arc::downgrade(&s.project)));
     Ok(json!({"commit":commit,"revision":s.revision,"results":results}))
 }
@@ -277,6 +288,52 @@ mod tests {
     }
     fn trim(id: u64) -> Value {
         json!({"command":"timeline.trim","params":{"clip":id,"edge":"out","deltaFrames":-1}})
+    }
+    #[test]
+    fn watcher_reads_share_a_basis_without_cancelling_an_agent_plan() {
+        let mut s = demo();
+        let id = clip(&s);
+        let agent = s.execute("agent.snapshot", json!({})).unwrap();
+        for _ in 0..256 {
+            let watcher = s.execute("agent.snapshot", json!({})).unwrap();
+            assert_eq!(agent["token"], watcher["token"]);
+        }
+        let foreign = s.execute("agent.snapshot", json!({"sequence":u64::MAX})).unwrap();
+        assert_ne!(foreign["token"], agent["token"]);
+        assert!(s.execute("agent.apply", json!({"token":foreign["token"],"operations":[trim(id)]})).is_err());
+        let (_, events, _subscription) = s.command_journal.subscribe().unwrap();
+        let applied = s.execute("agent.apply", json!({"token":agent["token"],"operations":[trim(id)]})).unwrap();
+        assert_eq!(events.try_recv().unwrap()["command"], "agent.apply");
+        assert!(events.try_recv().is_err());
+        assert!(s.execute("agent.apply", json!({"token":agent["token"],"operations":[trim(id)]})).is_err());
+        let read = s.execute("agent.snapshot", json!({})).unwrap();
+        s.execute("agent.snapshot", json!({})).unwrap();
+        s.execute("agent.undo", json!({"token":read["token"],"commit":applied["commit"]})).unwrap();
+    }
+    #[test]
+    fn ticket_limit_refuses_new_readers_without_evicting_an_existing_basis() {
+        let mut s = demo();
+        let id = clip(&s);
+        let agent = s.execute("agent.snapshot", json!({})).unwrap();
+        for sequence in 0..(MAX_READ_TICKETS - 1) {
+            read_token(&mut s, Some(filmcraft_project::ItemId(u64::MAX - sequence as u64))).unwrap();
+        }
+        assert!(read_token(&mut s, None).is_err());
+        s.execute("agent.apply", json!({"token":agent["token"],"operations":[trim(id)]})).unwrap();
+        s.execute("agent.snapshot", json!({})).unwrap();
+        assert_eq!(s.agent_bridge.tickets.len(), 1);
+    }
+    #[test]
+    fn tickets_cannot_cross_sessions_or_the_active_sequence() {
+        let mut s = demo();
+        let id = clip(&s);
+        let read = s.execute("agent.snapshot", json!({})).unwrap();
+        let mut other = demo();
+        let other_id = clip(&other);
+        other.execute("agent.snapshot", json!({})).unwrap();
+        assert!(other.execute("agent.apply", json!({"token":read["token"],"operations":[trim(other_id)]})).is_err());
+        s.state.active_sequence = None;
+        assert!(s.execute("agent.apply", json!({"token":read["token"],"operations":[trim(id)]})).is_err());
     }
     #[test]
     fn a_read_ticket_cannot_cross_a_document_replacement_with_the_same_revision() {
