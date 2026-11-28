@@ -45,6 +45,7 @@ mod poema_audio_law;
 mod poema_channel_sum;
 mod poema_metadata;
 mod poema_monitor;
+mod poema_scalar_curve;
 pub mod presets;
 pub mod previews;
 pub mod project_manager;

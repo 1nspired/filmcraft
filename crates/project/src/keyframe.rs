@@ -111,6 +111,8 @@ pub enum Interpolation {
     Linear,
     Hold,
     Bezier,
+    /// Scalar cubic with native [seconds, value] tangent vectors.
+    Cubic,
     AutoBezier,
     ContinuousBezier,
     EaseIn,
@@ -118,9 +120,10 @@ pub enum Interpolation {
 }
 
 impl Interpolation {
-    pub const ALL: [Interpolation; 7] = [
+    pub const ALL: [Interpolation; 8] = [
         Interpolation::Linear,
         Interpolation::Bezier,
+        Interpolation::Cubic,
         Interpolation::AutoBezier,
         Interpolation::ContinuousBezier,
         Interpolation::Hold,
@@ -132,6 +135,7 @@ impl Interpolation {
             Interpolation::Linear => "Linear",
             Interpolation::Hold => "Hold",
             Interpolation::Bezier => "Bezier",
+            Interpolation::Cubic => "Cubic",
             Interpolation::AutoBezier => "Auto Bezier",
             Interpolation::ContinuousBezier => "Continuous Bezier",
             Interpolation::EaseIn => "Ease In",
@@ -152,6 +156,12 @@ pub struct Keyframe {
     pub out_influence: f64,
     #[serde(default = "default_influence")]
     pub in_influence: f64,
+    /// Cubic scalar tangent vectors: seconds and value delta, relative to this key.
+    /// Only Cubic uses them; older interpolation/defaults remain unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_handle: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_handle: Option<[f64; 2]>,
 }
 
 fn default_influence() -> f64 {
@@ -160,7 +170,15 @@ fn default_influence() -> f64 {
 
 impl Keyframe {
     pub fn new(time: Tick, value: ParamValue) -> Self {
-        Self { time, value, interp: Interpolation::Linear, out_influence: default_influence(), in_influence: default_influence() }
+        Self {
+            time,
+            value,
+            interp: Interpolation::Linear,
+            out_influence: default_influence(),
+            in_influence: default_influence(),
+            in_handle: None,
+            out_handle: None,
+        }
     }
 }
 
@@ -268,6 +286,12 @@ impl Param {
         if a.interp == Interpolation::Hold || !a.value.interpolates() {
             return a.value.clone();
         }
+        if a.interp == Interpolation::Cubic {
+            if let (ParamValue::Float(va), ParamValue::Float(vb)) = (&a.value, &b.value) {
+                return ParamValue::Float(scalar_cubic(a, b, t, *va, *vb));
+            }
+            return a.value.clone();
+        }
         let span = (b.time - a.time).0 as f64;
         let u = (t - a.time).0 as f64 / span;
         let e = ease(a, b, u);
@@ -309,6 +333,9 @@ impl Param {
         if a.interp == Interpolation::Hold || !matches!(a.value, ParamValue::Float(_)) {
             return va;
         }
+        if a.interp == Interpolation::Cubic {
+            return scalar_cubic(a, b, t, va, vb);
+        }
         let u = (t - a.time).0 as f64 / (b.time - a.time).0 as f64;
         va + (vb - va) * ease(a, b, u)
     }
@@ -324,6 +351,66 @@ impl Param {
     pub fn next_keyframe(&self, t: Tick) -> Option<Tick> {
         self.keyframes.iter().map(|k| k.time).find(|&k| k > t)
     }
+}
+
+/// Evaluate native scalar tangents in seconds/value space. Invert time with
+/// bounded Newton/bisection; clamped time handles keep this a function of time.
+/// Neither normalization by value difference nor endpoint equality may erase a hump.
+fn scalar_cubic(a: &Keyframe, b: &Keyframe, t: Tick, va: f64, vb: f64) -> f64 {
+    let fallback = if va.is_finite() { va } else { 0.0 };
+    let Some(span) = b.time.0.checked_sub(a.time.0).filter(|s| *s > 0) else { return fallback };
+    let Some(at) = t.0.checked_sub(a.time.0) else { return fallback };
+    let span = span as f64 / filmcraft_time::TICKS_PER_SECOND as f64;
+    let x = at as f64 / filmcraft_time::TICKS_PER_SECOND as f64;
+    if !va.is_finite() || !vb.is_finite() {
+        return fallback;
+    }
+    if a.out_handle.is_none() && b.in_handle.is_none() {
+        let v = va + (vb - va) * (x / span).clamp(0.0, 1.0);
+        return if v.is_finite() { v } else { fallback };
+    }
+    let h1 = a.out_handle.unwrap_or([span / 3.0, 0.0]);
+    let h2 = b.in_handle.unwrap_or([-span / 3.0, 0.0]);
+    if h1.into_iter().chain(h2).any(|v| !v.is_finite()) {
+        return fallback;
+    }
+    let (x1, x2) = (h1[0].clamp(0.0, span), span + h2[0].clamp(-span, 0.0));
+    let (y1, y2) = (va + h1[1], vb + h2[1]);
+    if !y1.is_finite() || !y2.is_finite() {
+        return fallback;
+    }
+    let cubic = |a: f64, b: f64, c: f64, d: f64, u: f64| {
+        let w = 1.0 - u;
+        w * w * w * a + 3.0 * w * w * u * b + 3.0 * w * u * u * c + u * u * u * d
+    };
+    let mut u = (x / span).clamp(0.0, 1.0);
+    let mut converged = false;
+    for _ in 0..8 {
+        let xt = cubic(0.0, x1, x2, span, u) - x;
+        if xt.abs() < 1e-5 {
+            converged = true;
+            break;
+        }
+        let w = 1.0 - u;
+        let dx = 3.0 * w * w * x1 + 6.0 * w * u * (x2 - x1) + 3.0 * u * u * (span - x2);
+        if dx.abs() < 1e-9 {
+            break;
+        }
+        u = (u - xt / dx).clamp(0.0, 1.0);
+    }
+    if !converged {
+        let (mut lo, mut hi) = (0.0, 1.0);
+        for _ in 0..32 {
+            u = (lo + hi) / 2.0;
+            if cubic(0.0, x1, x2, span, u) < x {
+                lo = u;
+            } else {
+                hi = u;
+            }
+        }
+    }
+    let value = cubic(va, y1, y2, vb, u);
+    if value.is_finite() { value } else { fallback }
 }
 
 /// Temporal easing for u∈[0,1] between two keyframes (1D cubic Bezier in time/value space).
@@ -413,5 +500,60 @@ mod tests {
         p.toggle_animation(Tick(5));
         assert!(!p.is_animated());
         assert_eq!(p.value, ParamValue::Float(2.0));
+    }
+}
+
+#[cfg(test)]
+mod cubic_tests {
+    use super::*;
+    fn curve(a: f64, b: f64) -> Param {
+        let mut p = Param::new(ParamValue::Float(a));
+        p.keyframes = vec![Keyframe::new(Tick::ZERO, ParamValue::Float(a)), Keyframe::new(Tick::from_seconds_f64(2.0), ParamValue::Float(b))];
+        for k in &mut p.keyframes {
+            k.interp = Interpolation::Cubic;
+        }
+        p
+    }
+    #[test]
+    fn equal_endpoints_keep_vertical_hump_and_missing_handles_stay_linear() {
+        let mut p = curve(0.0, 0.0);
+        p.keyframes[0].out_handle = Some([2.0 / 3.0, 6.0]);
+        p.keyframes[1].in_handle = Some([-2.0 / 3.0, 6.0]);
+        assert!((p.scalar_at(Tick::from_seconds_f64(1.0)) - 4.5).abs() < 1e-12);
+        assert_eq!(p.f64_at(Tick::from_seconds_f64(1.0)), p.scalar_at(Tick::from_seconds_f64(1.0)));
+        let linear = curve(-18.0, -6.0);
+        assert_eq!(linear.scalar_at(Tick::from_seconds_f64(0.5)), -15.0);
+    }
+    #[test]
+    fn old_keyframes_and_all_interpolations_round_trip_without_raw_defaults() {
+        let old = Keyframe::new(Tick::ZERO, ParamValue::Float(0.0));
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("in_handle").is_none());
+        assert!(json.get("out_handle").is_none());
+        let restored: Keyframe = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, old);
+        let mut p = curve(-18.0, -6.0);
+        p.keyframes[0].out_handle = Some([3.7, 2.3]);
+        p.keyframes[1].in_handle = Some([-9.1, -1.2]);
+        let restored: Param = serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+        assert_eq!(p, restored);
+        for i in 0..=200 {
+            let t = Tick::from_seconds_f64(i as f64 / 100.0);
+            assert_eq!(p.f64_at(t), p.scalar_at(t));
+            assert!(p.scalar_at(t).is_finite());
+        }
+    }
+    #[test]
+    fn malformed_cubic_values_or_wide_tick_spans_do_not_panic() {
+        let mut p = curve(1.0, 2.0);
+        p.keyframes[0].time = Tick(i64::MIN);
+        p.keyframes[1].time = Tick(i64::MAX);
+        assert_eq!(p.scalar_at(Tick::ZERO), 1.0);
+        assert_eq!(p.f64_at(Tick::ZERO), 1.0);
+        let mut p = curve(1.0, 2.0);
+        p.keyframes[0].out_handle = Some([f64::NAN, f64::MAX]);
+        assert_eq!(p.scalar_at(Tick::from_seconds_f64(1.0)), 1.0);
+        p.keyframes[0].value = ParamValue::Bool(true);
+        assert_eq!(p.value_at(Tick::from_seconds_f64(1.0)), ParamValue::Bool(true));
     }
 }
