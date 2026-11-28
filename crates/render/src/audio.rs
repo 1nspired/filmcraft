@@ -233,6 +233,7 @@ fn mix_item(
     };
     // gains: clip gain × Volume (keyframed, per 64-sample block) × channel volume × panner
     let clip_gain = db_to_gain(item.gain_db);
+    let envelope = crate::audio_envelope::Envelope::for_item(item, sr);
     let vol = item.effect("volume").filter(|e| e.enabled && !e.param("bypass").and_then(|p| p.value.as_bool()).unwrap_or(false));
     let chv = item.effect("channel_volume").filter(|e| e.enabled && !e.param("bypass").and_then(|p| p.value.as_bool()).unwrap_or(false));
     let pan = item.effect("panner").filter(|e| e.enabled);
@@ -260,7 +261,8 @@ fn mix_item(
         let end = (((a0 + blk as i64).div_euclid(64) + 1) * 64 - a0).min(n as i64) as usize;
         if w == 2 {
             for i in blk..end {
-                let (l, r) = (buf[0][i], buf[1][i]);
+                let envelope_gain = envelope.gain(a0 + i as i64 - item_s0);
+                let (l, r) = (buf[0][i] * envelope_gain, buf[1][i] * envelope_gain);
                 out.channels[0][off + i] += l * g * cl * pl;
                 out.channels[1][off + i] += r * g * cr * pr;
             }
@@ -272,7 +274,7 @@ fn mix_item(
                     _ => 1.0,
                 };
                 for i in blk..end {
-                    dst[off + i] += src[i] * gc;
+                    dst[off + i] += src[i] * gc * envelope.gain(a0 + i as i64 - item_s0);
                 }
             }
         }
