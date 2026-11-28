@@ -170,6 +170,7 @@ fn allowed(id: &str) -> bool {
             | "timeline.move"
             | "timeline.razor"
             | "timeline.place"
+            | "sequence.addTracks"
             | "edit.clear"
             | "poema.setCarrier"
             | "poema.setSequenceMetadata"
@@ -211,6 +212,15 @@ fn audited_move(p: &Value) -> bool {
             && seen.insert(clip)
     })
 }
+fn audited_audio_track(p: &Value) -> bool {
+    let Some(fields) = p.as_object() else { return false };
+    fields.len() == 5
+        && p.get("video").and_then(Value::as_u64) == Some(0)
+        && p.get("audio").and_then(Value::as_u64) == Some(1)
+        && p.get("submix").and_then(Value::as_u64) == Some(0)
+        && p.get("audioAfter").and_then(Value::as_str) == Some("last")
+        && p.get("audioType").and_then(Value::as_str) == Some("stereo")
+}
 fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     guard(s, p, "agent.apply")?;
     let (staged, results, label) = stage(s, p)?;
@@ -232,6 +242,9 @@ fn stage_inner(s: &Session, p: &Value, scope: Option<filmcraft_project::ItemId>)
     }
     if ops.iter().any(|o| o.command == "timeline.move" && !audited_move(&o.params)) {
         return Err(bad("agent.apply", "guarded timeline.move needs 1..4096 unique explicit clip/track/time moves, linked:false, insert:false, copy:false"));
+    }
+    if ops.iter().any(|o| o.command == "sequence.addTracks" && !audited_audio_track(&o.params)) {
+        return Err(bad("agent.apply", "guarded sequence.addTracks needs only video:0, audio:1, submix:0, audioAfter:last, audioType:stereo"));
     }
     let label = p["label"].as_str().unwrap_or("Poema edit");
     if label.is_empty() || label.len() > 256 {
@@ -801,5 +814,150 @@ mod tests {
             .is_err()
         );
         assert!(Arc::ptr_eq(&before, &s.project));
+    }
+}
+
+#[cfg(test)]
+mod appended_audio_track_tests {
+    use super::*;
+    use filmcraft_project::{AudioChannels, ItemId, Track, TrackId, TrackKind};
+
+    fn demo() -> Session {
+        let mut s = Session::default();
+        let (project, sequence) = crate::demo::demo_project(&s.media);
+        s.project = Arc::new(project);
+        s.state.active_sequence = Some(sequence);
+        s
+    }
+    fn operation() -> Value {
+        json!({"command":"sequence.addTracks","params":{"video":0,"audio":1,"submix":0,"audioAfter":"last","audioType":"stereo"}})
+    }
+    fn expected(before: &filmcraft_project::Project, sequence: ItemId) -> filmcraft_project::Project {
+        // Independent model reference; the host discovers numeric ids from
+        // the actual raw preview and never assumes the allocator's next id.
+        let mut result = before.clone();
+        let identity = TrackId(result.next_id);
+        result.next_id += 1;
+        let q = result.sequence_mut(sequence).unwrap();
+        let mut track = Track::new(identity, TrackKind::Audio, format!("Audio {}", q.audio_tracks.len() + 1));
+        track.channels = AudioChannels::Stereo;
+        q.audio_tracks.push(track);
+        result
+    }
+    fn state(s: &Session) -> Value {
+        serde_json::to_value((&s.state, &s.state.clipboard, &s.prefs)).unwrap()
+    }
+    #[test]
+    fn appended_stereo_track_preview_is_private_and_one_owned_undo_redo_matches_independent_project() {
+        let mut s = demo();
+        let before = s.project.clone();
+        let editor = state(&s);
+        let depth = s.history.undo.len();
+        let sequence = s.state.active_sequence.unwrap();
+        let expected = expected(&before, sequence);
+        let basis = s.execute("agent.snapshot", json!({})).unwrap();
+        let (_, events, _subscription) = s.command_journal.subscribe().unwrap();
+        let preview = s.execute("agent.preview", json!({"token":basis["token"],"operations":[operation()]})).unwrap();
+        assert!(Arc::ptr_eq(&before, &s.project));
+        assert_eq!(state(&s), editor);
+        assert_eq!(s.history.undo.len(), depth);
+        assert!(events.try_recv().is_err());
+        // A watcher reads the unchanged document while this plan is pending.
+        s.execute("agent.document", json!({})).unwrap();
+        let applied = s.execute("agent.commitPreview", json!({"token":basis["token"],"preview":preview["preview"]})).unwrap();
+        assert_eq!(serde_json::to_value(&s.project).unwrap(), serde_json::to_value(&expected).unwrap());
+        assert_eq!(state(&s), editor);
+        assert_eq!(s.history.undo.len(), depth + 1);
+        assert_eq!(applied["results"][0]["audio"][0], before.next_id);
+        assert_eq!(events.try_recv().unwrap()["command"], "agent.commitPreview");
+        let read = s.execute("agent.snapshot", json!({})).unwrap();
+        s.execute("agent.undo", json!({"token":read["token"],"commit":applied["commit"]})).unwrap();
+        assert!(Arc::ptr_eq(&before, &s.project));
+        assert_eq!(events.try_recv().unwrap()["command"], "agent.undo");
+        let read = s.execute("agent.snapshot", json!({})).unwrap();
+        s.execute("agent.redo", json!({"token":read["token"],"commit":applied["commit"]})).unwrap();
+        assert_eq!(serde_json::to_value(&s.project).unwrap(), serde_json::to_value(&expected).unwrap());
+        assert_eq!(events.try_recv().unwrap()["command"], "agent.redo");
+        assert!(events.try_recv().is_err());
+    }
+    #[test]
+    fn appended_audio_track_hostile_profiles_refuse_before_a_valid_prefix_and_human_command_is_unchanged() {
+        let mut s = demo();
+        let before = s.project.clone();
+        let editor = state(&s);
+        let revision = s.revision;
+        let depth = s.history.undo.len();
+        let basis = s.execute("agent.snapshot", json!({})).unwrap();
+        let clip = s.active_sequence().unwrap().video_tracks[0].items[0].id.0;
+        let (_, events, _subscription) = s.command_journal.subscribe().unwrap();
+        let good = operation()["params"].clone();
+        let mut bad = vec![Value::Null, json!([]), json!("track"), json!({})];
+        for (key, values) in [
+            ("audio", vec![json!(-1), json!(0), json!(2), json!(u64::MAX), json!(1.0), json!("1"), json!(true)]),
+            ("video", vec![json!(1), json!(null), json!(-1)]),
+            ("submix", vec![json!(1), json!(false)]),
+            ("audioAfter", vec![json!("first"), json!(0), json!(null)]),
+            ("audioType", vec![json!("mono"), json!("adaptive"), json!(null)]),
+            ("unproved", vec![json!(false)]),
+        ] {
+            for value in values {
+                let mut p = good.clone();
+                p[key] = value;
+                bad.push(p);
+            }
+        }
+        for key in ["video", "audio", "submix", "audioAfter", "audioType"] {
+            let mut p = good.clone();
+            p.as_object_mut().unwrap().remove(key);
+            bad.push(p);
+        }
+        for params in bad {
+            let result = s.execute("agent.preview", json!({"token":basis["token"],"operations":[{"command":"timeline.trim","params":{"clip":clip,"edge":"out","deltaFrames":-1}},{"command":"sequence.addTracks","params":params}]}));
+            assert!(result.is_err(), "{params}");
+            assert!(Arc::ptr_eq(&before, &s.project));
+            assert_eq!(state(&s), editor);
+            assert_eq!(s.revision, revision);
+            assert_eq!(s.history.undo.len(), depth);
+            assert!(events.try_recv().is_err());
+        }
+        let old = s.active_sequence().unwrap().audio_tracks.len();
+        s.execute("sequence.addTracks", json!({"video":0,"audio":2})).unwrap();
+        assert_eq!(s.active_sequence().unwrap().audio_tracks.len(), old + 2);
+    }
+    #[test]
+    fn inactive_appended_track_changes_only_its_sequence_and_retains_foreground_editor_state() {
+        let mut s = demo();
+        let active = s.state.active_sequence.unwrap();
+        let settings = s.active_sequence().unwrap().settings.clone();
+        let other = Arc::make_mut(&mut s.project).new_sequence("Inactive track fixture", settings, 1, 1, None);
+        let before = s.project.clone();
+        let editor = state(&s);
+        let expected = expected(&before, other);
+        let read = s.execute("agent.snapshot", json!({})).unwrap();
+        let preview = s.execute("agent.previewSequence", json!({"token":read["token"],"sequence":other.0,"operations":[operation()]})).unwrap();
+        assert!(Arc::ptr_eq(&before, &s.project));
+        assert_eq!(state(&s), editor);
+        let applied = s.execute("agent.commitPreview", json!({"token":read["token"],"preview":preview["preview"]})).unwrap();
+        assert_eq!(serde_json::to_value(&s.project).unwrap(), serde_json::to_value(&expected).unwrap());
+        assert_eq!(s.state.active_sequence, Some(active));
+        assert_eq!(state(&s), editor);
+        let read = s.execute("agent.snapshot", json!({})).unwrap();
+        s.execute("agent.undo", json!({"token":read["token"],"commit":applied["commit"]})).unwrap();
+        assert!(Arc::ptr_eq(&before, &s.project));
+    }
+    #[test]
+    fn discarded_or_editor_stale_appended_track_preview_cannot_allocate_a_live_track() {
+        let mut s = demo();
+        let before = s.project.clone();
+        let read = s.execute("agent.snapshot", json!({})).unwrap();
+        let preview = s.execute("agent.preview", json!({"token":read["token"],"operations":[operation()]})).unwrap();
+        s.execute("agent.discardPreview", json!({"preview":preview["preview"]})).unwrap();
+        assert!(s.execute("agent.commitPreview", json!({"token":read["token"],"preview":preview["preview"]})).is_err());
+        let preview = s.execute("agent.preview", json!({"token":read["token"],"operations":[operation()]})).unwrap();
+        s.state.linked_selection = !s.state.linked_selection;
+        let editor = state(&s);
+        assert!(s.execute("agent.commitPreview", json!({"token":read["token"],"preview":preview["preview"]})).is_err());
+        assert!(Arc::ptr_eq(&before, &s.project));
+        assert_eq!(state(&s), editor);
     }
 }
