@@ -481,3 +481,24 @@ history and journal. Neither live project nor staged audio is rewritten by the
 comparison; the ordinary renderer is unchanged. Projects with no supported
 optional envelope retain the exact existing comparison. `agent.apply` retains
 its existing commit semantics; this rule belongs to preview/commitPreview.
+
+
+### Explicit native audio laws
+
+`poema.setAudioLaw {track, stereoBalance, monoSource}` sets physical native
+mixer state on an unlocked audio track. Both fields are required:
+`stereoBalance` is `equalPower` or `linear`; `monoSource` is `dualMono` or
+`equalPower`. It uses the normal command, guarded preview/batch, clone/check,
+Undo and journal path. Unknown fields/enums and video/locked targets refuse.
+
+Defaults preserve existing FilmCraft behavior, including deserializing older
+files. Poema candidate imports explicitly select linear stereo balance and
+an equal-power mono-source upmix. The latter applies before nonlinear clip
+DSP, only for an actual mono source feeding stereo. Static linear balance uses
+the existing Poema dead zone and four-decimal coefficients; automated balance
+uses continuous linear coefficients. Ordinary native pan and source defaults
+are unchanged. These are renderer/mixer fields, not editorial annotations or
+host DSP. Schema 18 prevents older readers from silently losing these laws;
+the 17-to-18 migration preserves old values/defaults. Existing schema steps,
+licenses and notices are unchanged. Host import/readBack and PCM parity are
+qualified separately against unchanged Poema rendering.

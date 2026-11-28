@@ -48,7 +48,7 @@ use filmcraft_audio_dsp::AudioEffect;
 use filmcraft_audio_dsp::channels::{self as chans, Layout, Mixdown, Pan51};
 use filmcraft_frame::AudioBuffer;
 use filmcraft_project::mixer::{LANE_MUTE, LANE_PAN, LANE_PAN51_CENTER, LANE_PAN51_LFE, LANE_PAN51_X, LANE_PAN51_Y, LANE_VOLUME, fx_lane, send_lane};
-use filmcraft_project::{AudioChannels, EffectInstance, InputMap, Param, ParamValue, Project, Sequence, Track, TrackId};
+use filmcraft_project::{AudioChannels, EffectInstance, InputMap, Param, ParamValue, Project, Sequence, StereoBalanceLaw, Track, TrackId};
 use filmcraft_time::Tick;
 use rayon::prelude::*;
 
@@ -703,6 +703,30 @@ fn apply_pan(buf: &mut Bus, lane: &Lane, c0: i64, sr: u32, law: fn(f32) -> (f32,
     }
 }
 
+// The static Poema balance keeps its unchanged dead zone and four-decimal
+// coefficients. Dynamic curves use continuous linear balance, like panGraph.
+fn linear_gains(pan: f64, static_value: bool) -> (f32, f32) {
+    let p = pan.clamp(-1.0, 1.0);
+    if static_value && p.abs() < 0.001 {
+        return (1.0, 1.0);
+    }
+    let value = |v: f64| if static_value { (crate::decimal::rounded_positive(v, 10000) as f64 / 10000.0) as f32 } else { v as f32 };
+    (value(1.0 - p.max(0.0)), value(1.0 + p.min(0.0)))
+}
+fn apply_linear_balance(buf: &mut Bus, lane: &Lane, c0: i64, sr: u32) {
+    if let Some(p) = lane.constant() {
+        let (l, r) = linear_gains(p / 100.0, true);
+        buf[0].iter_mut().for_each(|v| *v *= l);
+        buf[1].iter_mut().for_each(|v| *v *= r);
+    } else {
+        for i in 0..buf[0].len() {
+            let (l, r) = linear_gains(lane.at(Tick::from_units(c0 + i as i64, sr as i64)) / 100.0, false);
+            buf[0][i] *= l;
+            buf[1][i] *= r;
+        }
+    }
+}
+
 struct StripOut {
     /// (route index in the plan, delayed signal at the target's width)
     routes: Vec<(usize, Bus)>,
@@ -830,7 +854,11 @@ fn run_strip(plan: &Plan, si: usize, st: &mut StripState, mut buf: Bus, x0: i64,
             buf = convert_width(&buf, layout, 2);
         }
         let pan = Lane::new(tr, id, LANE_PAN, ovs);
-        apply_pan(&mut buf, &pan, c_c, sr, if mono { pan_law_mono } else { balance }, &mut scratch);
+        if !mono && tr.mixer.stereo_balance == StereoBalanceLaw::Linear {
+            apply_linear_balance(&mut buf, &pan, c_c, sr);
+        } else {
+            apply_pan(&mut buf, &pan, c_c, sr, if mono { pan_law_mono } else { balance }, &mut scratch);
+        }
     }
     send(Tap::Out, &buf, c_c, &mut scratch, st, &mut outs);
     StripOut { routes: outs, meter, out: None }
@@ -952,4 +980,17 @@ pub(crate) fn mix_graph_at(
         l.post_meters(&meters);
     }
     AudioBuffer { sample_rate: sr, channels: out.into_iter().map(|c| c[skip..].to_vec()).collect() }
+}
+
+#[cfg(test)]
+mod audio_law_tests {
+    use super::*;
+    #[test]
+    fn explicit_linear_balance_keeps_static_dead_zone_and_coefficients() {
+        assert_eq!(linear_gains(0.25, true), (0.75, 1.0));
+        assert_eq!(linear_gains(-0.5, true), (1.0, 0.5));
+        assert_eq!(linear_gains(0.000999999, true), (1.0, 1.0));
+        assert!(linear_gains(0.000999999, false).0 < 1.0);
+        assert_ne!(linear_gains(0.25, true), balance(0.25));
+    }
 }

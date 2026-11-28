@@ -13,22 +13,9 @@ pub(crate) struct Envelope {
 // ECMAScript toFixed(3), for finite nonnegative bounded timeline seconds:
 // round the actual binary64 rational, not an already-rounded x * 1000.
 fn milliseconds(value: f64) -> i64 {
-    if !value.is_finite() || value <= 0.0 {
-        return 0;
-    }
-    let bits = value.to_bits();
-    let power = ((bits >> 52) & 0x7ff) as i32 - 1023 - 52;
-    let numerator = (((bits & ((1u64 << 52) - 1)) | (1u64 << 52)) as u128) * 1000;
-    if power >= 0 {
-        return numerator.checked_shl(power as u32).unwrap_or(i64::MAX as u128).min(i64::MAX as u128) as i64;
-    }
-    let shift = (-power) as u32;
-    if shift >= 128 {
-        return 0;
-    }
-    let denominator = 1u128 << shift;
-    ((numerator / denominator) + u128::from(numerator % denominator >= denominator / 2)).min(i64::MAX as u128) as i64
+    crate::decimal::rounded_positive(value, 1000)
 }
+
 fn samples(microseconds: i64, rate: u32) -> i64 {
     ((microseconds as i128 * rate as i128 + 500_000) / 1_000_000).min(i64::MAX as i128) as i64
 }

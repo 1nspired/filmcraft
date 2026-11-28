@@ -97,8 +97,12 @@ pub(crate) fn track_input_at(
     depth: u32,
 ) -> AudioBuffer {
     let w = crate::mixer::width_of(track.channels);
-    let live =
-        ClipLive { vol: ovs.get(&(track.id, CLIP_LANE_VOLUME.to_string())).copied(), pan: ovs.get(&(track.id, CLIP_LANE_PAN.to_string())).copied(), depth };
+    let live = ClipLive {
+        vol: ovs.get(&(track.id, CLIP_LANE_VOLUME.to_string())).copied(),
+        pan: ovs.get(&(track.id, CLIP_LANE_PAN.to_string())).copied(),
+        depth,
+        mono_equal_power: track.mixer.mono_source == filmcraft_project::MonoSourceLaw::EqualPower,
+    };
     let range = TimeRange::from_bounds(Tick::from_units(start, sr as i64), Tick::from_units(start + frames as i64, sr as i64));
     let mut tbuf = AudioBuffer::silence(sr, w, frames);
     for item in track.items.iter().filter(|i| i.enabled && i.range().overlaps(&range)) {
@@ -167,6 +171,7 @@ fn with_handles(item: &TrackItem, t0: Tick, t1: Tick) -> TrackItem {
 /// Held Clip Mixer controls of one track.
 #[derive(Default)]
 struct ClipLive {
+    mono_equal_power: bool,
     vol: Option<Override>,
     pan: Option<Override>,
     /// How many nested sequences deep this track is ([`crate::MAX_NEST_DEPTH`] ends the descent).
@@ -206,6 +211,14 @@ fn mix_item(
     }
     let w = out.channels.len();
     let n = (a1 - a0) as usize;
+    let mono_gain = if live.mono_equal_power
+        && w == 2
+        && sources.source(item.item).is_some_and(|src| src.info().audio_streams.get(item.audio_stream).is_some_and(|a| a.channels == 1))
+    {
+        std::f32::consts::FRAC_1_SQRT_2
+    } else {
+        1.0
+    };
     let buf = if let Some(nested) = project.sequence(item.item) {
         // Past the depth limit a nest is silent, like its picture is empty, so a sequence that
         // contains itself (a damaged project; the editor refuses to make one) cannot recurse
@@ -223,13 +236,13 @@ fn mix_item(
         // The nested sequence is the clip's source: speed, reverse and clip effects apply to its
         // mix exactly as they do to a media clip's sound.
         let read = |m0: i64, len: usize| Some(nested_mix(project, &q, m0, len, sr, sources, w, live.depth));
-        effected(item, &read, a0, n, sr, w)
+        effected(item, &read, a0, n, sr, w, 1.0)
     } else {
         let Some(src) = sources.source(item.item) else { return };
         if !src.info().has_audio() {
             return;
         }
-        effected(item, &|m0, len| src.audio_stream(item.audio_stream, m0, len, sr).ok(), a0, n, sr, w)
+        effected(item, &|m0, len| src.audio_stream(item.audio_stream, m0, len, sr).ok(), a0, n, sr, w, mono_gain)
     };
     // gains: clip gain × Volume (keyframed, per 64-sample block) × channel volume × panner
     let clip_gain = db_to_gain(item.gain_db);
@@ -330,8 +343,19 @@ type SourceAudio<'a> = &'a dyn Fn(i64, usize) -> Option<AudioBuffer>;
 
 /// The clip's audio after speed/reverse and clip effects (before clip gain, Volume and Panner) for
 /// timeline samples `[a0, a0 + n)`, `w` channels.
-fn effected(item: &TrackItem, src: SourceAudio, a0: i64, n: usize, sr: u32, w: usize) -> Vec<Vec<f32>> {
-    let read = |x0: i64, len: usize| raw_channels(item, src, x0, len, sr, w);
+fn effected(item: &TrackItem, src: SourceAudio, a0: i64, n: usize, sr: u32, w: usize, source_gain: f32) -> Vec<Vec<f32>> {
+    // Source upmix precedes nonlinear clip DSP, just as source conversion does.
+    let read = |x0: i64, len: usize| {
+        let mut channels = raw_channels(item, src, x0, len, sr, w);
+        if source_gain != 1.0 {
+            for channel in &mut channels {
+                for value in channel {
+                    *value *= source_gain;
+                }
+            }
+        }
+        channels
+    };
     if crate::audio_fx::has_effects(item) { crate::audio_fx::process(item, a0, n, sr, &read) } else { read(a0, n) }
 }
 
@@ -351,7 +375,7 @@ pub fn clip_signal(item: &TrackItem, start: i64, frames: usize, sr: u32, sources
         let n = (a1 - a0) as usize;
         let off = (a0 - start) as usize;
         let g = db_to_gain(item.gain_db);
-        let buf = effected(item, &|m0, len| src.audio_stream(item.audio_stream, m0, len, sr).ok(), a0, n, sr, 2);
+        let buf = effected(item, &|m0, len| src.audio_stream(item.audio_stream, m0, len, sr).ok(), a0, n, sr, 2, 1.0);
         for (dst, b) in out.iter_mut().zip(&buf) {
             for (d, x) in dst[off..off + n].iter_mut().zip(b) {
                 *d = x * g;

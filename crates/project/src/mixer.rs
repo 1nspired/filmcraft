@@ -166,10 +166,41 @@ impl TrackSend {
     }
 }
 
+/// Stereo balance and mono-source upmix are explicit physical mixer laws.
+/// Defaults preserve existing FilmCraft playback and old files.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StereoBalanceLaw {
+    #[default]
+    EqualPower,
+    Linear,
+}
+impl StereoBalanceLaw {
+    pub fn is_default(&self) -> bool {
+        *self == Self::EqualPower
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MonoSourceLaw {
+    #[default]
+    DualMono,
+    EqualPower,
+}
+impl MonoSourceLaw {
+    pub fn is_default(&self) -> bool {
+        *self == Self::DualMono
+    }
+}
+
 /// Mixer-only state of a channel strip (audio track, submix or Mix).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MixerStrip {
+    #[serde(skip_serializing_if = "StereoBalanceLaw::is_default")]
+    pub stereo_balance: StereoBalanceLaw,
+    #[serde(skip_serializing_if = "MonoSourceLaw::is_default")]
+    pub mono_source: MonoSourceLaw,
     pub mode: AutomationMode,
     /// Automation lanes (`volume`, `pan`, `mute`, `send.<i>.level`), keyframes in sequence time.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
