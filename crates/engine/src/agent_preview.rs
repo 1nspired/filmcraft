@@ -28,6 +28,12 @@ pub(crate) struct PreviewState {
     serial: u64,
     pending: BTreeMap<String, Prepared>,
 }
+impl PreviewState {
+    pub(crate) fn discard_pending(&mut self) {
+        // Never recycle an old preview identity in the same Session.
+        self.pending.clear();
+    }
+}
 fn editor_basis(s: &Session) -> Result<Vec<u8>> {
     // EditorState's persisted representation omits the clipboard. Guard it too:
     // committing a delayed preview must not overwrite intervening human state.

@@ -94,6 +94,11 @@ impl Default for BridgeState {
         }
     }
 }
+pub(crate) fn invalidate_plans(s: &mut Session) {
+    s.agent_bridge.tickets.clear();
+    s.agent_bridge.previews.discard_pending();
+    s.agent_bridge.owned = None;
+}
 pub(crate) fn read_token(s: &mut Session, sequence: Option<filmcraft_project::ItemId>) -> Result<String> {
     let b = &mut s.agent_bridge;
     let same_project = b.read_project.upgrade().is_some_and(|p| Arc::ptr_eq(&p, &s.project));
@@ -295,6 +300,8 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec("poema.configureClip", "Configure delivered clip", configure, true),
         spec("poema.owner", "Read managed native project owner", crate::project_owner::status, false),
         spec("poema.checkpoint", "Checkpoint the guarded native owner", crate::project_owner::checkpoint, false),
+        spec("poema.freezeCheckpoint", "Freeze a guarded checkpoint for ownership publication", crate::project_owner::freeze_checkpoint, false),
+        spec("poema.releaseCheckpoint", "Release the original checkpoint freeze", crate::project_owner::release_checkpoint, false),
         spec("agent.snapshot", "Read guarded native sequence", snapshot, false),
         spec("agent.document", "Read lossless native project", crate::native_document::read, false),
         spec("agent.apply", "Apply guarded Poema batch", apply, true),

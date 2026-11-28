@@ -637,6 +637,7 @@ pub(crate) struct Sent {
 
 struct Snapshot {
     project_lease: Option<Arc<crate::project_owner::ProjectLease>>,
+    lease_epoch: Option<u64>,
     project: Arc<Project>,
     revision: u64,
     path: Option<String>,
@@ -767,7 +768,8 @@ impl Persistence {
         path: Option<String>,
         project_lease: Option<Arc<crate::project_owner::ProjectLease>>,
     ) {
-        let _ = self.tx.send(Msg::Dirty(Snapshot { project, revision, path, project_lease }));
+        let lease_epoch = project_lease.as_ref().map(|lease| lease.epoch());
+        let _ = self.tx.send(Msg::Dirty(Snapshot { project, revision, path, project_lease, lease_epoch }));
     }
 
     pub(crate) fn send_clean(&self) {
@@ -1048,7 +1050,11 @@ impl Worker {
                 {
                     match s.project_lease.as_ref().map_or_else(
                         || filmcraft_format::atomic_write(Path::new(p), &bytes).map_err(|e| e.to_string()),
-                        |lease| lease.save(&bytes).map_err(|e| e.to_string()),
+                        |lease| {
+                            s.lease_epoch
+                                .ok_or_else(|| "managed autosave epoch missing".to_string())
+                                .and_then(|epoch| lease.save_background(&bytes, epoch).map_err(|e| e.to_string()))
+                        },
                     ) {
                         Ok(()) => {
                             let _ = self.events.send(WorkerEvent::SavedProject { path: p.clone(), revision: s.revision });

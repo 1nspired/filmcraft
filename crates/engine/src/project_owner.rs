@@ -7,7 +7,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -58,6 +58,11 @@ pub(crate) fn required(project: &Project, path: &str) -> Result<bool> {
     }
 }
 #[derive(Debug)]
+struct LeaseWrites {
+    epoch: u64,
+    freeze: Option<String>,
+}
+#[derive(Debug)]
 pub(crate) struct ProjectLease {
     id: String,
     path: PathBuf,
@@ -66,6 +71,7 @@ pub(crate) struct ProjectLease {
     #[cfg(unix)]
     file: File,
     project_present: AtomicBool,
+    writes: Mutex<LeaseWrites>,
 }
 impl ProjectLease {
     fn acquire(path: &str) -> Result<Self> {
@@ -90,7 +96,14 @@ impl ProjectLease {
             let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lock_path).map_err(error)?;
             file.try_lock().map_err(|e| error(format!("another owner holds this project, or locking failed: {e}")))?;
             let project_present = AtomicBool::new(path.exists());
-            let lease = Self { id: crate::agent_bridge::fresh_owner(), path, lock_path, file, project_present };
+            let lease = Self {
+                id: crate::agent_bridge::fresh_owner(),
+                path,
+                lock_path,
+                file,
+                project_present,
+                writes: Mutex::new(LeaseWrites { epoch: 0, freeze: None }),
+            };
             lease.validate()?;
             Ok(lease)
         }
@@ -127,9 +140,41 @@ impl ProjectLease {
         }
     }
     pub(crate) fn save(&self, bytes: &[u8]) -> Result<()> {
+        self.save_at(bytes, None, None)
+    }
+    pub(crate) fn epoch(&self) -> u64 {
+        self.writes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).epoch
+    }
+    pub(crate) fn frozen(&self) -> bool {
+        self.writes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).freeze.is_some()
+    }
+    pub(crate) fn save_background(&self, bytes: &[u8], epoch: u64) -> Result<()> {
+        self.save_at(bytes, Some(epoch), None)
+    }
+    fn save_at(&self, bytes: &[u8], expected: Option<u64>, freeze: Option<String>) -> Result<()> {
+        // Serialize the file write and freeze transition with in-flight autosaves.
+        let mut writes = self.writes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if writes.freeze.is_some() || expected.is_some_and(|epoch| epoch != writes.epoch) {
+            return Err(error("checkpoint is frozen or queued autosave basis expired"));
+        }
+        let next = writes.epoch.checked_add(1).ok_or_else(|| error("persistence epoch exhausted"))?;
         self.validate()?;
         filmcraft_format::atomic_write(&self.path, bytes).map_err(error)?;
         self.project_present.store(true, Ordering::Relaxed);
+        if expected.is_none() {
+            writes.epoch = next;
+        }
+        writes.freeze = freeze;
+        Ok(())
+    }
+    fn release(&self, freeze: &str) -> Result<()> {
+        self.validate()?;
+        let mut writes = self.writes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if writes.freeze.as_deref() != Some(freeze) {
+            return Err(error("foreign, expired or already released checkpoint freeze"));
+        }
+        writes.epoch = writes.epoch.checked_add(1).ok_or_else(|| error("persistence epoch exhausted"))?;
+        writes.freeze = None;
         Ok(())
     }
 }
@@ -161,16 +206,45 @@ pub(crate) fn current(s: &Session) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn writable(s: &Session) -> Result<()> {
+    current(s)?;
+    if s.project_lease.as_ref().is_some_and(|lease| lease.frozen()) {
+        return Err(error("native checkpoint is frozen for ownership publication; reconcile and explicitly release it"));
+    }
+    Ok(())
+}
+
 pub(crate) fn status(s: &mut Session, _: &serde_json::Value) -> Result<serde_json::Value> {
     current(s)?;
     Ok(
-        serde_json::json!({"protocol":1,"owner":s.agent_bridge.owner,"path":s.path,"managed":s.project_lease.is_some(),"lease":s.project_lease.as_ref().map(|lease|&lease.id),"dirty":s.is_dirty(),"revision":s.revision.to_string(),"schemaVersion":filmcraft_format::SCHEMA_VERSION}),
+        serde_json::json!({"protocol":1,"owner":s.agent_bridge.owner,"path":s.path,"managed":s.project_lease.is_some(),"lease":s.project_lease.as_ref().map(|lease|&lease.id),"frozen":s.project_lease.as_ref().is_some_and(|lease|lease.frozen()),"dirty":s.is_dirty(),"revision":s.revision.to_string(),"schemaVersion":filmcraft_format::SCHEMA_VERSION}),
     )
 }
 
 /// One native command guards the exact basis, validates and saves it, then
 /// returns the digest of those exact bytes. No read/save race with human edits.
 pub(crate) fn checkpoint(s: &mut Session, p: &serde_json::Value) -> Result<serde_json::Value> {
+    checkpoint_impl(s, p, false)
+}
+pub(crate) fn freeze_checkpoint(s: &mut Session, p: &serde_json::Value) -> Result<serde_json::Value> {
+    checkpoint_impl(s, p, true)
+}
+pub(crate) fn release_checkpoint(s: &mut Session, p: &serde_json::Value) -> Result<serde_json::Value> {
+    use crate::commands::bad;
+    current(s)?;
+    if p.as_object().is_none_or(|params| params.keys().any(|key| key != "freeze" && key != "lease")) {
+        return Err(bad("poema.releaseCheckpoint", "release accepts only the original freeze and file lease"));
+    }
+    let lease = s.project_lease.as_ref().ok_or_else(|| bad("poema.releaseCheckpoint", "managed file owner required"))?;
+    if p["lease"].as_str() != Some(lease.id.as_str()) {
+        return Err(bad("poema.releaseCheckpoint", "file lease changed"));
+    }
+    lease.release(p["freeze"].as_str().ok_or_else(|| bad("poema.releaseCheckpoint", "freeze required"))?)?;
+    let result = serde_json::json!({"protocol":1,"released":true,"owner":s.agent_bridge.owner,"lease":lease.id,"revision":s.revision.to_string()});
+    crate::agent_bridge::invalidate_plans(s);
+    Ok(result)
+}
+fn checkpoint_impl(s: &mut Session, p: &serde_json::Value, freeze: bool) -> Result<serde_json::Value> {
     use crate::commands::bad;
     use sha2::Digest;
     crate::agent_bridge::guard(s, p, "poema.checkpoint")?;
@@ -194,12 +268,16 @@ pub(crate) fn checkpoint(s: &mut Session, p: &serde_json::Value) -> Result<serde
         return Err(bad("poema.checkpoint", "checkpoint exceeds 4MiB"));
     }
     let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
-    lease.save(&bytes)?;
+    let freeze_id = freeze.then(crate::agent_bridge::fresh_owner);
+    lease.save_at(&bytes, None, freeze_id.clone())?;
     s.saved_revision = s.revision;
     s.loaded_schema = filmcraft_format::SCHEMA_VERSION;
-    Ok(
-        serde_json::json!({"protocol":1,"owner":s.agent_bridge.owner,"lease":lease.id,"path":lease.path()?,"revision":s.revision.to_string(),"sha256":digest,"bytes":bytes.len()}),
-    )
+    let mut result = serde_json::json!({"protocol":1,"owner":s.agent_bridge.owner,"lease":lease.id,"path":lease.path()?,"revision":s.revision.to_string(),"sha256":digest,"bytes":bytes.len()});
+    if let Some(id) = freeze_id {
+        result["freeze"] = id.into();
+        crate::agent_bridge::invalidate_plans(s);
+    }
+    Ok(result)
 }
 
 #[cfg(all(test, unix))]
@@ -384,6 +462,96 @@ mod tests {
         s.execute("file.saveAs", json!({"path":dir.join("b.fcproj")})).unwrap();
         assert_ne!(s.execute("poema.owner", json!({})).unwrap()["lease"], next["lease"]);
         drop(s);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn frozen_checkpoint_fences_commands_direct_edits_history_and_foreign_release_without_an_edit() {
+        use serde_json::json;
+        let dir = directory();
+        let path = dir.join("frozen.fcproj");
+        let mut s = managed();
+        s.execute("file.saveAs", json!({"path":path})).unwrap();
+        s.execute("sequence.addEdit", json!({"seconds":1.5})).unwrap();
+        let owner = s.execute("poema.owner", json!({})).unwrap();
+        let basis = s.execute("agent.snapshot", json!({})).unwrap();
+        let operations = json!([{"command":"timeline.trim","params":{"clip":basis["sequence"]["video"][0]["items"][0]["clip"],"edge":"out","deltaFrames":-1}}]);
+        let old_preview = s.execute("agent.preview", json!({"token":basis["token"],"label":"Before freeze","operations":operations})).unwrap();
+        let revision = s.revision;
+        let project = s.project.clone();
+        let depth = s.history.undo.len();
+        let mark = s.undo_mark();
+        let (_, events, _subscription) = s.command_journal.subscribe().unwrap();
+        let frozen = s.execute("poema.freezeCheckpoint", json!({"token":basis["token"],"lease":owner["lease"]})).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(s.execute("poema.owner", json!({})).unwrap()["frozen"], true);
+        assert!(s.execute("agent.document", json!({})).is_ok());
+        for (command, params) in [
+            ("file.newProject", json!({})),
+            ("file.open", json!({"path":path})),
+            ("file.save", json!({})),
+            ("file.saveAs", json!({"path":dir.join("redirect.fcproj")})),
+            ("file.saveCopy", json!({"path":dir.join("copy.fcproj")})),
+            ("sequence.addEdit", json!({"seconds":1.0})),
+            ("edit.undo", json!({})),
+            ("agent.apply", json!({"token":basis["token"],"operations":[]})),
+        ] {
+            assert!(s.execute(command, params).is_err(), "{command}");
+        }
+        assert!(s.edit("Direct", |_, _| Ok(())).is_err());
+        assert!(s.edit_merged("Direct", "same", |_, _| Ok(())).is_err());
+        assert!(s.edit_group("Direct", |_| Ok(())).is_err());
+        assert_eq!(s.undo(), None);
+        assert_eq!(s.redo(), None);
+        assert_eq!(s.revert_to(mark), 0);
+        for params in [
+            json!({"lease":owner["lease"],"freeze":"foreign"}),
+            json!({"lease":"foreign","freeze":frozen["freeze"]}),
+            json!({"lease":owner["lease"],"freeze":frozen["freeze"],"extra":true}),
+        ] {
+            assert!(s.execute("poema.releaseCheckpoint", params).is_err());
+        }
+        assert!(Arc::ptr_eq(&s.project, &project));
+        assert_eq!(s.revision, revision);
+        assert_eq!(s.history.undo.len(), depth);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(events.try_recv().is_err());
+        let during = s.execute("agent.snapshot", json!({})).unwrap();
+        let release = json!({"lease":owner["lease"],"freeze":frozen["freeze"]});
+        s.execute("poema.releaseCheckpoint", release.clone()).unwrap();
+        assert!(s.execute("poema.releaseCheckpoint", release).is_err());
+        for old in [basis, during] {
+            assert!(crate::agent_bridge::guard(&s, &json!({"token":old["token"]}), "agent.apply").is_err());
+        }
+        assert_eq!(s.execute("poema.owner", json!({})).unwrap()["frozen"], false);
+        let fresh = s.execute("agent.snapshot", json!({})).unwrap();
+        let new_preview = s.execute("agent.preview", json!({"token":fresh["token"],"label":"After freeze","operations":operations})).unwrap();
+        assert_ne!(old_preview["preview"], new_preview["preview"]);
+        assert!(s.execute("agent.commitPreview", json!({"token":fresh["token"],"preview":old_preview["preview"]})).is_err());
+        s.execute("agent.discardPreview", json!({"preview":new_preview["preview"]})).unwrap();
+        assert!(s.execute("edit.undo", json!({})).is_ok());
+        assert_eq!(events.try_recv().unwrap()["command"], "edit.undo");
+        drop(s);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_and_release_expire_queued_autosaves_even_after_the_freeze_ends() {
+        let dir = directory();
+        let lease = ProjectLease::acquire(dir.join("queued.fcproj").to_str().unwrap()).unwrap();
+        lease.save(b"initial").unwrap();
+        let before = lease.epoch();
+        lease.save_at(b"frozen", None, Some("original-freeze".into())).unwrap();
+        let during = lease.epoch();
+        assert!(lease.save_background(b"queued before", before).is_err());
+        assert!(lease.save_background(b"queued during", during).is_err());
+        lease.release("original-freeze").unwrap();
+        assert!(lease.save_background(b"queued before", before).is_err());
+        assert!(lease.save_background(b"queued during", during).is_err());
+        assert_eq!(fs::read(dir.join("queued.fcproj")).unwrap(), b"frozen");
+        lease.save_background(b"fresh worker", lease.epoch()).unwrap();
+        assert_eq!(fs::read(dir.join("queued.fcproj")).unwrap(), b"fresh worker");
+        drop(lease);
         fs::remove_dir_all(dir).unwrap();
     }
 }
