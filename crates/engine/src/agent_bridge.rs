@@ -217,6 +217,15 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     commit_prepared(s, p, &label, staged.project, staged.state, results)
 }
 pub(crate) fn stage(s: &Session, p: &Value) -> Result<(Session, Vec<Value>, String)> {
+    stage_inner(s, p, None)
+}
+pub(crate) fn stage_sequence(s: &Session, p: &Value, sequence: filmcraft_project::ItemId) -> Result<(Session, Vec<Value>, String)> {
+    if s.project.sequence(sequence).is_none() {
+        return Err(bad("agent.previewSequence", "scope must be an existing sequence in this project"));
+    }
+    stage_inner(s, p, Some(sequence))
+}
+fn stage_inner(s: &Session, p: &Value, scope: Option<filmcraft_project::ItemId>) -> Result<(Session, Vec<Value>, String)> {
     let ops: Vec<Operation> = serde_json::from_value(p["operations"].clone()).map_err(|e| bad("agent.apply", e.to_string()))?;
     if ops.is_empty() || ops.len() > 256 || ops.iter().any(|o| !allowed(&o.command)) {
         return Err(bad("agent.apply", "batch needs 1..256 audited, in-memory edit operations"));
@@ -236,6 +245,12 @@ pub(crate) fn stage(s: &Session, p: &Value) -> Result<(Session, Vec<Value>, Stri
     staged.state = s.state.clone();
     staged.media = s.media.clone();
     staged.prefs = s.prefs.clone();
+    if let Some(sequence) = scope {
+        // Only the private clone changes scope. No implicit selection may
+        // borrow the live editor's targets in a different sequence.
+        staged.state.active_sequence = Some(sequence);
+        staged.state.selection.clear();
+    }
     let mut results = Vec::new();
     for op in ops {
         results.push(staged.execute(&op.command, op.params)?);
@@ -244,6 +259,27 @@ pub(crate) fn stage(s: &Session, p: &Value) -> Result<(Session, Vec<Value>, Stri
         if let ItemKind::Sequence(q) = &item.kind {
             q.check().map_err(crate::EngineError::Other)?;
         }
+    }
+    if let Some(sequence) = scope {
+        // Some ordinary commands can also modify shared media/catalog state.
+        // A scoped preview may only change its sequence item and allocate ids;
+        // compare the rest of the entire project before retaining a preview.
+        if staged.project.sequence(sequence).is_none() || staged.project.next_id < s.project.next_id {
+            return Err(bad("agent.previewSequence", "scope or native id allocator changed unexpectedly"));
+        }
+        let mut outside = (*staged.project).clone();
+        let original = s.project.items.get(&sequence).cloned().ok_or_else(|| bad("agent.previewSequence", "original sequence is unavailable"))?;
+        outside.items.insert(sequence, original);
+        outside.next_id = s.project.next_id;
+        if crate::native_document::bounded_json(&outside)? != crate::native_document::bounded_json(&s.project)? {
+            return Err(bad(
+                "agent.previewSequence",
+                "scoped commands changed project state outside the requested sequence; prepare a separately proved project transaction",
+            ));
+        }
+        // A scoped workflow never changes the live editor's active tab,
+        // playheads, selections, clipboard or other interactive state.
+        staged.state = s.state.clone();
     }
     Ok((staged, results, label.to_owned()))
 }
@@ -409,6 +445,10 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec("agent.document", "Read lossless native project", crate::native_document::read, false),
         spec("agent.apply", "Apply guarded Poema batch", apply, true),
         spec("agent.preview", "Preview isolated Poema batch", crate::agent_preview::preview, false),
+        CommandSpec {
+            params: r#"{"token":str,"sequence":id,"operations":[{"command":str,"params":object}],"label":str?}"#,
+            ..spec("agent.previewSequence", "Preview scoped Poema sequence batch", crate::agent_preview::preview_sequence, false)
+        },
         spec("agent.commitPreview", "Commit checked Poema preview", crate::agent_preview::commit, true),
         spec("agent.discardPreview", "Discard Poema preview", crate::agent_preview::discard, false),
         spec("agent.undo", "Undo owned Poema batch", |s, p| history(s, p, false), true),
