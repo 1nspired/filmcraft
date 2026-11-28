@@ -80,7 +80,7 @@ impl Default for BridgeState {
         }
     }
 }
-fn read_token(s: &mut Session, sequence: Option<filmcraft_project::ItemId>) -> Result<String> {
+pub(crate) fn read_token(s: &mut Session, sequence: Option<filmcraft_project::ItemId>) -> Result<String> {
     let b = &mut s.agent_bridge;
     let same_project = b.read_project.upgrade().is_some_and(|p| Arc::ptr_eq(&p, &s.project));
     if b.read_revision != s.revision || !same_project {
@@ -265,6 +265,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
     vec![
         spec("poema.configureClip", "Configure delivered clip", configure, true),
         spec("agent.snapshot", "Read guarded native sequence", snapshot, false),
+        spec("agent.document", "Read lossless native project", crate::native_document::read, false),
         spec("agent.apply", "Apply guarded Poema batch", apply, true),
         spec("agent.undo", "Undo owned Poema batch", |s, p| history(s, p, false), true),
         spec("agent.redo", "Redo owned Poema batch", |s, p| history(s, p, true), true),
