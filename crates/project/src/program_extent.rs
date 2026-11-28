@@ -149,4 +149,48 @@ mod tests {
         q.audio_tracks.clear();
         assert_eq!(q.duration(), Tick::ZERO);
     }
+    #[test]
+    fn content_extent_retains_every_stored_tail_without_mutating_project_state() {
+        let mut q = sequence();
+        q.settings.frame_rate = FrameRate::new(24000, 1001);
+        let frame = q.frame_rate().frame_duration();
+        q.video_tracks[0].items.push(clip(61, Tick::ZERO, Tick(frame.0 * 72)));
+        q.audio_tracks[0].items.push(clip(62, Tick(frame.0 * 21600), Tick(frame.0 * 48)));
+        q.video_tracks[1].items.push(clip(63, Tick(frame.0 * 22000), frame));
+        let mut captions = CaptionTrack::new(TrackId(64), "tail captions".into(), CaptionFormat::Subtitle);
+        captions.captions.push(Caption {
+            id: ClipId(65),
+            start: Tick(frame.0 * 23000),
+            duration: frame,
+            text: "synthetic".into(),
+            speaker: None,
+            cue_id: None,
+            settings: String::new(),
+        });
+        q.caption_tracks.push(captions);
+        let expected = Tick(frame.0 * 23001);
+        assert_eq!(q.duration(), expected);
+        assert_eq!(q.content_duration(), expected);
+        q.program_extent = Some(ProgramExtentPolicy::Poema);
+        q.video_tracks[1].enabled = false;
+        q.audio_tracks[0].muted = true;
+        let before = q.clone();
+        assert_eq!(q.duration(), Tick(frame.0 * 72));
+        assert_eq!(q.content_duration(), expected);
+        assert_eq!(q, before);
+        let restored: Sequence = serde_json::from_value(serde_json::to_value(&q).unwrap()).unwrap();
+        assert_eq!(restored.content_duration(), expected);
+        assert_eq!(restored.duration(), Tick(frame.0 * 72));
+        q.caption_tracks.clear();
+        assert_eq!(q.content_duration(), Tick(frame.0 * 22001));
+        q.video_tracks[1].items.clear();
+        assert_eq!(q.content_duration(), Tick(frame.0 * 21648));
+        q.audio_tracks[0].items.clear();
+        assert_eq!(q.content_duration(), Tick(frame.0 * 72));
+        q.video_tracks[0].items.clear();
+        assert_eq!(q.content_duration(), Tick::ZERO);
+        assert_eq!(q.duration(), Tick::ZERO);
+        q.audio_tracks[0].items.push(clip(66, Tick(i64::MAX - 5), Tick(20)));
+        assert_eq!(std::panic::catch_unwind(|| q.content_duration()).unwrap(), Tick(i64::MAX));
+    }
 }

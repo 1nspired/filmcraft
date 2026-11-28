@@ -328,8 +328,8 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
     // ---- sequence tabs strip (top-left header block)
     // ---- animated zoom / scroll
-    let empty = seq.duration().seconds() <= 0.0;
-    let dur_s = seq.duration().seconds().max(1.0);
+    let empty = seq.content_duration().seconds() <= 0.0;
+    let dur_s = seq.content_duration().seconds().max(1.0);
     {
         let v = &mut app.ui.timeline;
         if let Some(p) = v.fit_empty
@@ -409,7 +409,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // a script): scrolled past it, nothing is in view and the scroll bar has nowhere to show it.
     {
         let v = &mut app.ui.timeline;
-        let seconds = seq.duration().seconds();
+        let seconds = seq.content_duration().seconds();
         if !v.scroll.is_finite() || !v.target_scroll.is_finite() {
             (v.scroll, v.target_scroll) = (0.0, 0.0);
         }
@@ -697,7 +697,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app,
         ui,
         Rect::from_min_max(pos2(content.min.x, rect.max.y - SCROLLBAR_H + 2.0), pos2(content.max.x, rect.max.y - 2.0)),
-        seq.duration().seconds(),
+        seq.content_duration().seconds(),
         &t,
     );
     vertical_scrollbar(
@@ -2309,7 +2309,7 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
             match sideways {
                 Some(d) => {
                     let v = &mut app.ui.timeline;
-                    let limit = max_scroll(seq.duration().seconds(), layout.content.width(), v.pps);
+                    let limit = max_scroll(seq.content_duration().seconds(), layout.content.width(), v.pps);
                     v.target_scroll = (v.target_scroll - d as f64 / v.pps).clamp(0.0, limit);
                     v.scroll = v.target_scroll;
                 }
