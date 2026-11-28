@@ -1,5 +1,5 @@
 //! Four-door subset of native v185's guarded read/stage/check/commit boundary.
-//! No lifecycle, recovery, UI or provider code. All writes use Session's native undo.
+//! Bounded in-memory lifecycle; no file recovery, UI or provider code. All writes use native undo.
 use crate::commands::{CommandSpec, always, bad};
 use crate::{Result, Session};
 use filmcraft_project::{ClipId, ClipIdentity, ItemKind};
@@ -174,6 +174,9 @@ fn allowed(id: &str) -> bool {
             | "edit.clear"
             | "poema.setCarrier"
             | "poema.setSequenceMetadata"
+            | "poema.createSequence"
+            | "poema.setSequenceRecord"
+            | "poema.deleteSequence"
             | "poema.setImportedSourceRange"
             | "poema.configureClip"
             | "poema.patchClip"
@@ -475,7 +478,22 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec("agent.redo", "Redo owned Poema batch", |s, p| history(s, p, true), true),
         spec("poema.setImportedSourceRange", "Preserve imported source interval", crate::import_source::set, true),
         spec("poema.setCarrier", "Stamp timed Poema ids", carrier, true),
-        spec("poema.setSequenceMetadata", "Preserve Poema editorial metadata", crate::poema_metadata::set, true),
+        CommandSpec {
+            params: r#"{"metadata":boundedEditorialAliases,"sequence":id?}; omitted sequence targets the current native scope"#,
+            ..spec("poema.setSequenceMetadata", "Preserve Poema editorial metadata", crate::poema_metadata::set, true)
+        },
+        CommandSpec {
+            params: r#"{"sequence":id,"fallback":otherSequenceId?}"#,
+            ..spec("poema.deleteSequence", "Delete Poema sequence", crate::poema_sequences::delete, true)
+        },
+        CommandSpec {
+            params: r#"{"sequence":id,"projectId":str,"sequenceId":str,"props":boundedEditorialObject,"name":str?,"documentTitle":str?}; documentTitle is required exactly when the saved document declares a name"#,
+            ..spec("poema.setSequenceRecord", "Set Poema sequence catalog metadata", crate::poema_sequences::record, true)
+        },
+        CommandSpec {
+            params: r#"{"name":str,"frame":{"width":u32,"height":u32,"rate":{"num":i64,"den":i64}}?,"from":sequenceId?,"activate":bool?}; exactly one of frame/from; current snapshot only"#,
+            ..spec("poema.createSequence", "Create or copy Poema sequence", crate::poema_sequences::create, true)
+        },
     ]
 }
 
