@@ -22,6 +22,9 @@ fn session_namespace(serial: u64) -> String {
     let b = RandomState::new().hash_one(("filmcraft-session-b", serial));
     format!("{a:016x}{b:016x}")
 }
+pub(crate) fn fresh_owner() -> String {
+    session_namespace(NEXT_SESSION.fetch_add(1, Ordering::Relaxed))
+}
 const MAX_READ_TICKETS: usize = 128;
 #[derive(Default)]
 struct JournalState {
@@ -81,7 +84,7 @@ pub(crate) struct BridgeState {
 impl Default for BridgeState {
     fn default() -> Self {
         Self {
-            owner: session_namespace(NEXT_SESSION.fetch_add(1, Ordering::Relaxed)),
+            owner: fresh_owner(),
             previews: Default::default(),
             serial: 0,
             tickets: BTreeMap::new(),
@@ -291,6 +294,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
     vec![
         spec("poema.configureClip", "Configure delivered clip", configure, true),
         spec("poema.owner", "Read managed native project owner", crate::project_owner::status, false),
+        spec("poema.checkpoint", "Checkpoint the guarded native owner", crate::project_owner::checkpoint, false),
         spec("agent.snapshot", "Read guarded native sequence", snapshot, false),
         spec("agent.document", "Read lossless native project", crate::native_document::read, false),
         spec("agent.apply", "Apply guarded Poema batch", apply, true),
