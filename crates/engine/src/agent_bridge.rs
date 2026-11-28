@@ -5,7 +5,8 @@ use crate::{Result, Session};
 use filmcraft_project::{ClipId, ClipIdentity, ItemKind};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, hash_map::RandomState};
+use std::hash::BuildHasher;
 use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicU64, Ordering},
@@ -13,6 +14,14 @@ use std::sync::{
 };
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+/// Session counters restart in a new process. Two independently seeded standard
+/// hashers namespace them across restarts, including otherwise identical projects.
+/// These tickets are optimistic concurrency identities, never authentication.
+fn session_namespace(serial: u64) -> String {
+    let a = RandomState::new().hash_one(("filmcraft-session-a", serial));
+    let b = RandomState::new().hash_one(("filmcraft-session-b", serial));
+    format!("{a:016x}{b:016x}")
+}
 const MAX_READ_TICKETS: usize = 128;
 #[derive(Default)]
 struct JournalState {
@@ -61,7 +70,7 @@ impl CommandJournal {
 }
 
 pub(crate) struct BridgeState {
-    pub(crate) owner: u64,
+    pub(crate) owner: String,
     pub(crate) previews: crate::agent_preview::PreviewState,
     serial: u64,
     tickets: BTreeMap<Option<filmcraft_project::ItemId>, String>,
@@ -72,7 +81,7 @@ pub(crate) struct BridgeState {
 impl Default for BridgeState {
     fn default() -> Self {
         Self {
-            owner: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
+            owner: session_namespace(NEXT_SESSION.fetch_add(1, Ordering::Relaxed)),
             previews: Default::default(),
             serial: 0,
             tickets: BTreeMap::new(),
@@ -100,7 +109,7 @@ pub(crate) fn read_token(s: &mut Session, sequence: Option<filmcraft_project::It
     }
     b.serial = b.serial.checked_add(1).ok_or_else(|| bad("agent.snapshot", "read counter exhausted"))?;
     // An optimistic concurrency ticket, not an authentication credential.
-    let token = format!("{:016x}{:016x}{:016x}", b.owner, s.revision, b.serial);
+    let token = format!("{}-{:016x}-{:016x}", b.owner, s.revision, b.serial);
     b.tickets.insert(sequence, token.clone());
     Ok(token)
 }
@@ -345,6 +354,12 @@ mod tests {
         s.execute("agent.apply", json!({"token":agent["token"],"operations":[trim(id)]})).unwrap();
         s.execute("agent.snapshot", json!({})).unwrap();
         assert_eq!(s.agent_bridge.tickets.len(), 1);
+    }
+    #[test]
+    fn namespace_does_not_repeat_when_a_process_counter_restarts() {
+        let names: std::collections::BTreeSet<_> = (0..128).map(|_| session_namespace(1)).collect();
+        assert_eq!(names.len(), 128);
+        assert!(names.iter().all(|name| name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit())));
     }
     #[test]
     fn tickets_cannot_cross_sessions_or_the_active_sequence() {
