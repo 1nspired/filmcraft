@@ -431,6 +431,7 @@ impl Builder {
         let label = self.p.item(item).map(|i| i.label).unwrap_or(Label::Iris);
         TrackItem {
             identity: None,
+            source_end_offset: Default::default(),
             id: ClipId(self.p.alloc_id()),
             item,
             name: name.to_string(),

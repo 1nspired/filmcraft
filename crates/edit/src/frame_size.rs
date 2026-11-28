@@ -90,6 +90,7 @@ mod tests {
         motion.param_mut("scale").unwrap().value = ParamValue::Float(scale);
         TrackItem {
             identity: None,
+            source_end_offset: Default::default(),
             id: ClipId(id),
             item: ItemId(1),
             name: format!("c{id}"),

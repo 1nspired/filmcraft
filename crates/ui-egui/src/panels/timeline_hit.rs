@@ -306,6 +306,7 @@ mod tests {
     fn clip(id: u64, x0: f64, x1: f64) -> TrackItem {
         TrackItem {
             identity: None,
+            source_end_offset: Default::default(),
             id: ClipId(id),
             item: ItemId(1),
             name: format!("c{id}"),

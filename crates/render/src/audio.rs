@@ -377,7 +377,13 @@ pub fn clip_is_mono(item: &TrackItem, sources: &dyn SourceProvider) -> Option<bo
 fn raw_channels(item: &TrackItem, src: SourceAudio, x0: i64, len: usize, sr: u32, w: usize) -> Vec<Vec<f32>> {
     let mut out = vec![vec![0.0f32; len]; w];
     let item_s0 = item.start.to_units_floor(sr as i64);
-    let item_s1 = item.end().to_units_floor(sr as i64);
+    let item_s1 = if item.source_end_offset.0 < 0 {
+        let span = (item.source_out() - item.source_in).0;
+        let audible = Tick((span as f64 / item.speed.abs().max(1e-6)).ceil() as i64);
+        (item.start + audible).min(item.end()).to_units_floor(sr as i64)
+    } else {
+        item.end().to_units_floor(sr as i64)
+    };
     let a0 = x0.max(item_s0);
     let a1 = (x0 + len as i64).min(item_s1);
     if a1 <= a0 {

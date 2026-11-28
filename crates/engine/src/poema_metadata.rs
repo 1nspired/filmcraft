@@ -21,6 +21,8 @@ struct Metadata {
     sequence_id: String,
     root: BTreeMap<String, Value>,
     settings: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    clock: Option<filmcraft_time::FrameRate>,
     fields: Vec<String>,
     tracks: BTreeMap<String, TrackMetadata>,
     assets: BTreeMap<String, String>,
@@ -59,10 +61,11 @@ pub(crate) fn set(s: &mut Session, params: &Value) -> Result<Value> {
     let width = frame.get("width").and_then(Value::as_u64);
     let height = frame.get("height").and_then(Value::as_u64);
     let fps = meta.settings.get("fps").and_then(Value::as_f64);
-    if width != Some(u64::from(q.settings.width))
-        || height != Some(u64::from(q.settings.height))
-        || !fps.is_some_and(|f| f.is_finite() && (f - (q.settings.frame_rate.num as f64) / (q.settings.frame_rate.den as f64)).abs() < 0.001)
-    {
+    let rate_matches = match meta.clock {
+        Some(rate) => rate.num > 0 && rate.den > 0 && rate == q.settings.frame_rate && fps.is_some_and(|f| f.is_finite() && (f - rate.as_f64()).abs() < 0.015),
+        None => fps.is_some_and(|f| f.is_finite() && (f - (q.settings.frame_rate.num as f64) / (q.settings.frame_rate.den as f64)).abs() < 0.001),
+    };
+    if width != Some(u64::from(q.settings.width)) || height != Some(u64::from(q.settings.height)) || !rate_matches {
         return Err(bad("poema.setSequenceMetadata", "legacy frame representation must match native sequence settings"));
     }
     let mut aliases = std::collections::BTreeSet::new();

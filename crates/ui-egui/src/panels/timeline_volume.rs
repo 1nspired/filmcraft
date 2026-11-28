@@ -327,6 +327,7 @@ mod tests {
     fn clip(speed: f64, reverse: bool) -> TrackItem {
         TrackItem {
             identity: None,
+            source_end_offset: Default::default(),
             id: ClipId(1),
             item: ItemId(1),
             name: String::new(),

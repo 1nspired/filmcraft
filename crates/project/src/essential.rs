@@ -761,6 +761,7 @@ mod tests {
     fn clip() -> TrackItem {
         TrackItem {
             identity: None,
+            source_end_offset: Default::default(),
             id: crate::ClipId(1),
             item: crate::ItemId(2),
             name: "d".into(),

@@ -98,6 +98,7 @@ pub fn split_track_at(track: &mut Track, t: Tick, ctx: &mut EditCtx, links: &mut
     let mut right = left.clone();
     let cut = t - left.start;
     left.duration = cut;
+    left.source_end_offset = Tick::ZERO;
     let new_id = ClipId(ctx.alloc());
     right.id = new_id;
     if let Some(identity) = right.identity.as_mut() {
@@ -114,7 +115,7 @@ pub fn split_track_at(track: &mut Track, t: Tick, ctx: &mut EditCtx, links: &mut
         let consumed = Tick((cut.0 as f64 * left_ref.speed.abs()).round() as i64);
         let total_src = Tick(((cut + right.duration).0 as f64 * left_ref.speed.abs()).round() as i64);
         right.source_in = left_ref.source_in;
-        left_ref.source_in += total_src - consumed;
+        left_ref.source_in += total_src - consumed + right.source_end_offset;
     }
     if let Some(l) = right.link {
         let nl = *links.entry(l).or_insert_with(|| ctx.alloc());
@@ -1077,7 +1078,9 @@ pub fn rate_stretch_items(seq: &mut Sequence, clips: &[ClipId], edge: Edge, delt
     let mut speed = 1.0;
     for c in clips {
         let (_, it) = seq.find_item(*c).ok_or(EditError::NoItem(*c))?;
-        let src_len = it.source_out() - it.source_in;
+        let source_out = it.source_out();
+        let imported_tail = it.source_end_offset.0 != 0;
+        let src_len = source_out - it.source_in;
         let new_dur = match edge {
             Edge::Out => it.duration + d,
             Edge::In => it.duration - d,
@@ -1089,6 +1092,9 @@ pub fn rate_stretch_items(seq: &mut Sequence, clips: &[ClipId], edge: Edge, delt
         }
         it.duration = new_dur;
         it.speed = speed;
+        if imported_tail {
+            it.set_source_out(source_out);
+        }
     }
     Ok(speed)
 }
@@ -1119,7 +1125,9 @@ pub fn set_speed_group(seq: &mut Sequence, clips: &[ClipId], speed: f64, reverse
         if origins.iter().any(|o| o.0 == tid) {
             return Err(EditError::Other("clips on one track change speed one at a time".into()));
         }
-        let src_len = it.source_out() - it.source_in;
+        let source_out = it.source_out();
+        let imported_tail = it.source_end_offset.0 != 0;
+        let src_len = source_out - it.source_in;
         // a tiny speed saturates the cast: keep the clip's end representable
         let room = Tick(Tick::MAX.0.saturating_sub(it.start.0.max(0)));
         let mut new_dur = Tick((src_len.0 as f64 / speed).round() as i64).min(room).max(ctx.min_duration);
@@ -1134,6 +1142,9 @@ pub fn set_speed_group(seq: &mut Sequence, clips: &[ClipId], speed: f64, reverse
         it.speed = speed;
         it.reverse = reverse;
         it.duration = new_dur;
+        if imported_tail {
+            it.set_source_out(source_out);
+        }
         fades_follow_edges(work.track_mut(tid).ok_or(EditError::NoTrack(tid))?, *clip);
         origins.push((tid, old_end, delta));
     }

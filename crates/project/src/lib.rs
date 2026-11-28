@@ -525,6 +525,10 @@ pub struct TrackItem {
     pub duration: Tick,
     /// Media time of the first frame shown.
     pub source_in: Tick,
+    /// Exact source tail independent of frame-conformed record length. Zero on
+    /// ordinary clips; a boundary residual is native state, serialized and undone.
+    #[serde(default, skip_serializing_if = "source_offset_is_zero")]
+    pub source_end_offset: Tick,
     /// Playback speed (1.0 = 100%). Negative = reverse.
     pub speed: f64,
     #[serde(default)]
@@ -630,6 +634,10 @@ pub enum FieldProcessing {
     FlickerRemoval,
 }
 
+fn source_offset_is_zero(t: &Tick) -> bool {
+    t.0 == 0
+}
+
 impl TrackItem {
     pub fn end(&self) -> Tick {
         self.start + self.duration
@@ -657,15 +665,18 @@ impl TrackItem {
     pub fn moving_source_time_at(&self, t: Tick) -> Tick {
         let rel = t - self.start;
         let scaled = Tick((rel.0 as f64 * self.speed.abs()).round() as i64);
-        if self.reverse {
-            self.source_in + Tick((self.duration.0 as f64 * self.speed.abs()).round() as i64) - scaled - Tick(1)
-        } else {
-            self.source_in + scaled
-        }
+        let mapped =
+            if self.reverse { Tick(self.source_out().0.saturating_sub(scaled.0).saturating_sub(1)) } else { Tick(self.source_in.0.saturating_add(scaled.0)) };
+        if self.source_end_offset.0 == 0 { mapped } else { Tick(mapped.0.clamp(self.source_in.0, self.source_out().0.saturating_sub(1).max(self.source_in.0))) }
     }
     /// Media time consumed by the item (the source out point).
     pub fn source_out(&self) -> Tick {
-        self.source_in + Tick((self.duration.0 as f64 * self.speed.abs()).round() as i64)
+        Tick(self.source_in.0.saturating_add((self.duration.0 as f64 * self.speed.abs()).round() as i64).saturating_add(self.source_end_offset.0))
+    }
+    /// Keep the declared media tail while editing the independent record span.
+    pub fn set_source_out(&mut self, out: Tick) {
+        let nominal = self.source_in.0.saturating_add((self.duration.0 as f64 * self.speed.abs()).round() as i64);
+        self.source_end_offset = Tick(out.0.saturating_sub(nominal));
     }
     pub fn effect(&self, id: &str) -> Option<&EffectInstance> {
         self.effects.iter().find(|e| e.effect == id)
@@ -831,6 +842,11 @@ impl Track {
     /// such as overlap or positive duration); what a loaded project must satisfy.
     pub fn check_bounds(&self) -> Result<(), String> {
         for item in &self.items {
+            if item.source_end_offset.0 != 0
+                && (item.source_out() <= item.source_in || !bounded_time_range(item.source_in, Tick(item.source_out().0.saturating_sub(item.source_in.0))))
+            {
+                return Err(format!("{}: item {:?} has invalid independent source bounds", self.name, item.id));
+            }
             if !bounded_time_range(item.start, item.duration) {
                 return Err(format!("{}: item {:?} is outside supported time bounds", self.name, item.id));
             }
@@ -1614,6 +1630,7 @@ impl Project {
         let dur = seq_rate.snap_nearest(source.duration).max(seq_rate.frame_duration());
         Some(TrackItem {
             identity: None,
+            source_end_offset: Default::default(),
             id,
             item,
             name,
