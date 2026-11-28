@@ -150,6 +150,7 @@ fn allowed(id: &str) -> bool {
             | "timeline.place"
             | "edit.clear"
             | "poema.setCarrier"
+            | "poema.setSequenceMetadata"
             | "poema.configureClip"
             | "clip.link"
             | "clip.fitToFrame"
@@ -270,6 +271,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec("agent.undo", "Undo owned Poema batch", |s, p| history(s, p, false), true),
         spec("agent.redo", "Redo owned Poema batch", |s, p| history(s, p, true), true),
         spec("poema.setCarrier", "Stamp timed Poema ids", carrier, true),
+        spec("poema.setSequenceMetadata", "Preserve Poema editorial metadata", crate::poema_metadata::set, true),
     ]
 }
 
