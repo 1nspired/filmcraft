@@ -73,6 +73,7 @@ impl CommandJournal {
 }
 
 pub(crate) struct BridgeState {
+    pub(crate) staging: bool,
     pub(crate) owner: String,
     pub(crate) previews: crate::agent_preview::PreviewState,
     serial: u64,
@@ -84,6 +85,7 @@ pub(crate) struct BridgeState {
 impl Default for BridgeState {
     fn default() -> Self {
         Self {
+            staging: false,
             owner: fresh_owner(),
             previews: Default::default(),
             serial: 0,
@@ -197,6 +199,7 @@ pub(crate) fn stage(s: &Session, p: &Value) -> Result<(Session, Vec<Value>, Stri
     // Stage in a separate Session. Neither preview publication nor persistence in the
     // live Session can observe intermediate states. This is the v185 batch pattern.
     let mut staged = Session::new(s.services.clone());
+    staged.agent_bridge.staging = true;
     staged.project = s.project.clone();
     staged.state = s.state.clone();
     staged.media = s.media.clone();
@@ -244,6 +247,25 @@ fn history(s: &mut Session, p: &Value, redo: bool) -> Result<Value> {
     let label = if redo { s.redo() } else { s.undo() }.ok_or_else(|| bad(command, "owned history is unavailable"))?;
     s.agent_bridge.owned = Some((commit.clone(), s.revision, s.history.undo.len(), !redo, Arc::downgrade(&s.project)));
     Ok(json!({"commit":commit,"revision":s.revision,"label":label}))
+}
+/// Audition changes invalidate read tickets but keep ownership of an unchanged
+/// edit-history entry. Never resurrect a claim already invalidated by a human edit.
+pub(crate) fn retain_owned_after_monitor(s: &mut Session, before: &Arc<filmcraft_project::Project>, revision: u64) {
+    if let Some((commit, rev, depth, undone, project)) = s.agent_bridge.owned.clone()
+        && rev == revision
+        && depth == s.history.undo.len()
+        && project.upgrade().is_some_and(|p| Arc::ptr_eq(&p, before))
+    {
+        s.agent_bridge.owned = Some((commit, s.revision, depth, undone, Arc::downgrade(&s.project)));
+    }
+}
+fn monitor(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "agent.monitor";
+    guard(s, p, CMD)?;
+    if !p.as_object().is_some_and(|m| m.keys().all(|k| matches!(k.as_str(), "token" | "updates"))) {
+        return Err(bad(CMD, "need only token and explicit updates"));
+    }
+    crate::poema_monitor::set(s, &json!({"updates":p.get("updates")}))
 }
 fn configure(s: &mut Session, p: &Value) -> Result<Value> {
     let clip = p["clip"].as_u64().map(ClipId).ok_or_else(|| bad("poema.configureClip", "need clip"))?;
@@ -339,6 +361,8 @@ fn spec(id: &'static str, label: &'static str, run: fn(&mut Session, &Value) -> 
 pub(crate) fn commands() -> Vec<CommandSpec> {
     vec![
         spec("poema.configureClip", "Configure delivered clip", configure, true),
+        spec("poema.setMonitor", "Set native Poema audition", crate::poema_monitor::set, true),
+        spec("agent.monitor", "Set guarded native Poema audition", monitor, true),
         spec("poema.patchClip", "Set explicit clip playback properties", patch_clip, true),
         spec("poema.owner", "Read managed native project owner", crate::project_owner::status, false),
         spec("poema.checkpoint", "Checkpoint the guarded native owner", crate::project_owner::checkpoint, false),

@@ -413,3 +413,21 @@ The guarded batch/preview door admits this command and `timeline.setTrack`.
 Mixed operations stage and check together, then commit as one native Undo and
 one journal event. Host admission and policy are separate: this prerequisite
 does not migrate a Poema caller or enable any real film.
+
+### Poema native audition (B4a3 prerequisite)
+
+`agent.monitor {token, updates:[{track:<native audio id>, muted?:bool, solo?:bool}]}`
+changes 1–128 explicitly addressed audio audition settings under the same read guard.
+`poema.setMonitor {updates}` is its direct native command. Poema-tagged sequences route
+pure audio M/S calls from `timeline.setTrack` and `mixer.setStrip` to this same door.
+Ordinary FilmCraft projects retain their existing versioned M/S behavior.
+
+The renderer reads the actual native track flags. Bounded per-sequence
+`poema.monitor.v1` intent preserves both flags, including explicit false, through
+native Undo/Redo and project save/reopen. Audition invalidates stale reads and
+publishes one journal event on change, without adding history or clearing Redo.
+A valid owned edit-history claim follows the audition revision; an invalidated
+claim is never resurrected. Corrupt intent refuses before consuming history.
+Mixed/versioned M/S on a monitored sequence refuses until separately proved.
+Host human/agent routing is still planned in the next stacked piece; this
+prerequisite does not enable a real film or write a Node monitor overlay.
