@@ -44,6 +44,8 @@
 //!   readers must refuse rather than drop the source boundary when saving.
 //! - **v17**: Poema-managed project files require cooperative OS file ownership.
 //!   Older readers cannot enforce the lease and must refuse these files.
+//! - **v20**: optional native program extent policy. Missing preserves native duration;
+//!   older readers reject rather than discard an explicit program policy.
 //! - **v18**: explicit stereo-balance and mono-source mixer laws. Older readers
 //!   would silently change the sound and must refuse these files.
 
@@ -68,7 +70,7 @@ pub type Migration = fn(Value) -> Result<Value, String>;
 /// edit a shipped one.
 pub const MIGRATIONS: &[Migration] = &[
     v1_to_v2, v2_to_v3, v3_to_v4, v4_to_v5, v5_to_v6, v6_to_v7, v7_to_v8, v8_to_v9, v9_to_v10, v10_to_v11, v11_to_v12, v12_to_v13, v13_to_v14, v14_to_v15,
-    v15_to_v16, v16_to_v17, v17_to_v18, v18_to_v19,
+    v15_to_v16, v16_to_v17, v17_to_v18, v18_to_v19, v19_to_v20,
 ];
 
 /// The schema version this build writes (and the newest it reads).
@@ -391,13 +393,40 @@ fn v18_to_v19(doc: Value) -> Result<Value, String> {
     Ok(doc)
 }
 
+// v19 → v20: absent program extent retains the existing native duration.
+// Older readers must reject a file rather than discard its explicit policy.
+fn v19_to_v20(doc: Value) -> Result<Value, String> {
+    Ok(doc)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn program_extent_is_versioned_and_old_sequences_keep_native_default() {
+        let mut project = Project::new("Versioned extent");
+        let id = project.new_sequence("q", Default::default(), 1, 1, None);
+        let mut old: Value = serde_json::from_slice(&encode(&project, false)).unwrap();
+        old["schema_version"] = serde_json::json!(19);
+        let restored = decode(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(restored.project.sequence(id).unwrap().program_extent.is_none());
+        project.sequence_mut(id).unwrap().program_extent = Some(filmcraft_project::ProgramExtentPolicy::Poema);
+        let bytes = encode(&project, false);
+        assert_eq!(detect_version(&serde_json::from_slice(&bytes).unwrap()).unwrap(), 20);
+        let restored = decode(&bytes).unwrap();
+        assert_eq!(restored.project, project);
+        assert_eq!(restored.project.sequence(id).unwrap().program_extent, Some(filmcraft_project::ProgramExtentPolicy::Poema));
+        let mut invalid: Value = serde_json::from_slice(&bytes).unwrap();
+        let item = invalid["project"]["items"].as_object_mut().unwrap().get_mut(&id.0.to_string()).unwrap();
+        item["kind"]["Sequence"]["program_extent"] = serde_json::json!("unsupported");
+        let bytes = serde_json::to_vec(&invalid).unwrap();
+        assert!(std::panic::catch_unwind(|| decode(&bytes)).unwrap().is_err());
+    }
+
     use super::*;
 
     #[test]
     fn schema_version_matches_table() {
-        assert_eq!(SCHEMA_VERSION, 19);
+        assert_eq!(SCHEMA_VERSION, 20);
     }
 
     #[test]

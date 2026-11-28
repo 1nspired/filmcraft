@@ -180,6 +180,7 @@ fn allowed(id: &str) -> bool {
             | "poema.setChannelSum"
             | "poema.setAudioFades"
             | "poema.setAudioLaw"
+            | "poema.setExtentPolicy"
             | "poema.setScalarCurve"
             | "timeline.setTrack"
             | "clip.link"
@@ -447,6 +448,10 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec("agent.monitor", "Set guarded native Poema audition", monitor, true),
         spec("poema.setScalarCurve", "Set native scalar keyframes and tangents", crate::poema_scalar_curve::set, true),
         spec("poema.setAudioLaw", "Set explicit stereo and mono-source mixer laws", crate::poema_audio_law::set, true),
+        CommandSpec {
+            params: r#"{"policy":"poema"|"native"}"#,
+            ..spec("poema.setExtentPolicy", "Set native program extent policy", crate::poema_extent::set, true)
+        },
         spec("poema.setAudioFades", "Set exact clip audio fades", crate::poema_audio_fades::set, true),
         spec("poema.setChannelSum", "Set exact stereo-centre Channel Mixer", crate::poema_channel_sum::set, true),
         spec("poema.patchClip", "Set explicit clip playback properties", patch_clip, true),

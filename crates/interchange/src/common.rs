@@ -505,6 +505,7 @@ impl Builder {
 
 pub(crate) fn empty_sequence(settings: SequenceSettings) -> Sequence {
     Sequence {
+        program_extent: None,
         settings,
         video_tracks: Vec::new(),
         audio_tracks: Vec::new(),

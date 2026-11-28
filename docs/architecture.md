@@ -152,6 +152,12 @@ EffectInstance
 
 - **Graphic clips** ([graphics.md](graphics.md)) reference a `Graphic` canvas item; their text and
   shape layers are hidden `graphic_text` / `graphic_shape` effect instances on the track item.
+- `Sequence.program_extent` is optional native state (schema20). Absent keeps
+  ordinary furthest-item/caption duration. The explicit Poema policy derives
+  program duration from the first picture track or harness audio, falling back
+  to sound without a picture spine; free tails remain in their native tracks.
+  Native Undo and all duration readers share this policy; no app duration cache
+  supplies playback geometry.
 - Everything is plain serde data. `Sequence::check()` validates the invariants (no overlaps, unique
   ids), and the engine runs it after every sequence edit.
 - Timeline positions are sequence ticks; `source_in` and keyframes are in media time, so trims and
