@@ -5,7 +5,7 @@ use crate::{Result, Session};
 use filmcraft_project::{ClipId, ClipIdentity, ItemKind};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, hash_map::RandomState};
+use std::collections::{BTreeMap, BTreeSet, hash_map::RandomState};
 use std::hash::BuildHasher;
 use std::sync::{
     Arc, Mutex, Weak,
@@ -167,6 +167,7 @@ fn allowed(id: &str) -> bool {
     matches!(
         id,
         "timeline.trim"
+            | "timeline.move"
             | "timeline.razor"
             | "timeline.place"
             | "edit.clear"
@@ -186,6 +187,30 @@ fn allowed(id: &str) -> bool {
             | "markers.add"
     )
 }
+// The first guarded move profile is an explicit bounded overwrite move on
+// existing tracks. Copy/new-track/insert and implicit link expansion retain
+// their ordinary human command but need a separate batch audit/proof.
+fn audited_move(p: &Value) -> bool {
+    let Some(fields) = p.as_object() else { return false };
+    if fields.keys().any(|k| !matches!(k.as_str(), "moves" | "linked" | "insert" | "copy"))
+        || ["linked", "insert", "copy"].iter().any(|k| p.get(k).and_then(Value::as_bool) != Some(false))
+    {
+        return false;
+    }
+    let Some(moves) = p.get("moves").and_then(Value::as_array) else { return false };
+    if moves.is_empty() || moves.len() > 4096 {
+        return false;
+    }
+    let mut seen = BTreeSet::new();
+    moves.iter().all(|m| {
+        let Some(fields) = m.as_object() else { return false };
+        let Some(clip) = m.get("clip").and_then(Value::as_u64) else { return false };
+        fields.len() == 3
+            && m.get("track").and_then(Value::as_u64).is_some()
+            && m.get("time").and_then(Value::as_i64).is_some_and(|t| (0..=filmcraft_time::Tick::MAX.0).contains(&t))
+            && seen.insert(clip)
+    })
+}
 fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     guard(s, p, "agent.apply")?;
     let (staged, results, label) = stage(s, p)?;
@@ -195,6 +220,9 @@ pub(crate) fn stage(s: &Session, p: &Value) -> Result<(Session, Vec<Value>, Stri
     let ops: Vec<Operation> = serde_json::from_value(p["operations"].clone()).map_err(|e| bad("agent.apply", e.to_string()))?;
     if ops.is_empty() || ops.len() > 256 || ops.iter().any(|o| !allowed(&o.command)) {
         return Err(bad("agent.apply", "batch needs 1..256 audited, in-memory edit operations"));
+    }
+    if ops.iter().any(|o| o.command == "timeline.move" && !audited_move(&o.params)) {
+        return Err(bad("agent.apply", "guarded timeline.move needs 1..4096 unique explicit clip/track/time moves, linked:false, insert:false, copy:false"));
     }
     let label = p["label"].as_str().unwrap_or("Poema edit");
     if label.is_empty() || label.len() > 256 {
@@ -407,6 +435,93 @@ mod tests {
     }
     fn trim(id: u64) -> Value {
         json!({"command":"timeline.trim","params":{"clip":id,"edge":"out","deltaFrames":-1}})
+    }
+    #[test]
+    fn guarded_explicit_move_previews_once_commits_once_and_undo_restores_carriers_and_parked_tracks() {
+        use filmcraft_time::Tick;
+        let mut s = demo();
+        let q = s.active_sequence().unwrap();
+        let target = q.video_tracks[0].items.last().unwrap().clone();
+        let track = q.video_tracks[0].id.0;
+        let destination = target.end() + Tick::from_seconds_f64(1.0);
+        s.execute("poema.setCarrier", json!({"clip":target.id.0,"identity":{"id":"move-original","handoffSpans":[{"carrier":"poema:sel_move","sourceIn":target.source_in.0.to_string(),"sourceOut":target.source_out().0.to_string()}]}})).unwrap();
+        let before = s.project.clone();
+        let state = serde_json::to_value(&s.state).unwrap();
+        let depth = s.history.undo.len();
+        let basis = s.execute("agent.snapshot", json!({})).unwrap();
+        let (_, events, _subscription) = s.command_journal.subscribe().unwrap();
+        let params = json!({"moves":[{"clip":target.id.0,"track":track,"time":destination.0}],"linked":false,"insert":false,"copy":false});
+        let staged = s.execute("agent.preview", json!({"token":basis["token"],"operations":[{"command":"timeline.move","params":params}]})).unwrap();
+        assert!(Arc::ptr_eq(&before, &s.project));
+        assert_eq!(serde_json::to_value(&s.state).unwrap(), state);
+        assert_eq!(s.history.undo.len(), depth);
+        assert!(events.try_recv().is_err());
+        let mut expected = before.as_ref().clone();
+        let ItemKind::Sequence(q) = &mut expected.items.get_mut(&s.state.active_sequence.unwrap()).unwrap().kind else { panic!("fixture sequence") };
+        let track = &mut Arc::make_mut(q).video_tracks[0];
+        track.items.last_mut().unwrap().start = destination;
+        // The existing move command drops a transition to an unmoved partner.
+        // Poema's current projection refuses transitions, but this demo has one.
+        track.transitions.retain(|t| t.from != Some(target.id) && t.to != Some(target.id));
+        let applied = s.execute("agent.commitPreview", json!({"token":basis["token"],"preview":staged["preview"]})).unwrap();
+        assert_eq!(serde_json::to_value(&s.project).unwrap(), serde_json::to_value(expected).unwrap());
+        assert_eq!(s.history.undo.len(), depth + 1);
+        assert_eq!(events.try_recv().unwrap()["command"], "agent.commitPreview");
+        assert!(events.try_recv().is_err());
+        let basis = s.execute("agent.snapshot", json!({})).unwrap();
+        s.execute("agent.undo", json!({"token":basis["token"],"commit":applied["commit"]})).unwrap();
+        assert!(Arc::ptr_eq(&before, &s.project));
+        assert_eq!(events.try_recv().unwrap()["command"], "agent.undo");
+        assert!(events.try_recv().is_err());
+    }
+    #[test]
+    fn guarded_move_hostile_profiles_and_missing_targets_leave_prior_prefix_unpublished() {
+        let mut s = demo();
+        let id = clip(&s);
+        let track = s.active_sequence().unwrap().video_tracks[0].id.0;
+        let base = json!({"moves":[{"clip":id,"track":track,"time":0}],"linked":false,"insert":false,"copy":false});
+        let mut bad = vec![
+            Value::Null,
+            json!({}),
+            json!({"moves":[]}),
+            json!({"moves":vec![json!({"clip":id,"track":track,"time":0});4097],"linked":false,"insert":false,"copy":false}),
+        ];
+        for key in ["linked", "insert", "copy"] {
+            let mut p = base.clone();
+            p[key] = json!(true);
+            bad.push(p);
+        }
+        for time in [json!(-1), json!(i64::MAX), json!("0"), json!(0.5), Value::Null] {
+            let mut p = base.clone();
+            p["moves"][0]["time"] = time;
+            bad.push(p);
+        }
+        let mut duplicate = base.clone();
+        duplicate["moves"] = json!([base["moves"][0], base["moves"][0]]);
+        bad.push(duplicate);
+        let mut new_track = base.clone();
+        new_track["moves"][0]["track"] = json!("new");
+        bad.push(new_track);
+        let mut unknown = base.clone();
+        unknown["extra"] = json!(false);
+        bad.push(unknown);
+        let mut missing = base;
+        missing["moves"][0]["clip"] = json!(u64::MAX);
+        bad.push(missing);
+        let before = s.project.clone();
+        let depth = s.history.undo.len();
+        let basis = s.execute("agent.snapshot", json!({})).unwrap();
+        let (_, events, _subscription) = s.command_journal.subscribe().unwrap();
+        for params in bad {
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                s.execute("agent.apply", json!({"token":basis["token"],"operations":[trim(id),{"command":"timeline.move","params":params}]}))
+            }));
+            assert!(out.is_ok());
+            assert!(out.unwrap().is_err());
+            assert!(Arc::ptr_eq(&before, &s.project));
+            assert_eq!(s.history.undo.len(), depth);
+            assert!(events.try_recv().is_err());
+        }
     }
     #[test]
     fn explicit_playback_patch_and_track_settings_share_one_checked_undo() {

@@ -537,6 +537,18 @@ or host curve routing is complete. The Poema/external-adapter code stays
 unchanged and unsupported curve state remains planned.
 
 
+### Guarded explicit moves (B5a1)
+
+The native `timeline.move` command is admitted to guarded apply/preview only
+with explicit `linked:false, insert:false, copy:false`, 1..4096 unique
+`{clip,track,time}` entries, numeric existing track addresses and nonnegative
+bounded integer ticks. Unknown fields, duplicates, copy/insert/new-track modes
+and implicit link expansion refuse before staging. The ordinary human command
+retains its existing behavior. A guarded move uses that same engine command
+inside the private Session; a failed suffix publishes neither an earlier edit
+nor a journal event. Preview/commit is one native Undo, preserving source clocks,
+carriers and unrelated parked tracks. Other move profiles need their own audit.
+
 ### Tagged Poema clip-curve provenance
 
 For a Poema-tagged Volume.level curve, direct human effects.setParam,
