@@ -1066,6 +1066,11 @@ impl Sequence {
         if self.program_extent == Some(ProgramExtentPolicy::Poema) {
             return program_extent::poema_duration(self);
         }
+        self.content_duration()
+    }
+    /// Furthest stored media/caption edge, independent of the program's render extent.
+    /// View controls use this so out-of-program items remain reachable and editable.
+    pub fn content_duration(&self) -> Tick {
         let media = self.video_tracks.iter().chain(&self.audio_tracks).map(Track::end).max().unwrap_or(Tick::ZERO);
         media.max(self.caption_tracks.iter().map(CaptionTrack::end).max().unwrap_or(Tick::ZERO))
     }

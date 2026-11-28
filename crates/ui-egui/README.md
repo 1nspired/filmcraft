@@ -84,3 +84,7 @@ buttons use `craft-ui::layout::fit_toolbar`; commands beyond the available width
 through More, including their selected state and Source/Program routing. A scrolling fallback
 retains all commands if even More cannot fit. `monitor_geometry` checks the painted readouts,
 control bounds, overflow actions and Source drag payloads across monitor widths and themes.
+
+## Poema programme and content extents
+
+An explicitly Poema-tagged sequence can render a shorter programme while retaining parked media beyond it. Timeline Fit, empty-view detection, horizontal scroll/wheel limits and zoom scrollbar use the complete stored media/caption extent. Programme out indicators, playback, master mix and render retain programme duration. Ordinary native sequences retain their existing extent. `poema_content_ui` drives the real shared UI/control channel with a three-second programme and an audio tail at 900–902 seconds, proving Fit, reachability and selection without a project or history edit. Its optional `FILMCRAFT_POEMA_CONTENT_SHOT_DIR` saves private wgpu-rendered screenshots of synthetic content.
