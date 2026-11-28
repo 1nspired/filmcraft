@@ -472,3 +472,12 @@ the host; host routing/import remain separately gated until their proofs.
 
 Changing an existing envelope preserves its native effect-list position. A
 change-and-revert preview is a real no-op even beside another audio effect.
+
+A guarded preview also recognises the optional envelope's non-rendering list
+position (and its exact positive-zero/equal-power neutral form). It compares
+bounded private copies; all other fields and other effects' relative order stay
+exact. A semantic no-op commit retains the original project pointer, revision,
+history and journal. Neither live project nor staged audio is rewritten by the
+comparison; the ordinary renderer is unchanged. Projects with no supported
+optional envelope retain the exact existing comparison. `agent.apply` retains
+its existing commit semantics; this rule belongs to preview/commitPreview.
