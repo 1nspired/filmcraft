@@ -210,7 +210,7 @@ fn db_gain(db: f64) -> f32 {
 /// One automatable control of a strip, ready for per-sample evaluation.
 struct Lane<'a> {
     param: Option<&'a Param>,
-    offset: Option<(&'a Param, f64)>,
+    offset: Option<(&'a Param, f64, Option<Override>)>,
     stat: f64,
     ov: Option<Override>,
     /// Switch lanes (mute) hold between keyframes whatever their interpolation.
@@ -222,36 +222,52 @@ impl<'a> Lane<'a> {
         let reads = track.mixer.mode.reads();
         let param = track.lane(key).filter(|p| reads && p.is_animated());
         let hold = filmcraft_project::mixer::lane_info(key).is_some_and(|i| i.hold);
-        let offset = filmcraft_project::mixer::offset_lane(key).and_then(|(lane, scale)| track.lane(lane).filter(|_| reads).map(|p| (p, scale)));
+        let offset = filmcraft_project::mixer::offset_lane(key)
+            .and_then(|(lane, scale)| track.lane(lane).filter(|_| reads).map(|p| (p, scale, ovs.get(&(strip, lane.to_string())).copied())));
         Lane { param, offset, stat: track.lane_static(key).unwrap_or(0.0), ov: ovs.get(&(strip, key.to_string())).copied(), hold }
     }
-    fn auto(&self, t: Tick) -> f64 {
-        let base = match self.param {
+    fn base_auto(&self, t: Tick) -> f64 {
+        match self.param {
             None => self.stat,
             Some(p) if self.hold => {
                 let i = p.keyframes.partition_point(|k| k.time <= t);
                 p.keyframes[i.saturating_sub(1)].value.as_f64().unwrap_or(0.0)
             }
             Some(p) => p.scalar_at(t),
-        };
-        base + self.offset.map(|(p, scale)| p.scalar_at(t) * scale).unwrap_or(0.0)
+        }
     }
-    /// The value when it is the same at every sample.
+    /// The value when both independent controls stay the same at every sample.
     fn constant(&self) -> Option<f64> {
-        match self.ov {
-            Some(Override { value, release: None }) => Some(value),
+        let base = match self.ov {
+            Some(Override { value, release: None }) => value,
+            Some(_) => return None,
+            None if self.param.is_none() => self.stat,
+            None => return None,
+        };
+        match self.offset {
+            None => Some(base),
+            Some((_, scale, Some(Override { value, release: None }))) => Some(base + value * scale),
+            Some((_, _, Some(_))) => None,
+            Some((p, scale, None)) if !p.is_animated() => Some(base + p.value.as_f64().unwrap_or(0.0) * scale),
             Some(_) => None,
-            None if self.param.is_none() && self.offset.is_none_or(|(p, _)| !p.is_animated()) => {
-                Some(self.stat + self.offset.and_then(|(p, scale)| p.value.as_f64().map(|v| v * scale)).unwrap_or(0.0))
-            }
-            None => None,
         }
     }
     fn at(&self, t: Tick) -> f64 {
-        match self.ov {
-            None => self.auto(t),
+        let base = match self.ov {
+            None => self.base_auto(t),
             Some(Override { value, release: None }) => value,
-            Some(o) => o.at(t, self.auto(t)),
+            Some(o) => o.at(t, self.base_auto(t)),
+        };
+        // Holding either control never suppresses the other control's automation.
+        match self.offset {
+            None => base,
+            Some((p, scale, ov)) => {
+                let value = match ov {
+                    Some(o) => o.at(t, p.scalar_at(t)),
+                    None => p.scalar_at(t),
+                };
+                base + value * scale
+            }
         }
     }
     /// Per-sample values for content samples `c0 ..`, mapped through `f`, into `out`.

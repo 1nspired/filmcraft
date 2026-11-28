@@ -247,6 +247,74 @@ fn track_gain_and_pan_offsets_follow_the_sequence_at_every_sample() {
 }
 
 #[test]
+fn live_faders_keep_track_offsets_during_hold_and_touch_release() {
+    for animated in [false, true] {
+        for released in [false, true] {
+            for offset_control in [0, 1, 2] {
+                let mut r = Rig::new(&[dc]);
+                let id = {
+                    let tr = r.track(0);
+                    tr.volume_db = -3.0;
+                    tr.pan = 20.0;
+                    tr.mixer.stereo_balance = filmcraft_project::mixer::StereoBalanceLaw::Linear;
+                    for (lane, a, b) in [("volume.offset", -12.0, 0.0), ("pan.offset", -0.4, 0.4)] {
+                        let mut p = filmcraft_project::Param::new(ParamValue::Float(a));
+                        if animated {
+                            p.keyframes = vec![kf(0, a), kf(4800, b)];
+                        }
+                        tr.mixer.lanes.insert(lane.into(), p);
+                    }
+                    tr.id
+                };
+                let live = LiveMix::new();
+                live.hold(id, LANE_VOLUME, -9.0);
+                live.hold(id, LANE_PAN, -20.0);
+                if released {
+                    for lane in [LANE_VOLUME, LANE_PAN] {
+                        live.release(id, lane, Tick::from_units(1200, SR), Tick::from_units(2400, SR));
+                    }
+                }
+                if offset_control != 0 {
+                    live.hold(id, "volume.offset", -6.0);
+                    live.hold(id, "pan.offset", 0.1);
+                    if offset_control == 2 {
+                        for lane in ["volume.offset", "pan.offset"] {
+                            live.release(id, lane, Tick::from_units(600, SR), Tick::from_units(1800, SR));
+                        }
+                    }
+                }
+                let whole = r.mix_cut(37, 4800, &[4800], Some(&live));
+                for i in 0..4800 {
+                    let at = (37 + i) as f64;
+                    let u = if animated { (at / 4800.0).min(1.0) } else { 0.0 };
+                    let ramp = if released { ((at - 1200.0) / 2400.0).clamp(0.0, 1.0) } else { 0.0 };
+                    let curve_gain = -12.0 + 12.0 * u;
+                    let curve_pan = -0.4 + 0.8 * u;
+                    let (offset_gain, offset_pan) = if offset_control == 0 {
+                        (curve_gain, curve_pan)
+                    } else {
+                        let a = if offset_control == 2 { ((at - 600.0) / 1800.0).clamp(0.0, 1.0) } else { 0.0 };
+                        (-6.0 + (curve_gain + 6.0) * a, 0.1 + (curve_pan - 0.1) * a)
+                    };
+                    let gain = 0.5 * 10f64.powf((-9.0 + 6.0 * ramp + offset_gain) / 20.0);
+                    let pan = (-0.2 + 0.4 * ramp + offset_pan).clamp(-1.0, 1.0);
+                    let expected = [gain * (1.0 - pan.max(0.0)), gain * (1.0 + pan.min(0.0))];
+                    for c in 0..2 {
+                        assert!(
+                            (f64::from(whole[c][i]) - expected[c]).abs() < 1e-6,
+                            "animated={animated} released={released} offset_control={offset_control} sample={i} channel={c}: {} vs {}",
+                            whole[c][i],
+                            expected[c]
+                        );
+                    }
+                }
+                assert_eq!(r.mix_cut(37, 4800, &[1, 63, 257], Some(&live)), whole);
+            }
+        }
+    }
+}
+
+#[test]
 fn clip_volume_and_track_automation_both_apply() {
     let mut r = Rig::new(&[dc]);
     {
