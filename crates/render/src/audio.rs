@@ -244,15 +244,16 @@ fn mix_item(
         }
         effected(item, &|m0, len| src.audio_stream(item.audio_stream, m0, len, sr).ok(), a0, n, sr, w, mono_gain)
     };
-    // gains: clip gain × Volume (keyframed, per 64-sample block) × channel volume × panner
+    // gains: clip gain × Volume (sample-accurate keyframes) × channel volume × panner
     let clip_gain = db_to_gain(item.gain_db);
     let envelope = crate::audio_envelope::Envelope::for_item(item, sr);
     let vol = item.effect("volume").filter(|e| e.enabled && !e.param("bypass").and_then(|p| p.value.as_bool()).unwrap_or(false));
+    let animated_volume = vol.and_then(|e| e.param("level")).filter(|p| p.is_animated());
     let chv = item.effect("channel_volume").filter(|e| e.enabled && !e.param("bypass").and_then(|p| p.value.as_bool()).unwrap_or(false));
     let pan = item.effect("panner").filter(|e| e.enabled);
     let off = (a0 - start) as usize;
-    // Gains change on an absolute 64-sample grid, so the output does not depend on how callers cut
-    // the timeline into requests.
+    // Channel volume and pan retain their absolute 64-sample grid. Animated clip Volume uses
+    // each output sample's source clock, independent of how callers partition requests.
     let mut blk = 0usize;
     while blk < n {
         let t_tl = Tick::from_units((a0 + blk as i64).div_euclid(64) * 64, sr as i64);
@@ -271,23 +272,37 @@ fn mix_item(
             None => (1.0, 1.0),
         };
         let g = clip_gain * v * extra;
+        // Static clips retain the inexpensive block gain. Evaluate an animated Volume once per
+        // sample (shared by all channels); the live Clip Mixer override still composes with it.
+        let gain_at = |i: usize| match animated_volume {
+            Some(p) => {
+                let t = Tick::from_units(a0.saturating_add(i as i64), sr as i64);
+                let auto = p.f64_at(item.source_time_at(t));
+                let db = live.vol.map(|o| o.at(t, auto)).unwrap_or(auto);
+                clip_gain * db_to_gain(db) * extra
+            }
+            None => g,
+        };
         let end = (((a0 + blk as i64).div_euclid(64) + 1) * 64 - a0).min(n as i64) as usize;
         if w == 2 {
             for i in blk..end {
+                let g = gain_at(i);
                 let envelope_gain = envelope.gain(a0 + i as i64 - item_s0);
                 let (l, r) = (buf[0][i] * envelope_gain, buf[1][i] * envelope_gain);
                 out.channels[0][off + i] += l * g * cl * pl;
                 out.channels[1][off + i] += r * g * cr * pr;
             }
         } else {
-            for (c, (dst, src)) in out.channels.iter_mut().zip(&buf).enumerate() {
-                let gc = g * match c {
-                    chans::L => cl,
-                    chans::R => cr,
-                    _ => 1.0,
-                };
-                for i in blk..end {
-                    dst[off + i] += src[i] * gc * envelope.gain(a0 + i as i64 - item_s0);
+            for i in blk..end {
+                let g = gain_at(i);
+                let envelope_gain = envelope.gain(a0 + i as i64 - item_s0);
+                for (c, (dst, src)) in out.channels.iter_mut().zip(&buf).enumerate() {
+                    let gc = g * match c {
+                        chans::L => cl,
+                        chans::R => cr,
+                        _ => 1.0,
+                    };
+                    dst[off + i] += src[i] * gc * envelope_gain;
                 }
             }
         }
