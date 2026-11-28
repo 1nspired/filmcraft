@@ -12,7 +12,7 @@
 //! `timeline.track.A1.lane.kf.<n>` (the diamonds).
 
 use egui::{Align2, Color32, CursorIcon, Rect, Sense, Stroke, pos2, vec2};
-use filmcraft_project::mixer::{LANE_MUTE, LANE_PAN, LANE_VOLUME, lane_info, parse_fx_lane, send_lane};
+use filmcraft_project::mixer::{LANE_MUTE, LANE_PAN, LANE_PAN_OFFSET, LANE_VOLUME, LANE_VOLUME_OFFSET, lane_info, parse_fx_lane, send_lane};
 use filmcraft_project::{ParamKind, Sequence, Track, TrackKind};
 use filmcraft_time::Tick;
 use serde_json::json;
@@ -32,6 +32,12 @@ pub fn lane_options(tr: &Track) -> Vec<(String, String)> {
         (LANE_PAN.to_string(), tl!("Panner").to_string()),
         (LANE_MUTE.to_string(), tl!("Mute").to_string()),
     ];
+    // Existing projects keep the same menu. Imported additive curves use the same human tools.
+    for (key, label) in [(LANE_VOLUME_OFFSET, tl!("Gain offset")), (LANE_PAN_OFFSET, tl!("Pan offset"))] {
+        if tr.mixer.lanes.contains_key(key) {
+            v.push((key.into(), label.into()));
+        }
+    }
     for (i, s) in tr.mixer.sends.iter().enumerate() {
         let _ = s;
         v.push((send_lane(i), tlf!("Send {n} Level", n = i + 1)));

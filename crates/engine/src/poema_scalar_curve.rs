@@ -15,13 +15,13 @@ struct Request {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Point {
-    time: i64,
-    value: f64,
+pub(crate) struct Point {
+    pub(crate) time: i64,
+    pub(crate) value: f64,
     #[serde(default)]
-    in_handle: Option<[f64; 2]>,
+    pub(crate) in_handle: Option<[f64; 2]>,
     #[serde(default)]
-    out_handle: Option<[f64; 2]>,
+    pub(crate) out_handle: Option<[f64; 2]>,
 }
 pub(crate) const CURVE_BY: &str = "poema.gainCurve.by.v1";
 pub(crate) const CURVE_PRESENT: &str = "poema.gainCurve.present.v1";
@@ -48,16 +48,20 @@ pub(crate) fn human_curve_target(item: &filmcraft_project::TrackItem, effect: &V
 }
 /// Cross-language SHA-256 over scalar bytes, never numeric editorial state.
 pub(crate) fn curve_basis(p: &filmcraft_project::Param) -> Result<String> {
+    param_basis(p, b"poema-clip-gain-curve-v1\0", CMD)
+}
+/// Shared byte-exact digest; domains keep source-clock and sequence-clock curves distinct.
+pub(crate) fn param_basis(p: &filmcraft_project::Param, domain: &[u8], command: &str) -> Result<String> {
     use sha2::Digest;
     let float = |v: &ParamValue| match v {
         ParamValue::Float(n) if n.is_finite() => Ok(*n),
-        _ => Err(bad(CMD, "curve basis requires finite Float values")),
+        _ => Err(bad(command, "curve basis requires finite Float values")),
     };
     if p.keyframes.len() > 4096 {
-        return Err(bad(CMD, "curve basis exceeds point bound"));
+        return Err(bad(command, "curve basis exceeds point bound"));
     }
     let mut h = sha2::Sha256::new();
-    h.update(b"poema-clip-gain-curve-v1\0");
+    h.update(domain);
     h.update(float(&p.value)?.to_le_bytes());
     h.update((p.keyframes.len() as u32).to_le_bytes());
     for k in &p.keyframes {
@@ -172,21 +176,20 @@ pub(crate) fn edit_handles(prm: &mut filmcraft_project::Param, at: Tick, p: &Val
     Ok(())
 }
 
-pub(crate) fn set(s: &mut Session, p: &Value) -> Result<Value> {
-    crate::project_owner::writable(s)?;
-    let r: Request = serde_json::from_value(p.clone()).map_err(|e| bad(CMD, e.to_string()))?;
-    if r.param.is_empty() || r.param.len() > 128 || r.points.len() == 1 || r.points.len() > 4096 {
-        return Err(bad(CMD, "need a named scalar parameter and zero or 2..4096 points"));
+/// Validated native scalar keys used by clip and additive track command doors.
+pub(crate) fn scalar_keys(points: Vec<Point>, command: &str) -> Result<Vec<Keyframe>> {
+    if points.len() == 1 || points.len() > 4096 {
+        return Err(bad(command, "need zero or 2..4096 points"));
     }
-    let mut keys = Vec::with_capacity(r.points.len());
+    let mut keys = Vec::with_capacity(points.len());
     let mut previous = None;
-    for p in r.points {
+    for p in points {
         if !(Tick::MIN.0..=Tick::MAX.0).contains(&p.time) || previous.is_some_and(|t| t >= p.time) || !p.value.is_finite() || p.value.abs() > 1e6 {
-            return Err(bad(CMD, "curve times must be bounded and strictly increasing, values finite and bounded"));
+            return Err(bad(command, "curve times must be bounded and strictly increasing, values finite and bounded"));
         }
         for h in [p.in_handle, p.out_handle].into_iter().flatten() {
             if h.iter().any(|v| !v.is_finite() || v.abs() > 1e6) {
-                return Err(bad(CMD, "invalid tangent"));
+                return Err(bad(command, "invalid tangent"));
             }
         }
         let mut k = Keyframe::new(Tick(p.time), ParamValue::Float(p.value));
@@ -196,6 +199,16 @@ pub(crate) fn set(s: &mut Session, p: &Value) -> Result<Value> {
         keys.push(k);
         previous = Some(p.time);
     }
+    Ok(keys)
+}
+
+pub(crate) fn set(s: &mut Session, p: &Value) -> Result<Value> {
+    crate::project_owner::writable(s)?;
+    let r: Request = serde_json::from_value(p.clone()).map_err(|e| bad(CMD, e.to_string()))?;
+    if r.param.is_empty() || r.param.len() > 128 || r.points.len() == 1 || r.points.len() > 4096 {
+        return Err(bad(CMD, "need a named scalar parameter and zero or 2..4096 points"));
+    }
+    let keys = scalar_keys(r.points, CMD)?;
     let id = ClipId(r.clip);
     let q = s.active_sequence().ok_or(crate::EngineError::NoSequence)?;
     let track = q.find_item(id).and_then(|(t, _)| q.track(t)).ok_or_else(|| bad(CMD, "unknown clip"))?;

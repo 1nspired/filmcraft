@@ -210,6 +210,7 @@ fn db_gain(db: f64) -> f32 {
 /// One automatable control of a strip, ready for per-sample evaluation.
 struct Lane<'a> {
     param: Option<&'a Param>,
+    offset: Option<(&'a Param, f64)>,
     stat: f64,
     ov: Option<Override>,
     /// Switch lanes (mute) hold between keyframes whatever their interpolation.
@@ -221,24 +222,29 @@ impl<'a> Lane<'a> {
         let reads = track.mixer.mode.reads();
         let param = track.lane(key).filter(|p| reads && p.is_animated());
         let hold = filmcraft_project::mixer::lane_info(key).is_some_and(|i| i.hold);
-        Lane { param, stat: track.lane_static(key).unwrap_or(0.0), ov: ovs.get(&(strip, key.to_string())).copied(), hold }
+        let offset = filmcraft_project::mixer::offset_lane(key).and_then(|(lane, scale)| track.lane(lane).filter(|_| reads).map(|p| (p, scale)));
+        Lane { param, offset, stat: track.lane_static(key).unwrap_or(0.0), ov: ovs.get(&(strip, key.to_string())).copied(), hold }
     }
     fn auto(&self, t: Tick) -> f64 {
-        match self.param {
+        let base = match self.param {
             None => self.stat,
             Some(p) if self.hold => {
                 let i = p.keyframes.partition_point(|k| k.time <= t);
                 p.keyframes[i.saturating_sub(1)].value.as_f64().unwrap_or(0.0)
             }
             Some(p) => p.scalar_at(t),
-        }
+        };
+        base + self.offset.map(|(p, scale)| p.scalar_at(t) * scale).unwrap_or(0.0)
     }
     /// The value when it is the same at every sample.
     fn constant(&self) -> Option<f64> {
         match self.ov {
             Some(Override { value, release: None }) => Some(value),
             Some(_) => None,
-            None => self.param.is_none().then_some(self.stat),
+            None if self.param.is_none() && self.offset.is_none_or(|(p, _)| !p.is_animated()) => {
+                Some(self.stat + self.offset.and_then(|(p, scale)| p.value.as_f64().map(|v| v * scale)).unwrap_or(0.0))
+            }
+            None => None,
         }
     }
     fn at(&self, t: Tick) -> f64 {

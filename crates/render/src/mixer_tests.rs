@@ -214,6 +214,38 @@ fn animated_clip_volume_is_sample_accurate_and_request_invariant() {
     }
 }
 
+/// Sequence-clock offsets add to independent faders/knobs; source offsets cannot move them.
+#[test]
+fn track_gain_and_pan_offsets_follow_the_sequence_at_every_sample() {
+    let mut r = Rig::new(&[dc]);
+    {
+        let tr = r.track(0);
+        tr.volume_db = -3.0;
+        tr.pan = 20.0;
+        tr.mixer.stereo_balance = filmcraft_project::mixer::StereoBalanceLaw::Linear;
+        tr.items[0].start = Tick::from_units(37, SR);
+        tr.items[0].source_in = Tick::from_units(1200, SR);
+        for (lane, a, b) in [("volume.offset", -12.0, 0.0), ("pan.offset", -0.6, 1.0)] {
+            let mut p = filmcraft_project::Param::new(ParamValue::Float(0.0));
+            p.keyframes = vec![kf(0, a), kf(4800, b)];
+            tr.mixer.lanes.insert(lane.into(), p);
+        }
+    }
+    let whole = r.mix(37, 4800);
+    for i in 0..4800 {
+        let u = ((37 + i) as f64 / 4800.0).min(1.0);
+        let gain = 0.5 * 10f64.powf((-3.0 - 12.0 + 12.0 * u) / 20.0);
+        let pan = (0.2 - 0.6 + 1.6 * u).clamp(-1.0, 1.0);
+        let expected = [gain * (1.0 - pan.max(0.0)), gain * (1.0 + pan.min(0.0))];
+        for c in 0..2 {
+            assert!((f64::from(whole[c][i]) - expected[c]).abs() < 1e-6, "sample={i} channel={c}: {} vs {}", whole[c][i], expected[c]);
+        }
+    }
+    for sizes in [&[1usize, 63, 64, 65][..], &[333], &[7, 1024, 5]] {
+        assert_eq!(r.mix_cut(37, 4800, sizes, None), whole, "{sizes:?}");
+    }
+}
+
 #[test]
 fn clip_volume_and_track_automation_both_apply() {
     let mut r = Rig::new(&[dc]);

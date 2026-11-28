@@ -48,6 +48,7 @@ mod poema_human_trim;
 mod poema_metadata;
 mod poema_monitor;
 mod poema_scalar_curve;
+mod poema_track_curve;
 pub mod presets;
 pub mod previews;
 pub mod project_manager;
@@ -1012,10 +1013,12 @@ impl Session {
         f: impl FnOnce(&mut Sequence, &mut EditCtx, &mut EditorState) -> Result<R>,
     ) -> Result<R> {
         let seq_id = self.state.active_sequence.ok_or(EngineError::NoSequence)?;
+        let human = !self.agent_bridge.staging;
         let media = self.media.clone();
         let body = move |p: &mut Project, st: &mut EditorState| {
             let project_snapshot = std::sync::Arc::new(p.clone());
             let snap = project_snapshot.clone();
+            let previous_project = project_snapshot.clone();
             let durations = move |id: ItemId| -> Option<Tick> { media_duration(&project_snapshot, &media, id) };
             let starts = move |id: ItemId| media_start(&snap, id);
             let min = p.sequence(seq_id).map(|s| s.settings.frame_rate.frame_duration()).unwrap_or(Tick(1));
@@ -1025,6 +1028,7 @@ impl Session {
                 let mut ctx = EditCtx { next_id: &mut next, media_duration: &durations, media_start: &starts, min_duration: min };
                 f(seq, &mut ctx, st)?
             };
+            crate::poema_track_curve::reconcile_human(p, &previous_project, seq_id, human)?;
             p.next_id = next;
             if let Some(s) = p.sequence(seq_id) {
                 s.check().map_err(EngineError::Other)?;

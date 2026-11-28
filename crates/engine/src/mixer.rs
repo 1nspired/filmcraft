@@ -964,13 +964,31 @@ fn clear_lane(s: &mut Session, p: &Value) -> Result<Value> {
     let id = strip_p(s, p, "mixer.clearLane")?;
     let lane = lane_p(s, p, id, "mixer.clearLane")?;
     let t = s.playhead();
+    if lane == pm::LANE_VOLUME_OFFSET {
+        let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
+        let baked = q.strip(id).map(|tr| tr.volume_db + tr.lane_value(&lane, t)).ok_or_else(|| bad("mixer.clearLane", "unknown strip"))?;
+        if !baked.is_finite() || !(FADER_MIN_DB..=FADER_MAX_DB).contains(&baked) {
+            return Err(bad("mixer.clearLane", "held gain plus fader exceeds the fader range; reduce the fader before clearing"));
+        }
+    }
     s.edit_sequence("Clear Track Keyframes", move |q, _, _| {
         q.with_strip_mut(id, |tr| {
             let v = tr.lane_value(&lane, t);
             if let Some(par) = tr.lane_mut(&lane) {
                 par.keyframes.clear();
             }
-            tr.set_lane_static(&lane, v);
+            // Clearing an additive lane holds its audible value in the independent knob.
+            // Removing the curve through poema.setTrackCurve instead keeps the knob unchanged.
+            match lane.as_str() {
+                pm::LANE_VOLUME_OFFSET => {
+                    let baked = tr.volume_db + v;
+                    tr.volume_db = baked;
+                }
+                pm::LANE_PAN_OFFSET => tr.pan = (tr.pan + v * 100.0).clamp(-100.0, 100.0),
+                _ => {
+                    tr.set_lane_static(&lane, v);
+                }
+            }
             if parse_fx_lane(&lane).is_none() {
                 tr.mixer.lanes.remove(&lane);
             }
