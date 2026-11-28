@@ -29,6 +29,18 @@ use crate::{Track, TrackId};
 
 pub const LANE_VOLUME: &str = "volume";
 pub const LANE_PAN: &str = "pan";
+/// Additive dB automation, independent of the ordinary absolute fader lane.
+pub const LANE_VOLUME_OFFSET: &str = "volume.offset";
+/// Additive pan ratio (-1..1), independent of the ordinary percent pan lane.
+pub const LANE_PAN_OFFSET: &str = "pan.offset";
+/// The optional additive control behind a fader/pan lane and its unit conversion.
+pub fn offset_lane(key: &str) -> Option<(&'static str, f64)> {
+    match key {
+        LANE_VOLUME => Some((LANE_VOLUME_OFFSET, 1.0)),
+        LANE_PAN => Some((LANE_PAN_OFFSET, 100.0)),
+        _ => None,
+    }
+}
 pub const LANE_MUTE: &str = "mute";
 /// 5.1 panner puck, left (−100) … right (100). Used when the strip feeds a 5.1 submix or Mix.
 pub const LANE_PAN51_X: &str = "pan51.x";
@@ -193,6 +205,14 @@ impl MonoSourceLaw {
     }
 }
 
+/// Editorial intent for a physical additive curve. Numeric state stays in `lanes`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OffsetCurveIntent {
+    pub by: String,
+    pub basis: String,
+}
+
 /// Mixer-only state of a channel strip (audio track, submix or Mix).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -205,6 +225,9 @@ pub struct MixerStrip {
     /// Automation lanes (`volume`, `pan`, `mute`, `send.<i>.level`), keyframes in sequence time.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub lanes: BTreeMap<String, Param>,
+    /// Provenance/digest for verified additive curves; no curve numbers are stored here.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub offset_intents: BTreeMap<String, OffsetCurveIntent>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sends: Vec<TrackSend>,
     /// Output assignment: a submix track, or `None` for the Mix track.
@@ -230,6 +253,8 @@ pub struct LaneInfo {
 /// Range and behaviour of a non-effect lane (`volume`, `pan`, `mute`, `send.<i>.level`).
 pub fn lane_info(key: &str) -> Option<LaneInfo> {
     match key {
+        LANE_VOLUME_OFFSET => Some(LaneInfo { min: -60.0, max: 12.0, hold: false, unit: "dB" }),
+        LANE_PAN_OFFSET => Some(LaneInfo { min: -1.0, max: 1.0, hold: false, unit: "" }),
         LANE_VOLUME => Some(LaneInfo { min: FADER_MIN_DB, max: FADER_MAX_DB, hold: false, unit: "dB" }),
         LANE_PAN => Some(LaneInfo { min: -100.0, max: 100.0, hold: false, unit: "" }),
         LANE_MUTE => Some(LaneInfo { min: 0.0, max: 1.0, hold: true, unit: "" }),
@@ -255,6 +280,7 @@ impl Track {
     /// Static (un-automated) value of a lane.
     pub fn lane_static(&self, key: &str) -> Option<f64> {
         match key {
+            LANE_VOLUME_OFFSET | LANE_PAN_OFFSET => Some(self.mixer.lanes.get(key).and_then(|p| p.value.as_f64()).unwrap_or(0.0)),
             LANE_VOLUME => Some(self.volume_db),
             LANE_PAN => Some(self.pan),
             LANE_MUTE => Some(if self.muted { 1.0 } else { 0.0 }),
@@ -298,9 +324,14 @@ impl Track {
         if !self.mixer.mode.reads() {
             return stat;
         }
-        match self.lane(key) {
+        let base = match self.lane(key) {
             Some(p) if p.is_animated() => p.scalar_at(t),
             _ => stat,
+        };
+        match offset_lane(key).and_then(|(lane, scale)| self.lane(lane).map(|p| (p.scalar_at(t), scale))) {
+            Some((value, scale)) if key == LANE_PAN => (base + value * scale).clamp(-100.0, 100.0),
+            Some((value, scale)) => base + value * scale,
+            None => base,
         }
     }
 
@@ -320,6 +351,10 @@ impl Track {
     /// Set a lane's static value (fader moves in Off/Read mode, or no automation yet).
     pub fn set_lane_static(&mut self, key: &str, v: f64) -> bool {
         match key {
+            LANE_VOLUME_OFFSET | LANE_PAN_OFFSET => {
+                let Some(info) = lane_info(key) else { return false };
+                self.mixer.lanes.entry(key.into()).or_insert_with(|| Param::new(ParamValue::Float(0.0))).value = ParamValue::Float(v.clamp(info.min, info.max));
+            }
             LANE_VOLUME => self.volume_db = v.clamp(FADER_MIN_DB, FADER_MAX_DB),
             LANE_PAN => self.pan = v.clamp(-100.0, 100.0),
             LANE_MUTE => self.muted = v >= 0.5,
@@ -571,6 +606,32 @@ mod tests {
         t.mixer.mode = AutomationMode::Off;
         assert_eq!(t.lane_value(LANE_VOLUME, Tick(50)), -6.0);
         assert_eq!(t.automated_lanes(), vec!["volume".to_string()]);
+    }
+
+    #[test]
+    fn additive_lanes_preserve_independent_knobs_and_native_defaults() {
+        let mut t = tr();
+        let before = serde_json::to_value(&t).unwrap();
+        assert!(before["mixer"].get("offset_intents").is_none());
+        assert_eq!(t.lane_static(LANE_VOLUME_OFFSET), Some(0.0));
+        assert_eq!(t.lane_static(LANE_PAN_OFFSET), Some(0.0));
+        assert_eq!(serde_json::to_value(&t).unwrap(), before);
+        t.volume_db = -3.0;
+        t.pan = 20.0;
+        for (key, a, b) in [(LANE_VOLUME_OFFSET, -12.0, 0.0), (LANE_PAN_OFFSET, -0.6, 1.0)] {
+            t.lane_mut(key).unwrap().keyframes = vec![Keyframe::new(Tick(0), ParamValue::Float(a)), Keyframe::new(Tick(100), ParamValue::Float(b))];
+        }
+        assert_eq!(t.lane_value(LANE_VOLUME, Tick(50)), -9.0);
+        assert!((t.lane_value(LANE_PAN, Tick(50)) - 40.0).abs() < 1e-12);
+        assert_eq!(t.lane_value(LANE_PAN, Tick(100)), 100.0);
+        assert_eq!((t.volume_db, t.pan), (-3.0, 20.0));
+        t.volume_db = -8.0;
+        t.pan = -80.0;
+        assert_eq!(t.lane_value(LANE_VOLUME, Tick(50)), -14.0);
+        assert_eq!(t.lane_value(LANE_PAN, Tick(0)), -100.0);
+        t.mixer.mode = AutomationMode::Off;
+        assert_eq!(t.lane_value(LANE_VOLUME, Tick(50)), -8.0);
+        assert_eq!(t.lane_value(LANE_PAN, Tick(50)), -80.0);
     }
 
     #[test]

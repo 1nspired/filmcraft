@@ -496,3 +496,34 @@ fn paused_meters_repaint_without_input_and_settle_after_release() {
         d.snapshot(&format!("meters-{workspace}-paused-silent"), None);
     }
 }
+
+#[test]
+fn additive_curve_lanes_use_the_existing_human_pen_and_native_undo() {
+    use filmcraft_project::mixer::{LANE_PAN_OFFSET, LANE_VOLUME_OFFSET};
+    let mut d = Driver::demo();
+    d.click("timeline.track.A1.keyframes");
+    assert!(!d.ids("timeline.track.A1.keyframes").iter().any(|id| id.ends_with(".offset")));
+    d.click("timeline.track.A1.keyframes.volume");
+    let id = d.harness.state().session.active_sequence().unwrap().audio_tracks[0].id;
+    for (param, a, b) in [("gain", -12.0, -3.0), ("pan", -0.5, 0.5)] {
+        d.exec("poema.setTrackCurve", json!({"track":id.0,"param":param,"by":"fixture_ui","points":[{"time":0,"value":a},{"time":508032000000i64,"value":b}]}));
+    }
+    for lane in [LANE_VOLUME_OFFSET, LANE_PAN_OFFSET] {
+        d.click("timeline.track.A1.keyframes");
+        d.click(&format!("timeline.track.A1.keyframes.{lane}"));
+        assert!(d.ids("timeline.track.A1.lane").iter().any(|id| id.contains(".kf.")));
+        let before = d.harness.state().session.project.clone();
+        d.ok("ui.set", json!({"tool":"Pen"}));
+        d.frames(2);
+        let band = d.element("timeline.track.A1.lane").unwrap();
+        d.ok("ui.click", json!({"x":band[0]+band[2]*0.73,"y":band[1]+band[3]*0.35}));
+        d.frames(3);
+        let tr = d.harness.state().session.active_sequence().unwrap().track(id).unwrap();
+        assert_eq!(tr.mixer.lanes[lane].keyframes.len(), 3);
+        assert_eq!(tr.mixer.offset_intents[lane].by, "human");
+        d.exec("edit.undo", json!({}));
+        assert_eq!(d.harness.state().session.project, before);
+        d.ok("ui.set", json!({"tool":"Selection"}));
+        d.snapshot(&format!("mixer-additive-{lane}"), Some("timeline.track.A1"));
+    }
+}

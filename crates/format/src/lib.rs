@@ -17,6 +17,8 @@
 //!   `Auto-Save` folder next to the project, oldest pruned beyond the version limit).
 //!
 //! Schema history:
+//! - **v21**: additive track gain/pan offset lanes and checked provenance. Older readers
+//!   must reject instead of ignoring their audible automation.
 //! - **v1** (M0–M11): the bare serialized `Project` object with a `"version": 1` field.
 //! - **v2** (M11.1): the envelope above; `Project.version` dropped (the envelope carries it).
 //! - **v3** (M10.2): graphic clips (`ItemKind::Graphic`, text/shape layers). The shape of older
@@ -70,7 +72,7 @@ pub type Migration = fn(Value) -> Result<Value, String>;
 /// edit a shipped one.
 pub const MIGRATIONS: &[Migration] = &[
     v1_to_v2, v2_to_v3, v3_to_v4, v4_to_v5, v5_to_v6, v6_to_v7, v7_to_v8, v8_to_v9, v9_to_v10, v10_to_v11, v11_to_v12, v12_to_v13, v13_to_v14, v14_to_v15,
-    v15_to_v16, v16_to_v17, v17_to_v18, v18_to_v19, v19_to_v20,
+    v15_to_v16, v16_to_v17, v17_to_v18, v18_to_v19, v19_to_v20, v20_to_v21,
 ];
 
 /// The schema version this build writes (and the newest it reads).
@@ -399,8 +401,42 @@ fn v19_to_v20(doc: Value) -> Result<Value, String> {
     Ok(doc)
 }
 
+// v20 -> v21: absent offsets preserve existing faders and automation exactly.
+fn v20_to_v21(doc: Value) -> Result<Value, String> {
+    Ok(doc)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn additive_automation_is_versioned_and_schema20_defaults_remain_unchanged() {
+        use filmcraft_project::mixer::{LANE_VOLUME_OFFSET, OffsetCurveIntent};
+        use filmcraft_project::{Keyframe, Param, ParamValue};
+        let mut p = Project::new("offset schema");
+        let q = p.new_sequence("q", Default::default(), 1, 1, None);
+        let mut old: Value = serde_json::from_slice(&encode(&p, false)).unwrap();
+        old["schema_version"] = serde_json::json!(20);
+        assert_eq!(decode(&serde_json::to_vec(&old).unwrap()).unwrap().project, p);
+        let tr = &mut p.sequence_mut(q).unwrap().audio_tracks[0];
+        tr.mixer.lanes.insert(
+            LANE_VOLUME_OFFSET.into(),
+            Param {
+                value: ParamValue::Float(0.0),
+                keyframes: vec![
+                    Keyframe::new(filmcraft_time::Tick(0), ParamValue::Float(-12.0)),
+                    Keyframe::new(filmcraft_time::Tick(100), ParamValue::Float(-3.0)),
+                ],
+            },
+        );
+        tr.mixer.offset_intents.insert(LANE_VOLUME_OFFSET.into(), OffsetCurveIntent { by: "fixture".into(), basis: "0".repeat(64) });
+        let bytes = encode(&p, false);
+        let mut current: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(detect_version(&current).unwrap(), 21);
+        assert_eq!(decode(&bytes).unwrap().project, p);
+        current["schema_version"] = serde_json::json!(22);
+        assert!(decode(&serde_json::to_vec(&current).unwrap()).is_err());
+    }
+
     #[test]
     fn program_extent_is_versioned_and_old_sequences_keep_native_default() {
         let mut project = Project::new("Versioned extent");
@@ -411,7 +447,7 @@ mod tests {
         assert!(restored.project.sequence(id).unwrap().program_extent.is_none());
         project.sequence_mut(id).unwrap().program_extent = Some(filmcraft_project::ProgramExtentPolicy::Poema);
         let bytes = encode(&project, false);
-        assert_eq!(detect_version(&serde_json::from_slice(&bytes).unwrap()).unwrap(), 20);
+        assert_eq!(detect_version(&serde_json::from_slice(&bytes).unwrap()).unwrap(), 21);
         let restored = decode(&bytes).unwrap();
         assert_eq!(restored.project, project);
         assert_eq!(restored.project.sequence(id).unwrap().program_extent, Some(filmcraft_project::ProgramExtentPolicy::Poema));
@@ -426,7 +462,7 @@ mod tests {
 
     #[test]
     fn schema_version_matches_table() {
-        assert_eq!(SCHEMA_VERSION, 20);
+        assert_eq!(SCHEMA_VERSION, 21);
     }
 
     #[test]
