@@ -636,6 +636,7 @@ pub(crate) struct Sent {
 }
 
 struct Snapshot {
+    project_lease: Option<Arc<crate::project_owner::ProjectLease>>,
     project: Arc<Project>,
     revision: u64,
     path: Option<String>,
@@ -759,8 +760,14 @@ impl Persistence {
         })
     }
 
-    pub(crate) fn send_dirty(&self, project: Arc<Project>, revision: u64, path: Option<String>) {
-        let _ = self.tx.send(Msg::Dirty(Snapshot { project, revision, path }));
+    pub(crate) fn send_dirty(
+        &self,
+        project: Arc<Project>,
+        revision: u64,
+        path: Option<String>,
+        project_lease: Option<Arc<crate::project_owner::ProjectLease>>,
+    ) {
+        let _ = self.tx.send(Msg::Dirty(Snapshot { project, revision, path, project_lease }));
     }
 
     pub(crate) fn send_clean(&self) {
@@ -1039,7 +1046,10 @@ impl Worker {
                 if self.prefs.save_current_project
                     && let Some(p) = &s.path
                 {
-                    match filmcraft_format::atomic_write(Path::new(p), &bytes) {
+                    match s.project_lease.as_ref().map_or_else(
+                        || filmcraft_format::atomic_write(Path::new(p), &bytes).map_err(|e| e.to_string()),
+                        |lease| lease.save(&bytes).map_err(|e| e.to_string()),
+                    ) {
                         Ok(()) => {
                             let _ = self.events.send(WorkerEvent::SavedProject { path: p.clone(), revision: s.revision });
                         }
